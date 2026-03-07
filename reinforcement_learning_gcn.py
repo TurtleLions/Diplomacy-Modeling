@@ -503,7 +503,7 @@ class DiplomacyGCN(nn.Module):
 def worker(remote, parent_remote):
     """Runs a dedicated Diplomacy environment on a single CPU core."""
     parent_remote.close()
-    env = DiplomacyEnv() # Ensure your DiplomacyEnv is defined above this or imported
+    env = DiplomacyEnv() 
     
     while True:
         try:
@@ -579,7 +579,6 @@ if __name__ == "__main__":
     vec_env = SubprocVecDiplomacy(num_envs=NUM_ENVS_PER_GPU)
     possible_agents = vec_env.get_possible_agents()
     
-    # Dummy env to grab static map dimensions
     dummy_env = DiplomacyEnv()
     adj_matrix = get_adjacency_matrix(dummy_env.game).to(device)
     target_vocab_length = len(dummy_env.prov_to_idx)
@@ -611,137 +610,161 @@ if __name__ == "__main__":
         if global_rank == 0:
             print(f"\n[Episode {episode+1}/{num_episodes}] Running vectorized rollouts...")
 
-        episode_log_probs = {e: {a: [] for a in possible_agents} for e in range(NUM_ENVS_PER_GPU)}
-        episode_rewards = {e: {a: [] for a in possible_agents} for e in range(NUM_ENVS_PER_GPU)}
-        episode_entropies = {e: {a: [] for a in possible_agents} for e in range(NUM_ENVS_PER_GPU)}
+        # Data structure to hold the rollout trajectory on CPU memory
+        ep_data = {
+            e: {
+                a: {'obs': [], 'm_type': [], 'm_t1': [], 'm_t2': [], 
+                    'act_type': [], 'act_t1': [], 'act_t2': [], 'rewards': []} 
+                for a in possible_agents
+            } for e in range(NUM_ENVS_PER_GPU)
+        }
         
         step_count = 0
         
-        # --- GAME ROLLOUT PHASE ---
-        while step_count < 100: 
-            actions_to_send = [{} for _ in range(NUM_ENVS_PER_GPU)]
-            
-            # Temporary storage to align actions with rewards for this step
-            step_log_probs = {e: {a: None for a in possible_agents} for e in range(NUM_ENVS_PER_GPU)}
-            step_entropies = {e: {a: None for a in possible_agents} for e in range(NUM_ENVS_PER_GPU)}
-            
-            for agent in possible_agents:
-                active_env_indices = []
-                obs_list = []
-                mask_type_list, mask_t1_list, mask_t2_list = [], [], []
+        # --- GAME ROLLOUT PHASE (NO GRADIENTS) ---
+        with torch.no_grad():
+            while step_count < 100: 
+                actions_to_send = [{} for _ in range(NUM_ENVS_PER_GPU)]
+                step_took_action = {e: {a: False for a in possible_agents} for e in range(NUM_ENVS_PER_GPU)}
                 
+                for agent in possible_agents:
+                    active_env_indices = []
+                    obs_list = []
+                    mask_type_list, mask_t1_list, mask_t2_list = [], [], []
+                    
+                    for i in range(NUM_ENVS_PER_GPU):
+                        if len(env_results[i]) == 3:
+                            obs_dict, infos_dict, active_agents = env_results[i]
+                        else:
+                            obs_dict, _, _, _, infos_dict, active_agents = env_results[i]
+                            
+                        if agent in active_agents:
+                            active_env_indices.append(i)
+                            obs_list.append(torch.tensor(obs_dict[agent]))
+                            
+                            mask_dict = infos_dict[agent]['action_mask']
+                            mask_type_list.append(torch.tensor(mask_dict['type'], dtype=torch.bool))
+                            mask_t1_list.append(torch.tensor(mask_dict['target1'], dtype=torch.bool))
+                            mask_t2_list.append(torch.tensor(mask_dict['target2'], dtype=torch.bool))
+
+                    if not active_env_indices:
+                        continue 
+                    
+                    batch_obs = torch.stack(obs_list).to(device) 
+                    batch_mask_type = torch.stack(mask_type_list).to(device)
+                    batch_mask_t1 = torch.stack(mask_t1_list).to(device)
+                    batch_mask_t2 = torch.stack(mask_t2_list).to(device)
+
+                    type_logits, t1_logits, t2_logits = net(batch_obs)
+                    
+                    type_logits = type_logits.masked_fill(~batch_mask_type, -1e9)
+                    t1_logits = t1_logits.masked_fill(~batch_mask_t1, -1e9)
+                    t2_logits = t2_logits.masked_fill(~batch_mask_t2, -1e9)
+                    
+                    type_dist = Categorical(logits=type_logits)
+                    t1_dist = Categorical(logits=t1_logits)
+                    t2_dist = Categorical(logits=t2_logits)
+                    
+                    type_action = type_dist.sample()
+                    t1_action = t1_dist.sample()
+                    t2_action = t2_dist.sample()
+                    
+                    for idx, env_idx in enumerate(active_env_indices):
+                        active_unit_mask = (type_action[idx] != 0)
+                        
+                        if active_unit_mask.any():
+                            # Send data to CPU to save GPU VRAM during the 100 steps
+                            ep_data[env_idx][agent]['obs'].append(obs_list[idx].clone())
+                            ep_data[env_idx][agent]['m_type'].append(mask_type_list[idx].clone())
+                            ep_data[env_idx][agent]['m_t1'].append(mask_t1_list[idx].clone())
+                            ep_data[env_idx][agent]['m_t2'].append(mask_t2_list[idx].clone())
+                            
+                            ep_data[env_idx][agent]['act_type'].append(type_action[idx].cpu().clone())
+                            ep_data[env_idx][agent]['act_t1'].append(t1_action[idx].cpu().clone())
+                            ep_data[env_idx][agent]['act_t2'].append(t2_action[idx].cpu().clone())
+                            
+                            step_took_action[env_idx][agent] = True
+                        
+                        actions_to_send[env_idx][agent] = torch.stack([
+                            type_action[idx], 
+                            t1_action[idx], 
+                            t2_action[idx]
+                        ], dim=-1).cpu().numpy()
+
+                # Step parallel environments
+                next_env_results = vec_env.step(actions_to_send)
+                
+                # Assign rewards only to agents that actually took an action this step
                 for i in range(NUM_ENVS_PER_GPU):
-                    # Unpack dynamically based on reset() vs step() outputs
-                    if len(env_results[i]) == 3:
-                        obs_dict, infos_dict, active_agents = env_results[i]
-                    else:
-                        obs_dict, _, _, _, infos_dict, active_agents = env_results[i]
-                        
-                    if agent in active_agents:
-                        active_env_indices.append(i)
-                        obs_list.append(torch.tensor(obs_dict[agent]))
-                        
-                        mask_dict = infos_dict[agent]['action_mask']
-                        mask_type_list.append(torch.tensor(mask_dict['type'], dtype=torch.bool))
-                        mask_t1_list.append(torch.tensor(mask_dict['target1'], dtype=torch.bool))
-                        mask_t2_list.append(torch.tensor(mask_dict['target2'], dtype=torch.bool))
-
-                if not active_env_indices:
-                    continue 
+                    obs, rewards, terms, truncs, infos, active_agents = next_env_results[i]
+                    for agent in possible_agents:
+                        if step_took_action[i][agent]:
+                            ep_data[i][agent]['rewards'].append(float(rewards.get(agent, 0.0)))
                 
-                batch_obs = torch.stack(obs_list).to(device) 
-                batch_mask_type = torch.stack(mask_type_list).to(device)
-                batch_mask_t1 = torch.stack(mask_t1_list).to(device)
-                batch_mask_t2 = torch.stack(mask_t2_list).to(device)
-
-                type_logits, t1_logits, t2_logits = net(batch_obs)
+                env_results = next_env_results
                 
-                type_logits = type_logits.masked_fill(~batch_mask_type, -1e9)
-                t1_logits = t1_logits.masked_fill(~batch_mask_t1, -1e9)
-                t2_logits = t2_logits.masked_fill(~batch_mask_t2, -1e9)
+                all_done = all(len(result[5]) == 0 for result in env_results)
+                if all_done:
+                    break
+                    
+                step_count += 1
+                
+        # --- SYNCHRONIZED UPDATE PHASE (GRADIENTS ENABLED) ---
+        policy_loss = []
+        for i in range(NUM_ENVS_PER_GPU):
+            for agent in possible_agents:
+                data = ep_data[i][agent]
+                if len(data['rewards']) == 0: continue
+                
+                # 1. Calculate discounted returns
+                returns, R = [], 0
+                for r in reversed(data['rewards']):
+                    R = r + gamma * R
+                    returns.insert(0, R)
+                returns = torch.tensor(returns, dtype=torch.float32).to(device)
+                
+                if returns.std() > 0:
+                    returns = (returns - returns.mean()) / (returns.std() + 1e-8)
+                
+                # 2. Re-load the trajectory batch onto the GPU
+                b_obs = torch.stack(data['obs']).to(device)
+                b_m_type = torch.stack(data['m_type']).to(device)
+                b_m_t1 = torch.stack(data['m_t1']).to(device)
+                b_m_t2 = torch.stack(data['m_t2']).to(device)
+                
+                b_act_type = torch.stack(data['act_type']).to(device)
+                b_act_t1 = torch.stack(data['act_t1']).to(device)
+                b_act_t2 = torch.stack(data['act_t2']).to(device)
+                
+                # 3. One massive batched forward pass to re-evaluate the whole episode
+                type_logits, t1_logits, t2_logits = net(b_obs)
+                
+                type_logits = type_logits.masked_fill(~b_m_type, -1e9)
+                t1_logits = t1_logits.masked_fill(~b_m_t1, -1e9)
+                t2_logits = t2_logits.masked_fill(~b_m_t2, -1e9)
                 
                 type_dist = Categorical(logits=type_logits)
                 t1_dist = Categorical(logits=t1_logits)
                 t2_dist = Categorical(logits=t2_logits)
                 
-                type_action = type_dist.sample()
-                t1_action = t1_dist.sample()
-                t2_action = t2_dist.sample()
+                active_unit_mask = (b_act_type != 0)
                 
-                for idx, env_idx in enumerate(active_env_indices):
-                    active_unit_mask = (type_action[idx] != 0)
-                    
-                    if active_unit_mask.any():
-                        joint_log_prob = (
-                            type_dist.log_prob(type_action)[idx][active_unit_mask] + 
-                            t1_dist.log_prob(t1_action)[idx][active_unit_mask] + 
-                            t2_dist.log_prob(t2_action)[idx][active_unit_mask]
-                        )
-                        # Store locally for the step
-                        step_log_probs[env_idx][agent] = joint_log_prob.sum()
-                        
-                        joint_entropy = (
-                            type_dist.entropy()[idx][active_unit_mask] + 
-                            t1_dist.entropy()[idx][active_unit_mask] + 
-                            t2_dist.entropy()[idx][active_unit_mask]
-                        )
-                        step_entropies[env_idx][agent] = joint_entropy.sum()
-                    
-                    actions_to_send[env_idx][agent] = torch.stack([
-                        type_action[idx], 
-                        t1_action[idx], 
-                        t2_action[idx]
-                    ], dim=-1).cpu().numpy()
-
-            # Execute the actions in the parallel environments
-            next_env_results = vec_env.step(actions_to_send)
-            
-            # Commit tracking buffers only if an action was generated
-            for i in range(NUM_ENVS_PER_GPU):
-                obs, rewards, terms, truncs, infos, active_agents = next_env_results[i]
+                # Calculate joint log probabilities and sum over active provinces (dim 1)
+                log_p = type_dist.log_prob(b_act_type) + t1_dist.log_prob(b_act_t1) + t2_dist.log_prob(b_act_t2)
+                log_p = (log_p * active_unit_mask).sum(dim=1)
                 
-                for agent in possible_agents:
-                    if step_log_probs[i][agent] is not None:
-                        episode_log_probs[i][agent].append(step_log_probs[i][agent])
-                        episode_entropies[i][agent].append(step_entropies[i][agent])
-                        
-                        # Guarantee 1:1 length matching by appending reward only if action was valid
-                        step_r = float(rewards.get(agent, 0.0))
-                        episode_rewards[i][agent].append(step_r)
-            
-            env_results = next_env_results
-            
-            all_done = all(len(result[5]) == 0 for result in env_results)
-            if all_done:
-                break
+                entropy = type_dist.entropy() + t1_dist.entropy() + t2_dist.entropy()
+                entropy = (entropy * active_unit_mask).sum(dim=1)
                 
-            step_count += 1
-                
-        # --- SYNCHRONIZED UPDATE PHASE ---
-        policy_loss = []
-        for i in range(NUM_ENVS_PER_GPU):
-            for agent in possible_agents:
-                if not episode_log_probs[i][agent]: continue
-                
-                returns, R = [], 0
-                for r in reversed(episode_rewards[i][agent]):
-                    R = r + gamma * R
-                    returns.insert(0, R)
-                returns = torch.tensor(returns).to(device)
-                
-                if returns.std() > 0:
-                    returns = (returns - returns.mean()) / (returns.std() + 1e-8)
-                
-                agent_log_probs = torch.stack(episode_log_probs[i][agent])
-                agent_entropies = torch.stack(episode_entropies[i][agent])
-                
-                loss = -(agent_log_probs * returns).mean() - (entropy_coef * agent_entropies.mean())
+                # Calculate loss
+                loss = -(log_p * returns).mean() - (entropy_coef * entropy.mean())
                 policy_loss.append(loss)
             
         if policy_loss:
             optimizer.zero_grad()
             total_loss = torch.stack(policy_loss).mean()
             
+            # This backpropagates entirely through the single batched forward pass
             total_loss.backward()
             torch.nn.utils.clip_grad_norm_(net.parameters(), 0.5)
             optimizer.step()
