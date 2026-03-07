@@ -488,11 +488,15 @@ if __name__ == "__main__":
         # --- UPDATE PHASE ---
         net.train()
         b_size = flat_obs.shape[0]
-        mb_size = b_size // 4  # Break the massive batch into 4 smaller, memory-safe chunks
+        mb_size = b_size // 4  
         indices = np.arange(b_size)
         
+        target_kl = 0.015 # The standard threshold for PPO policy shifts
+
         for epoch in range(update_epochs):
             np.random.shuffle(indices)
+            approx_kl_total = 0.0 # Track how much the policy changes
+            
             for start in range(0, b_size, mb_size):
                 end = start + mb_size
                 mb_idx = indices[start:end]
@@ -501,6 +505,10 @@ if __name__ == "__main__":
                 mb_act = flat_act[mb_idx]
                 mb_logprobs = flat_logprobs[mb_idx]
                 mb_adv = flat_adv[mb_idx]
+                
+                # CRITICAL FIX 1: Mini-batch advantage normalization
+                mb_adv = (mb_adv - mb_adv.mean()) / (mb_adv.std() + 1e-8)
+                
                 mb_ret = flat_ret[mb_idx]
                 mb_m_type = flat_m_type[mb_idx]
                 mb_m_t1 = flat_m_t1[mb_idx]
@@ -518,16 +526,19 @@ if __name__ == "__main__":
                 active_counts = active_unit_mask.sum(dim=1).clamp(min=1)
                 
                 new_logp = type_dist.log_prob(mb_act[..., 0]) + t1_dist.log_prob(mb_act[..., 1]) + t2_dist.log_prob(mb_act[..., 2])
-                # CRITICAL FIX: Average the log probability over the active units
                 new_logp = (new_logp * active_unit_mask).sum(dim=1) / active_counts 
                 
                 entropy = type_dist.entropy() + t1_dist.entropy() + t2_dist.entropy()
-                # CRITICAL FIX: Average the entropy over the active units
                 entropy = (entropy * active_unit_mask).sum(dim=1) / active_counts 
                 entropy = entropy.mean()
 
                 logratio = new_logp - mb_logprobs
                 ratio = logratio.exp()
+                
+                # Calculate approximate KL divergence
+                with torch.no_grad():
+                    approx_kl = ((ratio - 1) - logratio).mean().item()
+                    approx_kl_total += approx_kl
                 
                 pg_loss1 = -mb_adv * ratio
                 pg_loss2 = -mb_adv * torch.clamp(ratio, 1 - clip_coef, 1 + clip_coef)
@@ -541,6 +552,13 @@ if __name__ == "__main__":
                 loss.backward()
                 nn.utils.clip_grad_norm_(net.parameters(), 0.5)
                 optimizer.step()
+                
+            # CRITICAL FIX 2: Hit the brakes if the policy changes too much
+            avg_epoch_kl = approx_kl_total / 4
+            if avg_epoch_kl > target_kl:
+                if global_rank == 0:
+                    print(f"      -> Early stopping at epoch {epoch+1} due to high KL: {avg_epoch_kl:.4f}")
+                break
 
         # --- RANK 0 LOGGING & SAVING ---
         if global_rank == 0:
