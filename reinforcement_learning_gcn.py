@@ -287,7 +287,6 @@ if __name__ == "__main__":
     NUM_ENVS = 14 # Scale this up to feed the GPU
     NUM_STEPS = 100
     NUM_AGENTS = 7
-    PROVINCES = 83 # Target vocab length
 
     if global_rank == 0:
         print(f"--- STARTING PPO DISTRIBUTED RL ---")
@@ -297,6 +296,8 @@ if __name__ == "__main__":
     dummy_env = DiplomacyEnv()
     possible_agents = dummy_env.possible_agents
     adj_matrix = get_adjacency_matrix(dummy_env.game).to(device)
+    MAP_PROVINCES = len(dummy_env.provinces)
+    VOCAB_SIZE = len(dummy_env.prov_to_idx)
     del dummy_env 
 
     net = DiplomacyActorCritic(adj=adj_matrix, target_vocab_size=PROVINCES).to(device)
@@ -304,18 +305,18 @@ if __name__ == "__main__":
     optimizer = optim.Adam(net.parameters(), lr=3e-4, eps=1e-5)
 
     # Pre-allocate Tensors (Zero memory fragmentation)
-    b_obs = torch.zeros((NUM_STEPS, NUM_ENVS, NUM_AGENTS, PROVINCES, 16), dtype=torch.float32, device=device)
-    b_actions = torch.zeros((NUM_STEPS, NUM_ENVS, NUM_AGENTS, PROVINCES, 3), dtype=torch.long, device=device)
+    b_obs = torch.zeros((NUM_STEPS, NUM_ENVS, NUM_AGENTS, MAP_PROVINCES, 16), dtype=torch.float32, device=device)
+    b_actions = torch.zeros((NUM_STEPS, NUM_ENVS, NUM_AGENTS, MAP_PROVINCES, 3), dtype=torch.long, device=device)
     b_logprobs = torch.zeros((NUM_STEPS, NUM_ENVS, NUM_AGENTS), dtype=torch.float32, device=device)
     b_rewards = torch.zeros((NUM_STEPS, NUM_ENVS, NUM_AGENTS), dtype=torch.float32, device=device)
     b_dones = torch.zeros((NUM_STEPS, NUM_ENVS, NUM_AGENTS), dtype=torch.float32, device=device)
     b_values = torch.zeros((NUM_STEPS, NUM_ENVS, NUM_AGENTS), dtype=torch.float32, device=device)
-    b_masks = torch.zeros((NUM_STEPS, NUM_ENVS, NUM_AGENTS), dtype=torch.bool, device=device) # True if agent alive
+    b_masks = torch.zeros((NUM_STEPS, NUM_ENVS, NUM_AGENTS), dtype=torch.bool, device=device) 
     
-    # Mask buffers
-    b_m_type = torch.zeros((NUM_STEPS, NUM_ENVS, NUM_AGENTS, PROVINCES, 8), dtype=torch.bool, device=device)
-    b_m_t1 = torch.zeros((NUM_STEPS, NUM_ENVS, NUM_AGENTS, PROVINCES, PROVINCES), dtype=torch.bool, device=device)
-    b_m_t2 = torch.zeros((NUM_STEPS, NUM_ENVS, NUM_AGENTS, PROVINCES, PROVINCES), dtype=torch.bool, device=device)
+    # Mask buffers (Targets use VOCAB_SIZE, types use 8)
+    b_m_type = torch.zeros((NUM_STEPS, NUM_ENVS, NUM_AGENTS, MAP_PROVINCES, 8), dtype=torch.bool, device=device)
+    b_m_t1 = torch.zeros((NUM_STEPS, NUM_ENVS, NUM_AGENTS, MAP_PROVINCES, VOCAB_SIZE), dtype=torch.bool, device=device)
+    b_m_t2 = torch.zeros((NUM_STEPS, NUM_ENVS, NUM_AGENTS, MAP_PROVINCES, VOCAB_SIZE), dtype=torch.bool, device=device)
 
     # PPO Hyperparams
     num_updates = 1000
@@ -413,16 +414,16 @@ if __name__ == "__main__":
 
         # Flatten buffers (Only keep valid agent steps)
         valid = b_masks.view(-1)
-        flat_obs = b_obs.view(-1, PROVINCES, 16)[valid]
-        flat_act = b_actions.view(-1, PROVINCES, 3)[valid]
+        flat_obs = b_obs.view(-1, MAP_PROVINCES, 16)[valid]
+        flat_act = b_actions.view(-1, MAP_PROVINCES, 3)[valid]
         flat_logprobs = b_logprobs.view(-1)[valid]
         flat_adv = advantages.view(-1)[valid]
         flat_ret = returns.view(-1)[valid]
         flat_val = b_values.view(-1)[valid]
         
-        flat_m_type = b_m_type.view(-1, PROVINCES, 8)[valid]
-        flat_m_t1 = b_m_t1.view(-1, PROVINCES, PROVINCES)[valid]
-        flat_m_t2 = b_m_t2.view(-1, PROVINCES, PROVINCES)[valid]
+        flat_m_type = b_m_type.view(-1, MAP_PROVINCES, 8)[valid]
+        flat_m_t1 = b_m_t1.view(-1, MAP_PROVINCES, VOCAB_SIZE)[valid]
+        flat_m_t2 = b_m_t2.view(-1, MAP_PROVINCES, VOCAB_SIZE)[valid]
 
         # Global Batch Normalization (The Fix)
         if flat_adv.shape[0] > 1:
