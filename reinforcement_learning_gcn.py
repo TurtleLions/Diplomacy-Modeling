@@ -226,9 +226,6 @@ class DiplomacyEnv(ParallelEnv):
     metadata = {'render_modes': ['human'], "name": "diplomacy_v0"}
 
     def __init__(self):
-        from gymnasium.spaces import Box, MultiDiscrete
-        import functools
-        
         self.possible_agents = ['AUSTRIA', 'ENGLAND', 'FRANCE', 'GERMANY', 'ITALY', 'RUSSIA', 'TURKEY']
         self.agents = self.possible_agents[:]
         
@@ -458,7 +455,7 @@ if __name__ == "__main__":
             print(f"\n=== Epoch {epoch+1}/{num_epochs} ===")
             
         epoch_loss = 0.0
-        optimizer.zero_grad() # Zero gradients at the start of the epoch
+        optimizer.zero_grad() 
         
         for accum_step in range(accum_steps):
             env_results = vec_env.reset()
@@ -586,6 +583,8 @@ if __name__ == "__main__":
                     all_act_t1.extend(data['act_t1'])
                     all_act_t2.extend(data['act_t2'])
                     
+            step_loss_val = 0.0 # Default in case of empty batch
+            
             if all_obs:
                 b_obs = torch.stack(all_obs).to(device)
                 b_m_type = torch.stack(all_m_type).to(device)
@@ -596,7 +595,6 @@ if __name__ == "__main__":
                 b_act_t2 = torch.stack(all_act_t2).to(device)
                 b_returns = torch.cat(all_returns).to(device)
                 
-                # Context manager for DDP to only network-sync on the final accumulation step
                 is_last_accum_step = (accum_step == accum_steps - 1)
                 sync_context = net.no_sync() if not is_last_accum_step else nullcontext()
                 
@@ -619,11 +617,27 @@ if __name__ == "__main__":
                     entropy = type_dist.entropy() + t1_dist.entropy() + t2_dist.entropy()
                     entropy = (entropy * active_unit_mask).sum(dim=1)
                     
-                    # Scale loss by accum_steps so the sum equals the true mean
                     loss = (-(log_p * b_returns).mean() - (entropy_coef * entropy.mean())) / accum_steps
                     
                     loss.backward()
-                    epoch_loss += loss.item() # Keep track of total scaled loss
+                    
+                    step_loss_val = loss.item() * accum_steps # Unscale to show the true loss for this episode
+                    epoch_loss += loss.item() 
+
+            # --- EPISODE LOGGING ---
+            if global_rank == 0:
+                current_ep = epoch * accum_steps + accum_step + 1
+                total_eps = num_epochs * accum_steps
+                
+                ep_rewards = [
+                    sum(ep_data[i][agent]['rewards']) 
+                    for i in range(NUM_ENVS_PER_GPU) 
+                    for agent in possible_agents 
+                    if len(ep_data[i][agent]['rewards']) > 0
+                ]
+                avg_r = sum(ep_rewards) / len(ep_rewards) if ep_rewards else 0.0
+                
+                print(f"    [Episode {current_ep}/{total_eps}] Steps: {step_count} | Avg Total Reward/Agent: {avg_r:.2f} | Loss: {step_loss_val:.4f}")
 
         # --- APPLY ACCUMULATED GRADIENTS AT END OF EPOCH ---
         torch.nn.utils.clip_grad_norm_(net.parameters(), 0.5)
