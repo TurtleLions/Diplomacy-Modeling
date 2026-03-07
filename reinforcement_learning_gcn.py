@@ -13,10 +13,6 @@ from pettingzoo import ParallelEnv
 from gymnasium.spaces import Box, MultiDiscrete
 
 def get_adjacency_matrix(game):
-    """
-    Builds a normalized adjacency matrix using 'loc_abut' from 
-    Diplomacy 1.1.2 engine.
-    """
     provinces = game.map.locs 
     prov_to_idx = {prov: i for i, prov in enumerate(provinces)}
     num_provs = len(provinces)
@@ -45,9 +41,6 @@ def get_adjacency_matrix(game):
     return torch.tensor(normalized_adj, dtype=torch.float32)
 
 def parse_state_to_tensor(turn_data):
-    """
-    Parses a Diplomacy JSON state into a (81, 16) NumPy tensor.
-    """
     game = Game()
     provinces = game.map.locs 
     prov_to_idx = {prov: i for i, prov in enumerate(provinces)}
@@ -97,19 +90,12 @@ ACTION_TO_IDX = {a: i for i, a in enumerate(ACTION_TYPES)}
 IDX_TO_ACTION = {i: a for a, i in ACTION_TO_IDX.items()}
 
 def get_province_vocab(game):
-    """
-    Returns the vocabulary for targets (Size: 82).
-    """
     provinces = ['NONE'] + list(game.map.locs)
     prov_to_idx = {p: i for i, p in enumerate(provinces)}
     idx_to_prov = {i: p for p, i in prov_to_idx.items()}
     return prov_to_idx, idx_to_prov
 
 def get_compositional_action_mask(game, power, provinces, prov_to_idx):
-    """
-    Parses the legal text orders into grammatical tokens and builds 
-    independent binary masks.
-    """
     num_provs = len(provinces)
     
     type_mask = np.zeros((num_provs, len(ACTION_TYPES)), dtype=np.int8)
@@ -155,9 +141,6 @@ def get_compositional_action_mask(game, power, provinces, prov_to_idx):
     return {'type': type_mask, 'target1': t1_mask, 'target2': t2_mask}
 
 def decode_compositional_order(province, action_array, game, idx_to_action, idx_to_prov):
-    """
-    Translates integer array back into text string.
-    """
     act_idx, t1_idx, t2_idx = action_array
     
     act_str = idx_to_action[act_idx]
@@ -270,8 +253,15 @@ class DiplomacyEnv(ParallelEnv):
         return observations, infos
 
     def step(self, actions):
+        # 1. Clear previous orders and record Pre-Step State for rewards
         self.game.clear_orders()
         
+        prev_sc_owners = {}
+        for agent in self.possible_agents:
+            for sc in self.game.get_centers(agent):
+                prev_sc_owners[sc] = agent
+        
+        # 2. Set new orders
         for agent, action_matrix in actions.items():
             text_orders = []
             for prov_idx, action_array in enumerate(action_matrix):
@@ -284,31 +274,60 @@ class DiplomacyEnv(ParallelEnv):
                     text_orders.append(order_str)
             self.game.set_orders(agent, text_orders)
             
+        # 3. Adjudicate the turn
         self.game.process()
         
+        # 4. Generate Post-Step Observations
         live_state_wrapper = {'state': self.game.get_state()}
         global_obs_tensor = parse_state_to_tensor(live_state_wrapper)
         observations = {agent: global_obs_tensor.copy() for agent in self.agents}
         
-        rewards = {}
-        for agent in self.agents:
-            sc_count = len(self.game.get_centers(agent))
-            rewards[agent] = float(sc_count) 
-            
+        # 5. Calculate Grand Strategy Shaped Rewards
+        rewards = {agent: 0.0 for agent in self.agents}
         is_done = False
+        
         for agent in self.agents:
-            if len(self.game.get_centers(agent)) >= 18:
+            current_scs = self.game.get_centers(agent)
+            agent_units = self.game.get_state()['units'].get(agent, [])
+            
+            # Baseline Maintenance
+            rewards[agent] += len(current_scs) * 0.05
+            
+            # Capture & Loss Mechanics
+            for sc in current_scs:
+                if sc not in prev_sc_owners:
+                    rewards[agent] += 1.0  # Captured neutral
+                elif prev_sc_owners[sc] != agent:
+                    rewards[agent] += 2.0  # Stole enemy SC
+                    
+            for sc, owner in prev_sc_owners.items():
+                if owner == agent and sc not in current_scs:
+                    rewards[agent] -= 2.0  # Lost an SC
+                    
+            # Tactical Penalties
+            dislodged_count = sum(1 for u in agent_units if '*' in u)
+            rewards[agent] -= (dislodged_count * 0.5) 
+            
+            # The Grand Objective
+            if len(current_scs) >= 18:
+                rewards[agent] += 100.0
                 is_done = True
                 
+            # Elimination Penalty
+            if len(current_scs) == 0 and len(agent_units) == 0:
+                rewards[agent] -= 50.0
+
         terminations = {agent: is_done for agent in self.agents}
         truncations = {agent: False for agent in self.agents} 
         
+        # 6. Generate action masks for the next turn
         infos = {agent: {} for agent in self.agents} 
         for agent in self.agents:
             infos[agent]['action_mask'] = get_compositional_action_mask(
                 self.game, agent, self.provinces, self.prov_to_idx
             )
             
+        # 7. Remove eliminated agents from active roster
         self.agents = [
             agent for agent in self.agents 
             if not terminations[agent] and 
@@ -445,8 +464,8 @@ if __name__ == "__main__":
     optimizer = optim.Adam(net.parameters(), lr=1e-4)
     
     # --- TRAINING HYPERPARAMETERS ---
-    num_epochs = 100            # Total number of epochs
-    accum_steps = 4             # Episodes per epoch (Gradient Accumulation Steps)
+    num_epochs = 1000 
+    accum_steps = 10  
     entropy_coef = 0.05 
     gamma = 0.99 
 
@@ -583,7 +602,7 @@ if __name__ == "__main__":
                     all_act_t1.extend(data['act_t1'])
                     all_act_t2.extend(data['act_t2'])
                     
-            step_loss_val = 0.0 # Default in case of empty batch
+            step_loss_val = 0.0 
             
             if all_obs:
                 b_obs = torch.stack(all_obs).to(device)
@@ -621,10 +640,9 @@ if __name__ == "__main__":
                     
                     loss.backward()
                     
-                    step_loss_val = loss.item() * accum_steps # Unscale to show the true loss for this episode
+                    step_loss_val = loss.item() * accum_steps 
                     epoch_loss += loss.item() 
 
-            # --- EPISODE LOGGING ---
             if global_rank == 0:
                 current_ep = epoch * accum_steps + accum_step + 1
                 total_eps = num_epochs * accum_steps
@@ -645,9 +663,10 @@ if __name__ == "__main__":
         
         if global_rank == 0:
             print(f"  Master Node - Avg Epoch Loss: {epoch_loss:.4f}")
-            checkpoint_path = f"diplomacy_rl_model_epoch_{epoch+1}.pth"
-            torch.save(net.module.state_dict(), checkpoint_path)
-            print(f"  Saved checkpoint: {checkpoint_path}")
+            if(epoch + 1) % 50 == 0:
+                checkpoint_path = f"diplomacy_rl_model_epoch_{epoch+1}.pth"
+                torch.save(net.module.state_dict(), checkpoint_path)
+                print(f"  Saved checkpoint: {checkpoint_path}")
 
     if global_rank == 0:
         print("\nTraining complete!")
