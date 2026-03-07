@@ -481,14 +481,13 @@ if __name__ == "__main__":
             nn.utils.clip_grad_norm_(net.parameters(), 0.5)
             optimizer.step()
 
-        b_masks.zero_()
-        b_rewards.zero_()
-
         # --- RANK 0 LOGGING & SAVING ---
         if global_rank == 0:
             end_time = time.time()  
             global_steps = NUM_ENVS * NUM_STEPS * NUM_AGENTS * dist.get_world_size()
             sps = int(global_steps / (end_time - start_time))  
+            
+            # Calculate reward BEFORE wiping the buffer
             avg_reward = b_rewards.sum() / (NUM_ENVS * NUM_AGENTS) 
             
             print(f"Update: {update}/{num_updates} | SPS: {sps} | Avg Reward: {avg_reward:.2f} | Loss: {loss.item():.4f} | Val Loss: {v_loss.item():.4f} | Ent: {entropy.item():.4f}")   
@@ -506,6 +505,9 @@ if __name__ == "__main__":
                 torch.save(net.module.state_dict(), ckpt_path)
                 print(f"  -> Saved checkpoint to {ckpt_path}")
 
+        # Cleanup buffers for the next update
+        b_masks.zero_()
+        b_rewards.zero_()
     # --- PROPER CLEANUP (OUTSIDE THE LOOP) ---
     vec_env.close()
     if global_rank == 0:
