@@ -480,5 +480,6 @@ if __name__ == "__main__":
             avg_reward = b_rewards.sum() / (NUM_ENVS * NUM_AGENTS) # Local approx metric
             
             # 4. UPDATE YOUR PRINT STATEMENT
-            print(f"Update: {update}/{num_updates} | SPS: {sps} | Avg Reward: {avg_reward:.2f} | Loss: {loss.item():.4f} | Val Loss: {v_loss.item():.4f} | Ent: {entropy.item():.4f}")    vec_env.close()
+            print(f"Update: {update}/{num_updates} | SPS: {sps} | Avg Reward: {avg_reward:.2f} | Loss: {loss.item():.4f} | Val Loss: {v_loss.item():.4f} | Ent: {entropy.item():.4f}")   
+            vec_env.close()
     dist.destroy_process_group()
