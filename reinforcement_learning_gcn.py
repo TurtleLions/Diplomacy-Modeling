@@ -284,7 +284,7 @@ if __name__ == "__main__":
     device = torch.device(f"cuda:{local_rank}")
     torch.cuda.set_device(device)
 
-    NUM_ENVS = 16 # Scale this up to feed the GPU
+    NUM_ENVS = 14 # Scale this up to feed the GPU
     NUM_STEPS = 100
     NUM_AGENTS = 7
     PROVINCES = 83 # Target vocab length
