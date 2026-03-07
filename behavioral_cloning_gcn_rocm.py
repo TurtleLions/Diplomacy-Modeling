@@ -555,33 +555,75 @@ def train_behavioral_cloning(rank, world_size):
     optimizer = optim.Adam(net.parameters(), lr=LEARNING_RATE)
     scaler = GradScaler() # Helps with stability on MI210 Matrix Cores
 
+    # Ensure total_loss is initialized for tracking across the epoch
+    total_loss = 0.0 
+
     for epoch in range(EPOCHS):
         sampler.set_epoch(epoch) # Required for shuffling in DDP
         net.train()
         
         for batch_idx, batch in enumerate(dataloader):
+            # Move all batch data to the specific GPU rank (local_rank)
             states = batch['state'].to(rank)
             targets = batch['targets'].to(rank)
-            # ... masks to rank ...
-            
+            mask_type = batch['mask_type'].to(rank)
+            mask_t1 = batch['mask_t1'].to(rank)
+            mask_t2 = batch['mask_t2'].to(rank)
+
             optimizer.zero_grad()
 
-            # Use Autocast for MI210 Performance
-            with autocast(dtype=torch.bfloat16):
+            # Optimized Autocast for MI210 Matrix Cores using modern torch.amp
+            with torch.amp.autocast('cuda', dtype=torch.bfloat16):
                 type_logits, t1_logits, t2_logits = net(states)
-                # ... Flattening and Valid Training Mask logic (same as your original) ...
+
+                # Flatten logits and masks for cross-entropy calculation
+                type_logits_flat = type_logits.view(-1, type_logits.size(-1))
+                t1_logits_flat = t1_logits.view(-1, t1_logits.size(-1))
+                t2_logits_flat = t2_logits.view(-1, t2_logits.size(-1))
                 
-                # Assume your loss calculation logic here
-                loss = loss_type + loss_t1 + loss_t2
+                mask_type_flat = mask_type.view(-1, mask_type.size(-1))
+                mask_t1_flat = mask_t1.view(-1, mask_t1.size(-1))
+                mask_t2_flat = mask_t2.view(-1, mask_t2.size(-1))
+                
+                targets_flat = targets.view(-1, 3)
 
-            scaler.scale(loss).backward()
-            scaler.unscale_(optimizer)
-            torch.nn.utils.clip_grad_norm_(net.parameters(), 0.5)
-            scaler.step(optimizer)
-            scaler.update()
+                # Verify human moves against engine masks to prevent training on illegal indices
+                is_legal_type = mask_type_flat.gather(1, targets_flat[:, 0:1]).squeeze()
+                is_legal_t1 = mask_t1_flat.gather(1, targets_flat[:, 1:2]).squeeze()
+                is_legal_t2 = mask_t2_flat.gather(1, targets_flat[:, 2:3]).squeeze()
 
-        if rank == 0: # Only save from the lead GPU
-            print(f"Epoch {epoch+1} complete. Saving...")
+                # Build mask: Unit must exist (type != 0) and all move parts must be legal
+                valid_training_mask = (targets_flat[:, 0] != 0) & is_legal_type & is_legal_t1 & is_legal_t2
+
+                # THE FIX: Only proceed if there are valid provinces to train on in this batch
+                if valid_training_mask.any():
+                    # Apply masking for illegal indices before loss calculation
+                    type_logits_masked = type_logits_flat.masked_fill(~mask_type_flat, -1e4)
+                    t1_logits_masked = t1_logits_flat.masked_fill(~mask_t1_flat, -1e4)
+                    t2_logits_masked = t2_logits_flat.masked_fill(~mask_t2_flat, -1e4)
+
+                    # Calculate CrossEntropyLoss for the three action components
+                    loss_type = criterion(type_logits_masked[valid_training_mask], targets_flat[valid_training_mask, 0])
+                    loss_t1 = criterion(t1_logits_masked[valid_training_mask], targets_flat[valid_training_mask, 1])
+                    loss_t2 = criterion(t2_logits_masked[valid_training_mask], targets_flat[valid_training_mask, 2])
+
+                    # Sum losses within the scope where they are defined
+                    loss = loss_type + loss_t1 + loss_t2
+
+                    # Distributed backward pass and optimizer step
+                    scaler.scale(loss).backward()
+                    scaler.unscale_(optimizer)
+                    torch.nn.utils.clip_grad_norm_(net.parameters(), 0.5)
+                    scaler.step(optimizer)
+                    scaler.update()
+
+                    total_loss += loss.item()
+
+            if batch_idx % 20 == 0 and rank == 0:
+                print(f"Epoch {epoch+1} | Batch {batch_idx}/{len(dataloader)} | Loss: {loss.item():.4f}")
+
+        if rank == 0:
+            print(f"Epoch {epoch+1} Complete. Saving checkpoint...")
             torch.save(net.module.state_dict(), "diplomacy_gcn_bc.pth")
 
     cleanup()
