@@ -9,6 +9,8 @@ import multiprocessing as mp
 import torch.distributed as dist
 from torch.nn.parallel import DistributedDataParallel as DDP
 from contextlib import nullcontext
+from pettingzoo import ParallelEnv
+from gymnasium.spaces import Box, MultiDiscrete
 
 def get_adjacency_matrix(game):
     """
