@@ -285,7 +285,7 @@ if __name__ == "__main__":
     device = torch.device(f"cuda:{local_rank}")
     torch.cuda.set_device(device)
 
-    NUM_ENVS = 42 # Scale this up to feed the GPU
+    NUM_ENVS = 56 # Scale this up to feed the GPU
     NUM_STEPS = 100
     NUM_AGENTS = 7
 
@@ -480,6 +480,5 @@ if __name__ == "__main__":
             avg_reward = b_rewards.sum() / (NUM_ENVS * NUM_AGENTS) # Local approx metric
             
             # 4. UPDATE YOUR PRINT STATEMENT
-            print(f"Update: {update}/{num_updates} | SPS: {sps} | Loss: {loss.item():.4f} | Val Loss: {v_loss.item():.4f} | Ent: {entropy.item():.4f}")
-    vec_env.close()
+            print(f"Update: {update}/{num_updates} | SPS: {sps} | Avg Reward: {avg_reward:.2f} | Loss: {loss.item():.4f} | Val Loss: {v_loss.item():.4f} | Ent: {entropy.item():.4f}")    vec_env.close()
     dist.destroy_process_group()
