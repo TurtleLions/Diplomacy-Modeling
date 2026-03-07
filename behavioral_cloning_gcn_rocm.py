@@ -525,7 +525,6 @@ EPOCHS = 10
 MAX_PHASES = None # Set to None for full dataset
 
 def train_behavioral_cloning(rank, world_size):
-    setup()
     print(f"Rank {rank} starting on GPU {torch.cuda.current_device()}")
 
     # 1. Initialize Engine and Map Topology
@@ -588,12 +587,14 @@ def train_behavioral_cloning(rank, world_size):
     cleanup()
 
 if __name__ == "__main__":
-    # Optimize for your PCIe topology on 'monster'
+    # Optimize for PCIe topology on 'monster'
     os.environ["RCCL_P2P_LEVEL"] = "PCIE" 
     
-    # setup() now pulls the correct info from torchrun
+    # 1. Initialize the process group and get rank info
     rank, world_size = setup()
     
+    # 2. Pass those to the training function
     train_behavioral_cloning(rank, world_size)
     
+    # 3. Clean up only at the very end
     cleanup()
