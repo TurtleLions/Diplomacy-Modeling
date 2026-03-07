@@ -15,14 +15,17 @@ from torch.utils.data.distributed import DistributedSampler
 from torch.cuda.amp import autocast, GradScaler
 
 def setup():
-    # Torchrun provides these via environment variables automatically
+    """Initializes the distributed environment for ROCm/MI210."""
     rank = int(os.environ["RANK"])
     world_size = int(os.environ["WORLD_SIZE"])
     local_rank = int(os.environ["LOCAL_RANK"])
     
-    # Initialize using the environment (no need to pass rank/world_size manually)
-    dist.init_process_group("nccl") # RCCL uses 'nccl' alias
+    # Claim the specific MI210 for this process
     torch.cuda.set_device(local_rank)
+    
+    # Initialize the process group using the RCCL-friendly 'nccl' backend
+    dist.init_process_group(backend="nccl")
+    
     return rank, world_size
 
 def cleanup():
@@ -522,7 +525,7 @@ EPOCHS = 10
 MAX_PHASES = None # Set to None for full dataset
 
 def train_behavioral_cloning(rank, world_size):
-    setup(rank, world_size)
+    setup()
     print(f"Rank {rank} starting on GPU {torch.cuda.current_device()}")
 
     # 1. Initialize Engine and Map Topology
