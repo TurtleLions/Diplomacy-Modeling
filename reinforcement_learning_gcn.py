@@ -496,12 +496,31 @@ class DiplomacyGCN(nn.Module):
         return type_logits, t1_logits, t2_logits
 
 if __name__ == "__main__":
-    env = DiplomacyEnv()
-    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    print(f"Using device: {device}")
+    import torch.distributed as dist
+    from torch.nn.parallel import DistributedDataParallel as DDP
 
+    # 1. Initialize Distributed Process Group (NCCL is optimized for both CUDA and ROCm)
+    dist.init_process_group(backend="nccl")
+    
+    # 2. Get process and hardware ranks
+    local_rank = int(os.environ["LOCAL_RANK"])
+    global_rank = int(os.environ["RANK"])
+    
+    # Map the 28 processes cleanly across the 4 GPUs (7 processes per GPU)
+    num_gpus = torch.cuda.device_count()
+    device_id = local_rank % num_gpus
+    torch.cuda.set_device(device_id)
+    device = torch.device(f"cuda:{device_id}")
+
+    if global_rank == 0:
+        print(f"--- STARTING DISTRIBUTED RL ---")
+        print(f"Detected {num_gpus} GPUs. Running 28 parallel environments.")
+
+    env = DiplomacyEnv()
     adj_matrix = get_adjacency_matrix(env.game).to(device)
     target_vocab_length = len(env.prov_to_idx)
+    
+    # 3. Instantiate and wrap the model in DDP
     net = DiplomacyGCN(
         adj=adj_matrix, 
         input_dim=16, 
@@ -509,25 +528,27 @@ if __name__ == "__main__":
         target_vocab_size=target_vocab_length
     ).to(device)
     
-    # Load BC weights
+    # DDP syncs gradients across all 28 processes automatically during backward()
+    net = DDP(net, device_ids=[device_id])
+    
     model_path = "diplomacy_gcn_bc_2_5644.pth"
     if os.path.exists(model_path):
-        net.load_state_dict(torch.load(model_path, map_location=device))
-        print(f"Successfully loaded pre-trained BC weights from {model_path}")
-    else:
-        print("No BC weights found. Starting from scratch.")
-        
+        # map_location ensures weights load directly to the correct GPU
+        net.module.load_state_dict(torch.load(model_path, map_location=device))
+        if global_rank == 0:
+            print(f"Successfully loaded pre-trained BC weights.")
+    
     optimizer = optim.Adam(net.parameters(), lr=1e-4)
     
     num_episodes = 10000 
     entropy_coef = 0.05 
     gamma = 0.99 
-    
-    print("\n--- STARTING UPGRADED RL SELF-PLAY ---")
-    
+
     for episode in range(num_episodes):
         obs, infos = env.reset()
-        print(f"\n[Episode {episode+1}/{num_episodes}] Game Started!")
+        
+        if global_rank == 0:
+            print(f"\n[Episode {episode+1}/{num_episodes}] Games running across cluster...")
 
         episode_log_probs = {agent: [] for agent in env.possible_agents}
         episode_rewards = {agent: [] for agent in env.possible_agents}
@@ -536,14 +557,14 @@ if __name__ == "__main__":
         prev_sc_counts = {agent: float(len(env.game.get_centers(agent))) for agent in env.possible_agents}
         
         step_count = 0
+        
+        # Note: Even if episodes finish at different step counts across the 28 processes,
+        # DDP handles this safely as long as every process eventually calls .backward() exactly once per loop.
         while env.agents: 
-            current_phase = env.game.phase
-            
             actions = {}
             turn_log_probs = {}
             turn_entropies = {}
             
-            # 1. Collect actions from all live agents
             for agent in env.agents:
                 state_tensor = torch.tensor(obs[agent]).unsqueeze(0).to(device)
                 
@@ -554,7 +575,6 @@ if __name__ == "__main__":
                 
                 type_logits, t1_logits, t2_logits = net(state_tensor)
                 
-                # Apply Masks
                 type_logits = type_logits.masked_fill(~mask_type, -1e9)
                 t1_logits = t1_logits.masked_fill(~mask_t1, -1e9)
                 t2_logits = t2_logits.masked_fill(~mask_t2, -1e9)
@@ -590,34 +610,26 @@ if __name__ == "__main__":
                     t2_action.squeeze(0)
                 ], dim=-1).cpu().numpy()
 
-            # --- PRE-STEP DATA FOR REWARDS ---
             all_supply_centers = env.game.map.scs
             prev_sc_owners = {sc: p for p in env.possible_agents for sc in env.game.get_centers(p)}
-            neutral_scs_before = [sc for sc in all_supply_centers if sc not in prev_sc_owners]
 
-            # 2. Step the environment
             next_obs, rewards, terminations, truncations, next_infos = env.step(actions)
             
-            # 3. Calculate Shaped Rewards
             for agent in env.possible_agents:
                 if agent not in turn_log_probs: continue
                 
                 current_sc_list = env.game.get_centers(agent)
                 current_sc_count = len(current_sc_list)
-                
-                # Maintenance reward
                 step_reward = current_sc_count * 0.1 
 
-                # Capture/Loss rewards
                 for sc in current_sc_list:
-                    if sc not in prev_sc_owners: step_reward += 1.0 # Neutral
-                    elif prev_sc_owners[sc] != agent: step_reward += 1.5 # Steal
+                    if sc not in prev_sc_owners: step_reward += 1.0 
+                    elif prev_sc_owners[sc] != agent: step_reward += 1.5 
 
                 for sc, owner in prev_sc_owners.items():
                     if owner == agent and sc not in current_sc_list:
-                        step_reward -= 2.0 # Lost SC
+                        step_reward -= 2.0 
 
-                # Retreat penalty
                 agent_units = env.game.get_state()['units'].get(agent, [])
                 dislodged_count = sum(1 for u in agent_units if '*' in u)
                 step_reward -= (dislodged_count * 0.5)
@@ -631,8 +643,7 @@ if __name__ == "__main__":
             step_count += 1
             if step_count > 100: break
                 
-        # --- UPDATE PHASE ---
-        print(f"\n  Episode Finished. Steps: {step_count} | Adjudicating...")
+        # --- SYNCHRONIZED UPDATE PHASE ---
         policy_loss = []
         for agent in env.possible_agents:
             if not episode_log_probs[agent]: continue
@@ -655,12 +666,19 @@ if __name__ == "__main__":
         if policy_loss:
             optimizer.zero_grad()
             total_loss = torch.stack(policy_loss).sum()
+            
+            # This backward pass acts as the synchronization barrier for all 28 processes
             total_loss.backward()
+            
             torch.nn.utils.clip_grad_norm_(net.parameters(), 0.5)
             optimizer.step()
-            print(f"  Total Policy Loss: {total_loss.item():.4f}")
-        
-        print(f"  Final SCs: { {k: int(v) for k, v in prev_sc_counts.items()} }")
+            
+            if global_rank == 0:
+                print(f"  Master Node - Policy Loss: {total_loss.item():.4f}")
 
-    torch.save(net.state_dict(), "diplomacy_rl_model.pth")
-    print("\nRL Training complete! Model saved.")
+    if global_rank == 0:
+        # Access the underlying model using .module when saving from DDP
+        torch.save(net.module.state_dict(), "diplomacy_rl_model_ddp.pth")
+        print("\nDistributed RL Training complete! Model saved.")
+
+    dist.destroy_process_group()
