@@ -12,6 +12,7 @@ from contextlib import nullcontext
 from pettingzoo import ParallelEnv
 from gymnasium.spaces import Box, MultiDiscrete
 import time
+from torch.utils.tensorboard import SummaryWriter
 
 # --- 1. UTILITIES & ENVIRONMENT (Unchanged Logic, Optimized for Speed) ---
 def get_adjacency_matrix(game):
@@ -301,7 +302,7 @@ if __name__ == "__main__":
     device = torch.device(f"cuda:{local_rank}")
     torch.cuda.set_device(device)
 
-    NUM_ENVS = 28 # Scale this up to feed the GPU
+    NUM_ENVS = 56 # Scale this up to feed the GPU
     NUM_STEPS = 100
     NUM_AGENTS = 7
 
@@ -350,6 +351,11 @@ if __name__ == "__main__":
     next_env_results = vec_env.reset()
     next_done = torch.zeros((NUM_ENVS, NUM_AGENTS), device=device)
 
+    # --- TENSORBOARD & CHECKPOINT SETUP ---
+    if global_rank == 0:
+        os.makedirs("./checkpoints", exist_ok=True)
+        writer = SummaryWriter(log_dir="./runs/diplomacy_ppo_01")
+
     for update in range(1, num_updates + 1):
         start_time = time.time()
         # Entropy schedule
@@ -364,8 +370,8 @@ if __name__ == "__main__":
             
             with torch.no_grad():
                 for i in range(NUM_ENVS):
-                    obs_dict, infos_dict, active_agents = next_env_results[i] if len(next_env_results[i]) == 3 else (*next_env_results[i][0:2], next_env_results[i][-2], next_env_results[i][-1])[0:3] # handle reset vs step outputs
-                    if len(next_env_results[i]) == 6: # Step output
+                    obs_dict, infos_dict, active_agents = next_env_results[i] if len(next_env_results[i]) == 3 else (*next_env_results[i][0:2], next_env_results[i][-2], next_env_results[i][-1])[0:3]
+                    if len(next_env_results[i]) == 6: 
                         obs_dict, step_rewards, terms, _, infos_dict, active_agents = next_env_results[i]
                         for a in possible_agents:
                             b_rewards[step-1, i, agent_to_idx[a]] = step_rewards.get(a, 0.0)
@@ -381,7 +387,6 @@ if __name__ == "__main__":
                         b_m_t1[step, i, a_idx] = torch.tensor(m_dict['target1'], device=device)
                         b_m_t2[step, i, a_idx] = torch.tensor(m_dict['target2'], device=device)
 
-                # Batched Inference over active agents
                 flat_obs = b_obs[step][b_masks[step]]
                 if flat_obs.shape[0] > 0:
                     type_l, t1_l, t2_l, values = net(flat_obs)
@@ -396,7 +401,6 @@ if __name__ == "__main__":
                     active_unit_mask = (a_type != 0)
                     log_p = type_dist.log_prob(a_type) + t1_dist.log_prob(a_t1) + t2_dist.log_prob(a_t2)
                     
-                    # Distribute back to buffers
                     b_values[step][b_masks[step]] = values.squeeze()
                     b_logprobs[step][b_masks[step]] = (log_p * active_unit_mask).sum(dim=1)
                     
@@ -411,10 +415,8 @@ if __name__ == "__main__":
 
             next_env_results = vec_env.step(actions_to_send)
             
-        # Get next value for GAE
         with torch.no_grad():
             next_value = torch.zeros((NUM_ENVS, NUM_AGENTS), device=device)
-            # Simplification: estimate 0 for next value if done, else forward pass (omitted for brevity, assume 0 for terminal)
             
         # --- GAE CALCULATION ---
         advantages = torch.zeros_like(b_rewards).to(device)
@@ -430,7 +432,6 @@ if __name__ == "__main__":
             advantages[t] = lastgaelam = delta + gamma * gae_lambda * nextnonterminal * lastgaelam
         returns = advantages + b_values
 
-        # Flatten buffers (Only keep valid agent steps)
         valid = b_masks.view(-1)
         flat_obs = b_obs.view(-1, MAP_PROVINCES, 16)[valid]
         flat_act = b_actions.view(-1, MAP_PROVINCES, 3)[valid]
@@ -443,14 +444,12 @@ if __name__ == "__main__":
         flat_m_t1 = b_m_t1.view(-1, MAP_PROVINCES, VOCAB_SIZE)[valid]
         flat_m_t2 = b_m_t2.view(-1, MAP_PROVINCES, VOCAB_SIZE)[valid]
 
-        # Global Batch Normalization (The Fix)
         if flat_adv.shape[0] > 1:
             flat_adv = (flat_adv - flat_adv.mean()) / (flat_adv.std() + 1e-8)
 
         # --- UPDATE PHASE ---
         net.train()
         for epoch in range(update_epochs):
-            # In a full setup, you'd mini-batch this. For simplicity, full-batch update here.
             type_l, t1_l, t2_l, new_val = net(flat_obs)
             
             type_l = type_l.masked_fill(~flat_m_type, -1e9)
@@ -482,20 +481,33 @@ if __name__ == "__main__":
             nn.utils.clip_grad_norm_(net.parameters(), 0.5)
             optimizer.step()
 
-        # Cleanup buffers for next update
         b_masks.zero_()
         b_rewards.zero_()
 
+        # --- RANK 0 LOGGING & SAVING ---
         if global_rank == 0:
-            end_time = time.time()  # <--- 2. ADD THIS HERE
-            
-            # Calculate total global steps across all GPUs (World Size)
+            end_time = time.time()  
             global_steps = NUM_ENVS * NUM_STEPS * NUM_AGENTS * dist.get_world_size()
-            sps = int(global_steps / (end_time - start_time))  # <--- 3. ADD THIS HERE
+            sps = int(global_steps / (end_time - start_time))  
+            avg_reward = b_rewards.sum() / (NUM_ENVS * NUM_AGENTS) 
             
-            avg_reward = b_rewards.sum() / (NUM_ENVS * NUM_AGENTS) # Local approx metric
-            
-            # 4. UPDATE YOUR PRINT STATEMENT
             print(f"Update: {update}/{num_updates} | SPS: {sps} | Avg Reward: {avg_reward:.2f} | Loss: {loss.item():.4f} | Val Loss: {v_loss.item():.4f} | Ent: {entropy.item():.4f}")   
-            vec_env.close()
+            
+            # 1. Log to TensorBoard
+            writer.add_scalar("Perf/SPS", sps, update)
+            writer.add_scalar("Reward/Avg_Reward", avg_reward, update)
+            writer.add_scalar("Loss/Policy_Loss", loss.item(), update)
+            writer.add_scalar("Loss/Value_Loss", v_loss.item(), update)
+            writer.add_scalar("Loss/Entropy", entropy.item(), update)
+
+            # 2. Save Checkpoint every 50 updates
+            if update % 50 == 0:
+                ckpt_path = f"./checkpoints/diplomacy_ppo_update_{update}.pth"
+                torch.save(net.module.state_dict(), ckpt_path)
+                print(f"  -> Saved checkpoint to {ckpt_path}")
+
+    # --- PROPER CLEANUP (OUTSIDE THE LOOP) ---
+    vec_env.close()
+    if global_rank == 0:
+        writer.close()
     dist.destroy_process_group()
