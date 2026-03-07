@@ -201,10 +201,18 @@ class GCNLayer(nn.Module):
     def __init__(self, in_features, out_features):
         super().__init__()
         self.projection = nn.Linear(in_features, out_features)
+        self.norm = nn.LayerNorm(out_features) # <-- 1. Added LayerNorm
 
     def forward(self, x, adj):
-        out = torch.relu(torch.matmul(adj, self.projection(x)))
-        # Residual connection if dimensions match
+        # 2. Project and aggregate
+        out = self.projection(x)
+        out = torch.matmul(adj, out)
+        
+        # 3. Normalize the values BEFORE the activation function
+        out = self.norm(out)           
+        out = torch.relu(out)
+        
+        # Residual connection
         if x.shape[-1] == out.shape[-1]:
             return x + out
         return out
@@ -320,7 +328,7 @@ if __name__ == "__main__":
 
     net = DiplomacyActorCritic(adj=adj_matrix, target_vocab_size=VOCAB_SIZE).to(device)
     net = DDP(net, device_ids=[local_rank])
-    optimizer = optim.Adam(net.parameters(), lr=3e-4, eps=1e-5)
+    optimizer = optim.Adam(net.parameters(), lr=1e-4, eps=1e-5)
 
     # Pre-allocate Tensors (Zero memory fragmentation)
     b_obs = torch.zeros((NUM_STEPS, NUM_ENVS, NUM_AGENTS, MAP_PROVINCES, 16), dtype=torch.float32, device=device)
