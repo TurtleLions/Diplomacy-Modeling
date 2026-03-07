@@ -503,7 +503,7 @@ class DiplomacyGCN(nn.Module):
 def worker(remote, parent_remote):
     """Runs a dedicated Diplomacy environment on a single CPU core."""
     parent_remote.close()
-    env = DiplomacyEnv()
+    env = DiplomacyEnv() # Ensure your DiplomacyEnv is defined above this or imported
     
     while True:
         try:
@@ -621,6 +621,10 @@ if __name__ == "__main__":
         while step_count < 100: 
             actions_to_send = [{} for _ in range(NUM_ENVS_PER_GPU)]
             
+            # Temporary storage to align actions with rewards for this step
+            step_log_probs = {e: {a: None for a in possible_agents} for e in range(NUM_ENVS_PER_GPU)}
+            step_entropies = {e: {a: None for a in possible_agents} for e in range(NUM_ENVS_PER_GPU)}
+            
             for agent in possible_agents:
                 active_env_indices = []
                 obs_list = []
@@ -673,14 +677,15 @@ if __name__ == "__main__":
                             t1_dist.log_prob(t1_action)[idx][active_unit_mask] + 
                             t2_dist.log_prob(t2_action)[idx][active_unit_mask]
                         )
-                        episode_log_probs[env_idx][agent].append(joint_log_prob.sum())
+                        # Store locally for the step
+                        step_log_probs[env_idx][agent] = joint_log_prob.sum()
                         
                         joint_entropy = (
                             type_dist.entropy()[idx][active_unit_mask] + 
                             t1_dist.entropy()[idx][active_unit_mask] + 
                             t2_dist.entropy()[idx][active_unit_mask]
                         )
-                        episode_entropies[env_idx][agent].append(joint_entropy.sum())
+                        step_entropies[env_idx][agent] = joint_entropy.sum()
                     
                     actions_to_send[env_idx][agent] = torch.stack([
                         type_action[idx], 
@@ -688,12 +693,21 @@ if __name__ == "__main__":
                         t2_action[idx]
                     ], dim=-1).cpu().numpy()
 
+            # Execute the actions in the parallel environments
             next_env_results = vec_env.step(actions_to_send)
             
+            # Commit tracking buffers only if an action was generated
             for i in range(NUM_ENVS_PER_GPU):
                 obs, rewards, terms, truncs, infos, active_agents = next_env_results[i]
-                for agent, r in rewards.items():
-                    episode_rewards[i][agent].append(float(r))
+                
+                for agent in possible_agents:
+                    if step_log_probs[i][agent] is not None:
+                        episode_log_probs[i][agent].append(step_log_probs[i][agent])
+                        episode_entropies[i][agent].append(step_entropies[i][agent])
+                        
+                        # Guarantee 1:1 length matching by appending reward only if action was valid
+                        step_r = float(rewards.get(agent, 0.0))
+                        episode_rewards[i][agent].append(step_r)
             
             env_results = next_env_results
             
