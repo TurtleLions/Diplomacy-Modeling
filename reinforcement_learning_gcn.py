@@ -673,7 +673,6 @@ if __name__ == "__main__":
                         active_unit_mask = (type_action[idx] != 0)
                         
                         if active_unit_mask.any():
-                            # Send data to CPU to save GPU VRAM during the 100 steps
                             ep_data[env_idx][agent]['obs'].append(obs_list[idx].clone())
                             ep_data[env_idx][agent]['m_type'].append(mask_type_list[idx].clone())
                             ep_data[env_idx][agent]['m_t1'].append(mask_t1_list[idx].clone())
@@ -691,10 +690,8 @@ if __name__ == "__main__":
                             t2_action[idx]
                         ], dim=-1).cpu().numpy()
 
-                # Step parallel environments
                 next_env_results = vec_env.step(actions_to_send)
                 
-                # Assign rewards only to agents that actually took an action this step
                 for i in range(NUM_ENVS_PER_GPU):
                     obs, rewards, terms, truncs, infos, active_agents = next_env_results[i]
                     for agent in possible_agents:
@@ -710,13 +707,16 @@ if __name__ == "__main__":
                 step_count += 1
                 
         # --- SYNCHRONIZED UPDATE PHASE (GRADIENTS ENABLED) ---
-        policy_loss = []
+        all_obs, all_m_type, all_m_t1, all_m_t2 = [], [], [], []
+        all_act_type, all_act_t1, all_act_t2 = [], [], []
+        all_returns = []
+        
+        # 1. Flatten all environments and agents into a single mega-batch
         for i in range(NUM_ENVS_PER_GPU):
             for agent in possible_agents:
                 data = ep_data[i][agent]
                 if len(data['rewards']) == 0: continue
                 
-                # 1. Calculate discounted returns
                 returns, R = [], 0
                 for r in reversed(data['rewards']):
                     R = r + gamma * R
@@ -726,51 +726,53 @@ if __name__ == "__main__":
                 if returns.std() > 0:
                     returns = (returns - returns.mean()) / (returns.std() + 1e-8)
                 
-                # 2. Re-load the trajectory batch onto the GPU
-                b_obs = torch.stack(data['obs']).to(device)
-                b_m_type = torch.stack(data['m_type']).to(device)
-                b_m_t1 = torch.stack(data['m_t1']).to(device)
-                b_m_t2 = torch.stack(data['m_t2']).to(device)
+                all_returns.append(returns)
+                all_obs.extend(data['obs'])
+                all_m_type.extend(data['m_type'])
+                all_m_t1.extend(data['m_t1'])
+                all_m_t2.extend(data['m_t2'])
+                all_act_type.extend(data['act_type'])
+                all_act_t1.extend(data['act_t1'])
+                all_act_t2.extend(data['act_t2'])
                 
-                b_act_type = torch.stack(data['act_type']).to(device)
-                b_act_t1 = torch.stack(data['act_t1']).to(device)
-                b_act_t2 = torch.stack(data['act_t2']).to(device)
-                
-                # 3. One massive batched forward pass to re-evaluate the whole episode
-                type_logits, t1_logits, t2_logits = net(b_obs)
-                
-                type_logits = type_logits.masked_fill(~b_m_type, -1e9)
-                t1_logits = t1_logits.masked_fill(~b_m_t1, -1e9)
-                t2_logits = t2_logits.masked_fill(~b_m_t2, -1e9)
-                
-                type_dist = Categorical(logits=type_logits)
-                t1_dist = Categorical(logits=t1_logits)
-                t2_dist = Categorical(logits=t2_logits)
-                
-                active_unit_mask = (b_act_type != 0)
-                
-                # Calculate joint log probabilities and sum over active provinces (dim 1)
-                log_p = type_dist.log_prob(b_act_type) + t1_dist.log_prob(b_act_t1) + t2_dist.log_prob(b_act_t2)
-                log_p = (log_p * active_unit_mask).sum(dim=1)
-                
-                entropy = type_dist.entropy() + t1_dist.entropy() + t2_dist.entropy()
-                entropy = (entropy * active_unit_mask).sum(dim=1)
-                
-                # Calculate loss
-                loss = -(log_p * returns).mean() - (entropy_coef * entropy.mean())
-                policy_loss.append(loss)
+        # 2. Execute ONE single forward pass for the entire episode across all envs
+        if all_obs:
+            b_obs = torch.stack(all_obs).to(device)
+            b_m_type = torch.stack(all_m_type).to(device)
+            b_m_t1 = torch.stack(all_m_t1).to(device)
+            b_m_t2 = torch.stack(all_m_t2).to(device)
+            b_act_type = torch.stack(all_act_type).to(device)
+            b_act_t1 = torch.stack(all_act_t1).to(device)
+            b_act_t2 = torch.stack(all_act_t2).to(device)
+            b_returns = torch.cat(all_returns).to(device)
             
-        if policy_loss:
+            type_logits, t1_logits, t2_logits = net(b_obs)
+            
+            type_logits = type_logits.masked_fill(~b_m_type, -1e9)
+            t1_logits = t1_logits.masked_fill(~b_m_t1, -1e9)
+            t2_logits = t2_logits.masked_fill(~b_m_t2, -1e9)
+            
+            type_dist = Categorical(logits=type_logits)
+            t1_dist = Categorical(logits=t1_logits)
+            t2_dist = Categorical(logits=t2_logits)
+            
+            active_unit_mask = (b_act_type != 0)
+            
+            log_p = type_dist.log_prob(b_act_type) + t1_dist.log_prob(b_act_t1) + t2_dist.log_prob(b_act_t2)
+            log_p = (log_p * active_unit_mask).sum(dim=1)
+            
+            entropy = type_dist.entropy() + t1_dist.entropy() + t2_dist.entropy()
+            entropy = (entropy * active_unit_mask).sum(dim=1)
+            
+            loss = -(log_p * b_returns).mean() - (entropy_coef * entropy.mean())
+            
             optimizer.zero_grad()
-            total_loss = torch.stack(policy_loss).mean()
-            
-            # This backpropagates entirely through the single batched forward pass
-            total_loss.backward()
+            loss.backward()
             torch.nn.utils.clip_grad_norm_(net.parameters(), 0.5)
             optimizer.step()
             
             if global_rank == 0:
-                print(f"  Master Node - Policy Loss: {total_loss.item():.4f}")
+                print(f"  Master Node - Policy Loss: {loss.item():.4f}")
 
     if global_rank == 0:
         torch.save(net.module.state_dict(), "diplomacy_rl_model_vectorized.pth")
