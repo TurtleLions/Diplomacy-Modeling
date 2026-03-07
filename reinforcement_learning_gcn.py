@@ -506,8 +506,8 @@ if __name__ == "__main__":
                 mb_logprobs = flat_logprobs[mb_idx]
                 mb_adv = flat_adv[mb_idx]
                 
-                # CRITICAL FIX 1: Mini-batch advantage normalization
-                mb_adv = (mb_adv - mb_adv.mean()) / (mb_adv.std() + 1e-8)
+                if mb_adv.shape[0] > 1:
+                    mb_adv = (mb_adv - mb_adv.mean()) / (mb_adv.std() + 1e-8)
                 
                 mb_ret = flat_ret[mb_idx]
                 mb_m_type = flat_m_type[mb_idx]
