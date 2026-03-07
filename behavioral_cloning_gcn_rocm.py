@@ -14,12 +14,16 @@ from torch.nn.parallel import DistributedDataParallel as DDP
 from torch.utils.data.distributed import DistributedSampler
 from torch.cuda.amp import autocast, GradScaler
 
-def setup(rank, world_size):
-    os.environ['MASTER_ADDR'] = 'localhost'
-    os.environ['MASTER_PORT'] = '12355'
-    # ROCm uses 'nccl' (aliased to RCCL) for MI210 PCIe communication
-    dist.init_process_group("nccl", rank=rank, world_size=world_size)
-    torch.cuda.set_device(rank)
+def setup():
+    # Torchrun provides these via environment variables automatically
+    rank = int(os.environ["RANK"])
+    world_size = int(os.environ["WORLD_SIZE"])
+    local_rank = int(os.environ["LOCAL_RANK"])
+    
+    # Initialize using the environment (no need to pass rank/world_size manually)
+    dist.init_process_group("nccl") # RCCL uses 'nccl' alias
+    torch.cuda.set_device(local_rank)
+    return rank, world_size
 
 def cleanup():
     dist.destroy_process_group()
@@ -581,11 +585,12 @@ def train_behavioral_cloning(rank, world_size):
     cleanup()
 
 if __name__ == "__main__":
-    # Performance hack for your PCIe-only topology
+    # Optimize for your PCIe topology on 'monster'
     os.environ["RCCL_P2P_LEVEL"] = "PCIE" 
     
-    world_size = torch.cuda.device_count()
-    # torchrun automatically sets 'RANK'
-    rank = int(os.environ.get("RANK", 0))
+    # setup() now pulls the correct info from torchrun
+    rank, world_size = setup()
     
     train_behavioral_cloning(rank, world_size)
+    
+    cleanup()
