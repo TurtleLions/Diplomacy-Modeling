@@ -19,25 +19,21 @@ from gymnasium.spaces import Box, MultiDiscrete
 # Assuming these are in your local diplomacy_utils.py
 from diplomacy_utils import DiplomacyEnv, DiplomacyGCN, get_adjacency_matrix
 
-# Setup basic terminal logging
-logging.basicConfig(level=logging.INFO, format='%(message)s')
-logger = logging.getLogger("DiplomacyTrainer")
-
 def setup(rank, world_size):
     os.environ['MASTER_ADDR'] = 'localhost'
     os.environ['MASTER_PORT'] = '12355'
-    # NCCL/RCCL for AMD GPUs
+    # NCCL/RCCL for AMD GPUs (MI210)
     dist.init_process_group("nccl", rank=rank, world_size=world_size)
     torch.cuda.set_device(rank)
 
 def cleanup():
-    dist.destroy_process_group()
+    dist.destroy_group()
 
 def train(rank, world_size, num_envs_per_gpu):
     setup(rank, world_size)
     device = torch.device(f"cuda:{rank}")
     
-    # 1. Initialize Vector of Environments (28 total across cluster)
+    # 1. Initialize Vector of Environments (7 per GPU = 28 cores total)
     envs = [DiplomacyEnv() for _ in range(num_envs_per_gpu)]
     sample_env = envs[0]
     
@@ -58,14 +54,15 @@ def train(rank, world_size, num_envs_per_gpu):
     entropy_coef = 0.05
     max_steps = 120
     
-    # Local CSV Logging Setup (Rank 0 only)
+    # Rank 0 handles the Console and CSV Logging
     if rank == 0:
         csv_file = open('training_log.csv', mode='w', newline='')
         csv_writer = csv.writer(csv_file)
         csv_writer.writerow(['epoch', 'loss', 'avg_reward', 'steps'])
+        print(f"--- Starting Training on {world_size} MI210s with {world_size * num_envs_per_gpu} total environments ---")
 
     for epoch in range(1000):
-        # Buffer for log_probs, rewards, and entropies
+        # Buffers for RL metrics
         env_log_probs = {i: {agent: [] for agent in sample_env.possible_agents} for i in range(num_envs_per_gpu)}
         env_rewards = {i: {agent: [] for agent in sample_env.possible_agents} for i in range(num_envs_per_gpu)}
         env_entropies = {i: {agent: [] for agent in sample_env.possible_agents} for i in range(num_envs_per_gpu)}
@@ -87,7 +84,7 @@ def train(rank, world_size, num_envs_per_gpu):
             flat_masks = {'type': [], 't1': [], 't2': []}
             env_agent_map = [] 
 
-            # A. Prepare Batch from all active environments
+            # A. Prepare Batch
             for e_idx in active_envs:
                 for agent in envs[e_idx].agents:
                     flat_obs.append(all_obs[e_idx][agent])
@@ -99,7 +96,6 @@ def train(rank, world_size, num_envs_per_gpu):
 
             if not flat_obs: break
 
-            # Tensor conversion [Batch, 81, 16]
             obs_t = torch.tensor(np.array(flat_obs), dtype=torch.float32).to(device)
             m_type = torch.tensor(np.array(flat_masks['type']), dtype=torch.bool).to(device)
             m_t1 = torch.tensor(np.array(flat_masks['t1']), dtype=torch.bool).to(device)
@@ -118,14 +114,13 @@ def train(rank, world_size, num_envs_per_gpu):
             act_type, act_t1, act_t2 = dist_type.sample(), dist_t1.sample(), dist_t2.sample()
             active_unit_mask = (act_type != 0) 
 
-            # C. Corrected Vectorized Log Prob & Entropy (Fixes the IndexError)
+            # C. Vectorized Log Prob (The IndexError Fix)
             batch_lp = (dist_type.log_prob(act_type) + dist_t1.log_prob(act_t1) + dist_t2.log_prob(act_t2)) * active_unit_mask
             batch_ent = (dist_type.entropy() + dist_t1.entropy() + dist_t2.entropy()) * active_unit_mask
 
             actions_per_env = {i: {} for i in active_envs}
             pre_step_sc_owners = {e_idx: {sc: p for p in sample_env.possible_agents for sc in envs[e_idx].game.get_centers(p)} for e_idx in active_envs}
 
-            # Map batch results back to individual envs
             for idx, (e_idx, agent) in enumerate(env_agent_map):
                 actions_per_env[e_idx][agent] = torch.stack([act_type[idx], act_t1[idx], act_t2[idx]], dim=-1).cpu().numpy()
                 
@@ -133,7 +128,7 @@ def train(rank, world_size, num_envs_per_gpu):
                     env_log_probs[e_idx][agent].append(batch_lp[idx].sum())
                     env_entropies[e_idx][agent].append(batch_ent[idx].sum())
 
-            # D. Execute Step & Calculate Local Rewards
+            # D. Execute Step
             new_active_envs = []
             for e_idx in active_envs:
                 next_obs, rewards, terminations, truncations, next_infos = envs[e_idx].step(actions_per_env[e_idx])
@@ -143,14 +138,14 @@ def train(rank, world_size, num_envs_per_gpu):
                         curr_sc_list = envs[e_idx].game.get_centers(agent)
                         step_reward = len(curr_sc_list) * 0.1 
                         
-                        # Capture / Loss Rewards
+                        # Shaping: Neutral/Enemy Captures
                         for sc in curr_sc_list:
                             if sc not in pre_step_sc_owners[e_idx]: step_reward += 1.0 
                             elif pre_step_sc_owners[e_idx][sc] != agent: step_reward += 1.5 
                         for sc, owner in pre_step_sc_owners[e_idx].items():
                             if owner == agent and sc not in curr_sc_list: step_reward -= 2.0 
 
-                        # Retreat penalty
+                        # Dislodged Unit Penalty
                         dislodged = sum(1 for u in envs[e_idx].game.get_state()['units'].get(agent, []) if '*' in u)
                         step_reward -= (dislodged * 0.5)
                         
@@ -164,13 +159,12 @@ def train(rank, world_size, num_envs_per_gpu):
             active_envs = new_active_envs
             step_count += 1
 
-        # --- POLICY GRADIENT UPDATE ---
+        # --- UPDATE PHASE (Policy Gradient) ---
         policy_losses = []
         for i in range(num_envs_per_gpu):
             for agent in sample_env.possible_agents:
                 if not env_log_probs[i][agent]: continue
                 
-                # Discounted Rewards
                 returns, R = [], 0
                 for r in reversed(env_rewards[i][agent]):
                     R = r + gamma * R
@@ -195,16 +189,19 @@ def train(rank, world_size, num_envs_per_gpu):
 
             if rank == 0:
                 avg_reward = total_epoch_reward / (num_envs_per_gpu * 7)
-                logger.info(f"Epoch {epoch} | Loss: {total_loss.item():.4f} | Avg Reward: {avg_reward:.2f}")
+                # Print to Console
+                print(f"[Epoch {epoch:03d}] Loss: {total_loss.item():.4f} | Avg Reward: {avg_reward:.2f} | Steps: {step_count}")
+                # Save to CSV
                 csv_writer.writerow([epoch, f"{total_loss.item():.4f}", f"{avg_reward:.2f}", step_count])
-                csv_file.flush() # Ensure it writes to disk
+                csv_file.flush() 
 
     if rank == 0:
-        torch.save(model.module.state_dict(), "diplomacy_rl_model_mi210.pth")
+        torch.save(model.module.state_dict(), "diplomacy_rl_model_final.pth")
         csv_file.close()
+        print("--- Training Complete. Model Saved. ---")
     cleanup()
 
 if __name__ == "__main__":
     WORLD_SIZE = 4
-    ENVS_PER_GPU = 7 # Utilizes all 28 cores
+    ENVS_PER_GPU = 7 # 7 * 4 GPUs = 28 cores utilized
     spawn(train, args=(WORLD_SIZE, ENVS_PER_GPU), nprocs=WORLD_SIZE, join=True)
