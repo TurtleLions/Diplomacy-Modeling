@@ -196,23 +196,25 @@ class DiplomacyEnv(ParallelEnv):
         self.agents = [a for a in self.agents if not terminations[a] and (len(self.game.get_centers(a)) > 0 or len(self.game.get_state()['units'].get(a, [])) > 0)]
         return observations, rewards, terminations, {a: False for a in self.agents}, infos
 
-# --- 2. DEEPER GCN WITH RESIDUALS & VALUE HEAD ---
+# --- 2. DEEPER GCN, MLPS & ORTHOGONAL INIT ---
+def layer_init(layer, std=np.sqrt(2), bias_const=0.0):
+    """Initializes network layers to prevent exploding early-game logits."""
+    torch.nn.init.orthogonal_(layer.weight, std)
+    torch.nn.init.constant_(layer.bias, bias_const)
+    return layer
+
 class GCNLayer(nn.Module):
     def __init__(self, in_features, out_features):
         super().__init__()
-        self.projection = nn.Linear(in_features, out_features)
-        self.norm = nn.LayerNorm(out_features) # <-- 1. Added LayerNorm
+        self.projection = layer_init(nn.Linear(in_features, out_features))
+        self.norm = nn.LayerNorm(out_features)
 
     def forward(self, x, adj):
-        # 2. Project and aggregate
         out = self.projection(x)
         out = torch.matmul(adj, out)
-        
-        # 3. Normalize the values BEFORE the activation function
         out = self.norm(out)           
         out = torch.relu(out)
         
-        # Residual connection
         if x.shape[-1] == out.shape[-1]:
             return x + out
         return out
@@ -222,32 +224,56 @@ class DiplomacyActorCritic(nn.Module):
         super().__init__()
         self.register_buffer('adj', adj)
         
-        # Increased depth for better global propagation
+        # 1. Spatial Feature Extractors (GCNs)
         self.gcn1 = GCNLayer(input_dim, hidden_dim)
         self.gcn2 = GCNLayer(hidden_dim, hidden_dim)
         self.gcn3 = GCNLayer(hidden_dim, hidden_dim)
         self.gcn4 = GCNLayer(hidden_dim, hidden_dim)
         
-        # Actor Heads
-        self.type_head = nn.Linear(hidden_dim, 8)
-        self.t1_head = nn.Linear(hidden_dim, target_vocab_size)
-        self.t2_head = nn.Linear(hidden_dim, target_vocab_size)
+        # 2. Deeper Strategy Brain (Actor MLP)
+        self.actor_mlp = nn.Sequential(
+            layer_init(nn.Linear(hidden_dim, hidden_dim)),
+            nn.LayerNorm(hidden_dim),
+            nn.Tanh(),
+            layer_init(nn.Linear(hidden_dim, hidden_dim)),
+            nn.LayerNorm(hidden_dim),
+            nn.Tanh()
+        )
         
-        # Critic (Value) Head - Outputs 1 value per province, pooled for state value
-        self.value_head = nn.Linear(hidden_dim, 1)
+        # 3. Deeper Evaluation Brain (Critic MLP)
+        self.critic_mlp = nn.Sequential(
+            layer_init(nn.Linear(hidden_dim, hidden_dim)),
+            nn.LayerNorm(hidden_dim),
+            nn.Tanh()
+        )
+        
+        # 4. Actor Heads (std=0.01 forces logits to start near zero, maximizing entropy!)
+        self.type_head = layer_init(nn.Linear(hidden_dim, 8), std=0.01)
+        self.t1_head = layer_init(nn.Linear(hidden_dim, target_vocab_size), std=0.01)
+        self.t2_head = layer_init(nn.Linear(hidden_dim, target_vocab_size), std=0.01)
+        
+        # Critic Head (std=1.0 is standard for value prediction)
+        self.value_head = layer_init(nn.Linear(hidden_dim, 1), std=1.0)
 
     def forward(self, x):
+        # Pass through Map Logic
         h = self.gcn1(x, self.adj)
         h = self.gcn2(h, self.adj)
         h = self.gcn3(h, self.adj)
         h = self.gcn4(h, self.adj)
         
-        type_logits = self.type_head(h)
-        t1_logits = self.t1_head(h)
-        t2_logits = self.t2_head(h)
+        # Split into Strategy and Value thinking
+        actor_features = self.actor_mlp(h)
+        critic_features = self.critic_mlp(h)
         
-        # Mean pool the province values to get a single state value
-        state_value = self.value_head(h).mean(dim=-2) 
+        # Get Actions
+        type_logits = self.type_head(actor_features)
+        t1_logits = self.t1_head(actor_features)
+        t2_logits = self.t2_head(actor_features)
+        
+        # Get Value (Pooled across all provinces)
+        state_value = self.value_head(critic_features).mean(dim=-2) 
+        
         return type_logits, t1_logits, t2_logits, state_value
 
 # --- 3. VECTORIZER ---
