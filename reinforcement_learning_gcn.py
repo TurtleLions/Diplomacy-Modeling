@@ -11,6 +11,7 @@ from torch.nn.parallel import DistributedDataParallel as DDP
 from contextlib import nullcontext
 from pettingzoo import ParallelEnv
 from gymnasium.spaces import Box, MultiDiscrete
+import time
 
 # --- 1. UTILITIES & ENVIRONMENT (Unchanged Logic, Optimized for Speed) ---
 def get_adjacency_matrix(game):
@@ -334,6 +335,7 @@ if __name__ == "__main__":
     next_done = torch.zeros((NUM_ENVS, NUM_AGENTS), device=device)
 
     for update in range(1, num_updates + 1):
+        start_time = time.time()
         # Entropy schedule
         frac = 1.0 - (update - 1.0) / num_updates
         ent_coef = frac * ent_coef_start + (1 - frac) * ent_coef_end
@@ -469,8 +471,15 @@ if __name__ == "__main__":
         b_rewards.zero_()
 
         if global_rank == 0:
-            avg_reward = b_rewards.sum() / (NUM_ENVS * NUM_AGENTS) # Approx metric
-            print(f"Update: {update}/{num_updates} | Loss: {loss.item():.4f} | Val Loss: {v_loss.item():.4f} | Ent: {entropy.item():.4f}")
-
+            end_time = time.time()  # <--- 2. ADD THIS HERE
+            
+            # Calculate total global steps across all GPUs (World Size)
+            global_steps = NUM_ENVS * NUM_STEPS * NUM_AGENTS * dist.get_world_size()
+            sps = int(global_steps / (end_time - start_time))  # <--- 3. ADD THIS HERE
+            
+            avg_reward = b_rewards.sum() / (NUM_ENVS * NUM_AGENTS) # Local approx metric
+            
+            # 4. UPDATE YOUR PRINT STATEMENT
+            print(f"Update: {update}/{num_updates} | SPS: {sps} | Loss: {loss.item():.4f} | Val Loss: {v_loss.item():.4f} | Ent: {entropy.item():.4f}")
     vec_env.close()
     dist.destroy_process_group()
