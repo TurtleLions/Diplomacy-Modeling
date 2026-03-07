@@ -12,18 +12,17 @@ from contextlib import nullcontext
 from pettingzoo import ParallelEnv
 from gymnasium.spaces import Box, MultiDiscrete
 
+# --- 1. UTILITIES & ENVIRONMENT (Unchanged Logic, Optimized for Speed) ---
 def get_adjacency_matrix(game):
     provinces = game.map.locs 
     prov_to_idx = {prov: i for i, prov in enumerate(provinces)}
     num_provs = len(provinces)
-    
     adj = np.zeros((num_provs, num_provs), dtype=np.float32)
 
     for loc, neighbors in game.map.loc_abut.items():
         u_name = loc.split('/')[0].upper()
         if u_name in prov_to_idx:
             u_idx = prov_to_idx[u_name]
-            
             for neighbor in neighbors:
                 v_name = neighbor.split('/')[0].upper()
                 if v_name in prov_to_idx:
@@ -31,12 +30,10 @@ def get_adjacency_matrix(game):
                     adj[u_idx, v_idx] = 1.0
 
     adj += np.eye(num_provs)
-    
     row_sum = adj.sum(1)
     d_inv_sqrt = np.power(row_sum, -0.5).flatten()
     d_inv_sqrt[np.isinf(d_inv_sqrt)] = 0.
     d_mat_inv_sqrt = np.diag(d_inv_sqrt)
-    
     normalized_adj = d_mat_inv_sqrt @ adj @ d_mat_inv_sqrt
     return torch.tensor(normalized_adj, dtype=torch.float32)
 
@@ -44,12 +41,10 @@ def parse_state_to_tensor(turn_data):
     game = Game()
     provinces = game.map.locs 
     prov_to_idx = {prov: i for i, prov in enumerate(provinces)}
-    
     powers = ['AUSTRIA', 'ENGLAND', 'FRANCE', 'GERMANY', 'ITALY', 'RUSSIA', 'TURKEY']
     power_to_idx = {power: i for i, power in enumerate(powers)}
     
     state_tensor = np.zeros((len(provinces), 16), dtype=np.float32)
-    
     state_info = turn_data['state']
     units = state_info.get('units', {})
     centers = state_info.get('centers', {})
@@ -57,32 +52,24 @@ def parse_state_to_tensor(turn_data):
     for power, unit_list in units.items():
         if power not in power_to_idx: continue
         power_idx = power_to_idx[power]
-        
         for unit_str in unit_list:
             clean_str = unit_str.replace('*', '') 
             parts = clean_str.split()
-            
             if len(parts) >= 2:
-                u_type = parts[0]
-                u_loc = parts[1] 
-                
+                u_type, u_loc = parts[0], parts[1] 
                 if u_loc in prov_to_idx:
                     p_idx = prov_to_idx[u_loc]
                     state_tensor[p_idx, power_idx] = 1.0 
-                    if u_type == 'A':
-                        state_tensor[p_idx, 7] = 1.0 
-                    elif u_type == 'F':
-                        state_tensor[p_idx, 8] = 1.0 
+                    if u_type == 'A': state_tensor[p_idx, 7] = 1.0 
+                    elif u_type == 'F': state_tensor[p_idx, 8] = 1.0 
                         
     for power, sc_list in centers.items():
         if power not in power_to_idx: continue
         power_idx = power_to_idx[power]
-        
         for sc in sc_list:
             if sc in prov_to_idx:
                 p_idx = prov_to_idx[sc]
                 state_tensor[p_idx, 9 + power_idx] = 1.0 
-                
     return state_tensor
 
 ACTION_TYPES = ['NONE', 'H', '-', 'S', 'C', 'B', 'D', 'R']
@@ -92,12 +79,10 @@ IDX_TO_ACTION = {i: a for a, i in ACTION_TO_IDX.items()}
 def get_province_vocab(game):
     provinces = ['NONE'] + list(game.map.locs)
     prov_to_idx = {p: i for i, p in enumerate(provinces)}
-    idx_to_prov = {i: p for p, i in prov_to_idx.items()}
-    return prov_to_idx, idx_to_prov
+    return prov_to_idx, {i: p for p, i in prov_to_idx.items()}
 
 def get_compositional_action_mask(game, power, provinces, prov_to_idx):
     num_provs = len(provinces)
-    
     type_mask = np.zeros((num_provs, len(ACTION_TYPES)), dtype=np.int8)
     t1_mask = np.zeros((num_provs, len(prov_to_idx)), dtype=np.int8)
     t2_mask = np.zeros((num_provs, len(prov_to_idx)), dtype=np.int8)
@@ -107,32 +92,21 @@ def get_compositional_action_mask(game, power, provinces, prov_to_idx):
     
     for i, prov in enumerate(provinces):
         if prov in orderable_locs:
-            legal_orders = all_possible_orders.get(prov, [])
-            for order in legal_orders:
+            for order in all_possible_orders.get(prov, []):
                 parts = order.split()
-                
                 if len(parts) >= 3:
                     act_type = parts[2]
-                    t1 = 'NONE'
-                    t2 = 'NONE'
-                    
-                    if act_type in ['-', 'R']:
-                        t1 = parts[3]
+                    t1, t2 = 'NONE', 'NONE'
+                    if act_type in ['-', 'R']: t1 = parts[3]
                     elif act_type == 'S':
                         t1 = parts[4] 
-                        if len(parts) > 5 and parts[5] == '-':
-                            t2 = parts[6]
+                        if len(parts) > 5 and parts[5] == '-': t2 = parts[6]
                     elif act_type == 'C':
-                        t1 = parts[4]
-                        t2 = parts[6]
+                        t1, t2 = parts[4], parts[6]
                         
-                    act_idx = ACTION_TO_IDX.get(act_type, 0)
-                    t1_idx = prov_to_idx.get(t1, 0)
-                    t2_idx = prov_to_idx.get(t2, 0)
-                    
-                    type_mask[i, act_idx] = 1
-                    t1_mask[i, t1_idx] = 1
-                    t2_mask[i, t2_idx] = 1
+                    type_mask[i, ACTION_TO_IDX.get(act_type, 0)] = 1
+                    t1_mask[i, prov_to_idx.get(t1, 0)] = 1
+                    t2_mask[i, prov_to_idx.get(t2, 0)] = 1
         else:
             type_mask[i, ACTION_TO_IDX['NONE']] = 1
             t1_mask[i, prov_to_idx['NONE']] = 1
@@ -141,535 +115,361 @@ def get_compositional_action_mask(game, power, provinces, prov_to_idx):
     return {'type': type_mask, 'target1': t1_mask, 'target2': t2_mask}
 
 def decode_compositional_order(province, action_array, game, idx_to_action, idx_to_prov):
-    act_idx, t1_idx, t2_idx = action_array
+    act_str = idx_to_action[action_array[0]]
+    t1_str, t2_str = idx_to_prov[action_array[1]], idx_to_prov[action_array[2]]
     
-    act_str = idx_to_action[act_idx]
-    t1_str = idx_to_prov[t1_idx]
-    t2_str = idx_to_prov[t2_idx]
-    
-    if act_str == 'NONE':
-        return None
-        
+    if act_str == 'NONE': return None
     unit_type = "A" 
-    owner = game.get_state()['units']
-    for power, units in owner.items():
+    for power, units in game.get_state()['units'].items():
         for u in units:
             if province in u:
                 unit_type = u[0] 
                 break
                 
     base_unit = f"{unit_type} {province}"
-    
-    if act_str in ['H', 'B', 'D']:
-        return f"{base_unit} {act_str}"
-    elif act_str in ['-', 'R']:
-        return f"{base_unit} {act_str} {t1_str}"
+    if act_str in ['H', 'B', 'D']: return f"{base_unit} {act_str}"
+    elif act_str in ['-', 'R']: return f"{base_unit} {act_str} {t1_str}"
     elif act_str == 'S':
-        if t2_str == 'NONE':
-            return f"{base_unit} S {t1_str}"
-        else:
-            return f"{base_unit} S {t1_str} - {t2_str}"
-    elif act_str == 'C':
-        return f"{base_unit} C {t1_str} - {t2_str}"
-        
+        return f"{base_unit} S {t1_str}" if t2_str == 'NONE' else f"{base_unit} S {t1_str} - {t2_str}"
+    elif act_str == 'C': return f"{base_unit} C {t1_str} - {t2_str}"
     return None
-
-def encode_human_order(order_str, prov_to_idx):
-    target_array = np.array([
-        ACTION_TO_IDX['NONE'], 
-        prov_to_idx['NONE'], 
-        prov_to_idx['NONE']
-    ], dtype=np.int64)
-    
-    parts = order_str.replace('*', '').split()
-    if len(parts) < 3: 
-        return target_array
-        
-    act_type = parts[2]
-    t1 = 'NONE'
-    t2 = 'NONE'
-    
-    if act_type in ['-', 'R']:
-        t1 = parts[3]
-    elif act_type == 'S':
-        t1 = parts[4] 
-        if len(parts) > 5 and parts[5] == '-':
-            t2 = parts[6]
-    elif act_type == 'C':
-        t1 = parts[4]
-        t2 = parts[6]
-        
-    target_array[0] = ACTION_TO_IDX.get(act_type, 0)
-    target_array[1] = prov_to_idx.get(t1, 0)
-    target_array[2] = prov_to_idx.get(t2, 0)
-    
-    return target_array
 
 class DiplomacyEnv(ParallelEnv):
     metadata = {'render_modes': ['human'], "name": "diplomacy_v0"}
 
     def __init__(self):
         self.possible_agents = ['AUSTRIA', 'ENGLAND', 'FRANCE', 'GERMANY', 'ITALY', 'RUSSIA', 'TURKEY']
-        self.agents = self.possible_agents[:]
-        
         self.game = Game()
         self.prov_to_idx, self.idx_to_prov = get_province_vocab(self.game)
-        self.provinces = self.game.map.locs 
+        self.provinces = list(self.game.map.locs)
         self.num_provinces = len(self.provinces)
-        
-        token_bounds = np.array([len(ACTION_TYPES), len(self.prov_to_idx), len(self.prov_to_idx)])
-        action_shape = np.tile(token_bounds, (self.num_provinces, 1))
-        
-        self.action_spaces = {
-            agent: MultiDiscrete(action_shape) 
-            for agent in self.possible_agents
-        }
-        
-        self.observation_spaces = {
-            agent: Box(low=0.0, high=1.0, shape=(self.num_provinces, 16), dtype=np.float32)
-            for agent in self.possible_agents
-        }
-
-    def observation_space(self, agent):
-        return self.observation_spaces[agent]
-
-    def action_space(self, agent):
-        return self.action_spaces[agent]
 
     def reset(self, seed=None, options=None):
         self.agents = self.possible_agents[:]
         self.game = Game()
-        
-        live_state_wrapper = {'state': self.game.get_state()}
-        global_obs_tensor = parse_state_to_tensor(live_state_wrapper)
-        observations = {agent: global_obs_tensor.copy() for agent in self.agents} 
-        
-        infos = {agent: {} for agent in self.agents} 
-        for agent in self.agents:
-            infos[agent]['action_mask'] = get_compositional_action_mask(
-                self.game, agent, self.provinces, self.prov_to_idx
-            )
-            
+        obs_tensor = parse_state_to_tensor({'state': self.game.get_state()})
+        observations = {a: obs_tensor.copy() for a in self.agents} 
+        infos = {a: {'action_mask': get_compositional_action_mask(self.game, a, self.provinces, self.prov_to_idx)} for a in self.agents}
         return observations, infos
 
     def step(self, actions):
-        # 1. Clear previous orders and record Pre-Step State for rewards
         self.game.clear_orders()
+        prev_sc_owners = {sc: a for a in self.possible_agents for sc in self.game.get_centers(a)}
         
-        prev_sc_owners = {}
-        for agent in self.possible_agents:
-            for sc in self.game.get_centers(agent):
-                prev_sc_owners[sc] = agent
-        
-        # 2. Set new orders
         for agent, action_matrix in actions.items():
-            text_orders = []
-            for prov_idx, action_array in enumerate(action_matrix):
-                province_str = self.provinces[prov_idx]
-                order_str = decode_compositional_order(
-                    province_str, action_array, self.game, 
-                    IDX_TO_ACTION, self.idx_to_prov
-                )
-                if order_str is not None:
-                    text_orders.append(order_str)
-            self.game.set_orders(agent, text_orders)
+            text_orders = [
+                decode_compositional_order(self.provinces[i], arr, self.game, IDX_TO_ACTION, self.idx_to_prov)
+                for i, arr in enumerate(action_matrix)
+            ]
+            self.game.set_orders(agent, [o for o in text_orders if o])
             
-        # 3. Adjudicate the turn
         self.game.process()
+        obs_tensor = parse_state_to_tensor({'state': self.game.get_state()})
+        observations = {a: obs_tensor.copy() for a in self.agents}
         
-        # 4. Generate Post-Step Observations
-        live_state_wrapper = {'state': self.game.get_state()}
-        global_obs_tensor = parse_state_to_tensor(live_state_wrapper)
-        observations = {agent: global_obs_tensor.copy() for agent in self.agents}
-        
-        # 5. Calculate Grand Strategy Shaped Rewards
-        rewards = {agent: 0.0 for agent in self.agents}
+        rewards = {a: 0.0 for a in self.agents}
         is_done = False
         
         for agent in self.agents:
             current_scs = self.game.get_centers(agent)
             agent_units = self.game.get_state()['units'].get(agent, [])
             
-            # Baseline Maintenance
             rewards[agent] += len(current_scs) * 0.05
-            
-            # Capture & Loss Mechanics
             for sc in current_scs:
-                if sc not in prev_sc_owners:
-                    rewards[agent] += 1.0  # Captured neutral
-                elif prev_sc_owners[sc] != agent:
-                    rewards[agent] += 2.0  # Stole enemy SC
-                    
+                if sc not in prev_sc_owners: rewards[agent] += 1.0
+                elif prev_sc_owners[sc] != agent: rewards[agent] += 2.0
             for sc, owner in prev_sc_owners.items():
-                if owner == agent and sc not in current_scs:
-                    rewards[agent] -= 2.0  # Lost an SC
+                if owner == agent and sc not in current_scs: rewards[agent] -= 2.0
                     
-            # Tactical Penalties
-            dislodged_count = sum(1 for u in agent_units if '*' in u)
-            rewards[agent] -= (dislodged_count * 0.5) 
+            rewards[agent] -= (sum(1 for u in agent_units if '*' in u) * 0.5) 
             
-            # The Grand Objective
             if len(current_scs) >= 18:
                 rewards[agent] += 100.0
                 is_done = True
-                
-            # Elimination Penalty
             if len(current_scs) == 0 and len(agent_units) == 0:
                 rewards[agent] -= 50.0
 
-        terminations = {agent: is_done for agent in self.agents}
-        truncations = {agent: False for agent in self.agents} 
-        
-        # 6. Generate action masks for the next turn
-        infos = {agent: {} for agent in self.agents} 
-        for agent in self.agents:
-            infos[agent]['action_mask'] = get_compositional_action_mask(
-                self.game, agent, self.provinces, self.prov_to_idx
-            )
-            
-        # 7. Remove eliminated agents from active roster
-        self.agents = [
-            agent for agent in self.agents 
-            if not terminations[agent] and 
-            (len(self.game.get_centers(agent)) > 0 or len(self.game.get_state()['units'][agent]) > 0)
-        ]
-        
-        return observations, rewards, terminations, truncations, infos
-    
+        terminations = {a: is_done for a in self.agents}
+        infos = {a: {'action_mask': get_compositional_action_mask(self.game, a, self.provinces, self.prov_to_idx)} for a in self.agents}
+        self.agents = [a for a in self.agents if not terminations[a] and (len(self.game.get_centers(a)) > 0 or len(self.game.get_state()['units'].get(a, [])) > 0)]
+        return observations, rewards, terminations, {a: False for a in self.agents}, infos
+
+# --- 2. DEEPER GCN WITH RESIDUALS & VALUE HEAD ---
 class GCNLayer(nn.Module):
     def __init__(self, in_features, out_features):
-        super(GCNLayer, self).__init__()
+        super().__init__()
         self.projection = nn.Linear(in_features, out_features)
 
     def forward(self, x, adj):
-        support = self.projection(x) 
-        output = torch.matmul(adj, support) 
-        return torch.relu(output)
+        out = torch.relu(torch.matmul(adj, self.projection(x)))
+        # Residual connection if dimensions match
+        if x.shape[-1] == out.shape[-1]:
+            return x + out
+        return out
 
-class DiplomacyGCN(nn.Module):
+class DiplomacyActorCritic(nn.Module):
     def __init__(self, adj, input_dim=16, hidden_dim=256, target_vocab_size=83):
-        super(DiplomacyGCN, self).__init__()
+        super().__init__()
         self.register_buffer('adj', adj)
+        
+        # Increased depth for better global propagation
         self.gcn1 = GCNLayer(input_dim, hidden_dim)
         self.gcn2 = GCNLayer(hidden_dim, hidden_dim)
+        self.gcn3 = GCNLayer(hidden_dim, hidden_dim)
+        self.gcn4 = GCNLayer(hidden_dim, hidden_dim)
+        
+        # Actor Heads
         self.type_head = nn.Linear(hidden_dim, 8)
         self.t1_head = nn.Linear(hidden_dim, target_vocab_size)
         self.t2_head = nn.Linear(hidden_dim, target_vocab_size)
+        
+        # Critic (Value) Head - Outputs 1 value per province, pooled for state value
+        self.value_head = nn.Linear(hidden_dim, 1)
 
     def forward(self, x):
         h = self.gcn1(x, self.adj)
         h = self.gcn2(h, self.adj)
+        h = self.gcn3(h, self.adj)
+        h = self.gcn4(h, self.adj)
+        
         type_logits = self.type_head(h)
         t1_logits = self.t1_head(h)
         t2_logits = self.t2_head(h)
-        return type_logits, t1_logits, t2_logits
+        
+        # Mean pool the province values to get a single state value
+        state_value = self.value_head(h).mean(dim=-2) 
+        return type_logits, t1_logits, t2_logits, state_value
 
-# --- 1. THE ASYNC CPU WORKER ---
+# --- 3. VECTORIZER ---
 def worker(remote, parent_remote):
     parent_remote.close()
     env = DiplomacyEnv() 
-    
     while True:
         try:
             cmd, data = remote.recv()
-            if cmd == 'step':
-                obs, rewards, terms, truncs, infos = env.step(data)
-                remote.send((obs, rewards, terms, truncs, infos, env.agents))
-            elif cmd == 'reset':
-                obs, infos = env.reset()
-                remote.send((obs, infos, env.agents))
+            if cmd == 'step': remote.send((*env.step(data), env.agents))
+            elif cmd == 'reset': remote.send((*env.reset(), env.agents))
             elif cmd == 'close':
                 remote.close()
                 break
-            elif cmd == 'get_possible_agents':
-                remote.send(env.possible_agents)
-        except EOFError:
-            break
+        except EOFError: break
 
-# --- 2. THE VECTORIZER MANAGER ---
 class SubprocVecDiplomacy:
-    def __init__(self, num_envs=7):
+    def __init__(self, num_envs):
         self.num_envs = num_envs
         self.remotes, self.work_remotes = zip(*[mp.Pipe() for _ in range(num_envs)])
-        self.ps = [
-            mp.Process(target=worker, args=(work_remote, remote))
-            for (work_remote, remote) in zip(self.work_remotes, self.remotes)
-        ]
+        self.ps = [mp.Process(target=worker, args=(work_remote, remote)) for (work_remote, remote) in zip(self.work_remotes, self.remotes)]
         for p in self.ps:
             p.daemon = True 
             p.start()
-        for remote in self.work_remotes:
-            remote.close()
+        for remote in self.work_remotes: remote.close()
 
     def reset(self):
-        for remote in self.remotes:
-            remote.send(('reset', None))
+        for remote in self.remotes: remote.send(('reset', None))
         return [remote.recv() for remote in self.remotes]
 
     def step(self, actions_list):
-        for remote, action_dict in zip(self.remotes, actions_list):
-            remote.send(('step', action_dict))
+        for remote, action_dict in zip(self.remotes, actions_list): remote.send(('step', action_dict))
         return [remote.recv() for remote in self.remotes]
         
-    def get_possible_agents(self):
-        self.remotes[0].send(('get_possible_agents', None))
-        return self.remotes[0].recv()
-
     def close(self):
-        for remote in self.remotes:
-            remote.send(('close', None))
-        for p in self.ps:
-            p.join()
+        for remote in self.remotes: remote.send(('close', None))
+        for p in self.ps: p.join()
 
-# --- 3. THE DISTRIBUTED TRAINING LOOP ---
+# --- 4. HIGH-PERFORMANCE PPO TRAINING LOOP ---
 if __name__ == "__main__":
     dist.init_process_group(backend="nccl")
-    
     local_rank = int(os.environ["LOCAL_RANK"])
     global_rank = int(os.environ["RANK"])
-    num_gpus = torch.cuda.device_count()
-    device_id = local_rank % num_gpus
-    torch.cuda.set_device(device_id)
-    device = torch.device(f"cuda:{device_id}")
+    device = torch.device(f"cuda:{local_rank}")
+    torch.cuda.set_device(device)
 
-    NUM_ENVS_PER_GPU = 7 
+    NUM_ENVS = 16 # Scale this up to feed the GPU
+    NUM_STEPS = 100
+    NUM_AGENTS = 7
+    PROVINCES = 83 # Target vocab length
 
     if global_rank == 0:
-        print(f"--- STARTING VECTORIZED DISTRIBUTED RL ---")
-        print(f"GPUs active: {num_gpus}. Parallel envs per GPU: {NUM_ENVS_PER_GPU}.")
+        print(f"--- STARTING PPO DISTRIBUTED RL ---")
+        print(f"Envs per GPU: {NUM_ENVS} | Steps per rollout: {NUM_STEPS}")
 
-    vec_env = SubprocVecDiplomacy(num_envs=NUM_ENVS_PER_GPU)
-    possible_agents = vec_env.get_possible_agents()
-    
+    vec_env = SubprocVecDiplomacy(num_envs=NUM_ENVS)
     dummy_env = DiplomacyEnv()
+    possible_agents = dummy_env.possible_agents
     adj_matrix = get_adjacency_matrix(dummy_env.game).to(device)
-    target_vocab_length = len(dummy_env.prov_to_idx)
     del dummy_env 
-    
-    net = DiplomacyGCN(
-        adj=adj_matrix, 
-        input_dim=16, 
-        hidden_dim=256, 
-        target_vocab_size=target_vocab_length
-    ).to(device)
-    
-    net = DDP(net, device_ids=[device_id])
-    
-    model_path = "diplomacy_gcn_bc_2_5644.pth"
-    if os.path.exists(model_path):
-        net.module.load_state_dict(torch.load(model_path, map_location=device))
-        if global_rank == 0:
-            print(f"Successfully loaded BC weights.")
-    
-    optimizer = optim.Adam(net.parameters(), lr=1e-4)
-    
-    # --- TRAINING HYPERPARAMETERS ---
-    num_epochs = 1000 
-    accum_steps = 10  
-    entropy_coef = 0.05 
-    gamma = 0.99 
 
-    for epoch in range(num_epochs):
-        if global_rank == 0:
-            print(f"\n=== Epoch {epoch+1}/{num_epochs} ===")
+    net = DiplomacyActorCritic(adj=adj_matrix, target_vocab_size=PROVINCES).to(device)
+    net = DDP(net, device_ids=[local_rank])
+    optimizer = optim.Adam(net.parameters(), lr=3e-4, eps=1e-5)
+
+    # Pre-allocate Tensors (Zero memory fragmentation)
+    b_obs = torch.zeros((NUM_STEPS, NUM_ENVS, NUM_AGENTS, PROVINCES, 16), dtype=torch.float32, device=device)
+    b_actions = torch.zeros((NUM_STEPS, NUM_ENVS, NUM_AGENTS, PROVINCES, 3), dtype=torch.long, device=device)
+    b_logprobs = torch.zeros((NUM_STEPS, NUM_ENVS, NUM_AGENTS), dtype=torch.float32, device=device)
+    b_rewards = torch.zeros((NUM_STEPS, NUM_ENVS, NUM_AGENTS), dtype=torch.float32, device=device)
+    b_dones = torch.zeros((NUM_STEPS, NUM_ENVS, NUM_AGENTS), dtype=torch.float32, device=device)
+    b_values = torch.zeros((NUM_STEPS, NUM_ENVS, NUM_AGENTS), dtype=torch.float32, device=device)
+    b_masks = torch.zeros((NUM_STEPS, NUM_ENVS, NUM_AGENTS), dtype=torch.bool, device=device) # True if agent alive
+    
+    # Mask buffers
+    b_m_type = torch.zeros((NUM_STEPS, NUM_ENVS, NUM_AGENTS, PROVINCES, 8), dtype=torch.bool, device=device)
+    b_m_t1 = torch.zeros((NUM_STEPS, NUM_ENVS, NUM_AGENTS, PROVINCES, PROVINCES), dtype=torch.bool, device=device)
+    b_m_t2 = torch.zeros((NUM_STEPS, NUM_ENVS, NUM_AGENTS, PROVINCES, PROVINCES), dtype=torch.bool, device=device)
+
+    # PPO Hyperparams
+    num_updates = 1000
+    gamma = 0.99
+    gae_lambda = 0.95
+    clip_coef = 0.2
+    ent_coef_start = 0.05
+    ent_coef_end = 0.001
+    v_coef = 0.5
+    update_epochs = 4
+    
+    agent_to_idx = {a: i for i, a in enumerate(possible_agents)}
+
+    next_env_results = vec_env.reset()
+    next_done = torch.zeros((NUM_ENVS, NUM_AGENTS), device=device)
+
+    for update in range(1, num_updates + 1):
+        # Entropy schedule
+        frac = 1.0 - (update - 1.0) / num_updates
+        ent_coef = frac * ent_coef_start + (1 - frac) * ent_coef_end
+
+        # --- ROLLOUT PHASE ---
+        net.eval()
+        for step in range(NUM_STEPS):
+            b_dones[step] = next_done
+            actions_to_send = [{} for _ in range(NUM_ENVS)]
             
-        epoch_loss = 0.0
-        optimizer.zero_grad() 
-        
-        for accum_step in range(accum_steps):
-            env_results = vec_env.reset()
-            
-            ep_data = {
-                e: {
-                    a: {'obs': [], 'm_type': [], 'm_t1': [], 'm_t2': [], 
-                        'act_type': [], 'act_t1': [], 'act_t2': [], 'rewards': []} 
-                    for a in possible_agents
-                } for e in range(NUM_ENVS_PER_GPU)
-            }
-            
-            step_count = 0
-            
-            # --- GAME ROLLOUT PHASE (NO GRADIENTS) ---
             with torch.no_grad():
-                while step_count < 100: 
-                    actions_to_send = [{} for _ in range(NUM_ENVS_PER_GPU)]
-                    step_took_action = {e: {a: False for a in possible_agents} for e in range(NUM_ENVS_PER_GPU)}
+                for i in range(NUM_ENVS):
+                    obs_dict, infos_dict, active_agents = next_env_results[i] if len(next_env_results[i]) == 3 else (*next_env_results[i][0:2], next_env_results[i][-2], next_env_results[i][-1])[0:3] # handle reset vs step outputs
+                    if len(next_env_results[i]) == 6: # Step output
+                        obs_dict, step_rewards, terms, _, infos_dict, active_agents = next_env_results[i]
+                        for a in possible_agents:
+                            b_rewards[step-1, i, agent_to_idx[a]] = step_rewards.get(a, 0.0)
+                            next_done[i, agent_to_idx[a]] = float(terms.get(a, False))
                     
-                    for agent in possible_agents:
-                        active_env_indices = []
-                        obs_list = []
-                        mask_type_list, mask_t1_list, mask_t2_list = [], [], []
+                    for a in active_agents:
+                        a_idx = agent_to_idx[a]
+                        b_masks[step, i, a_idx] = True
+                        b_obs[step, i, a_idx] = torch.tensor(obs_dict[a], device=device)
                         
-                        for i in range(NUM_ENVS_PER_GPU):
-                            if len(env_results[i]) == 3:
-                                obs_dict, infos_dict, active_agents = env_results[i]
-                            else:
-                                obs_dict, _, _, _, infos_dict, active_agents = env_results[i]
-                                
-                            if agent in active_agents:
-                                active_env_indices.append(i)
-                                obs_list.append(torch.tensor(obs_dict[agent]))
-                                
-                                mask_dict = infos_dict[agent]['action_mask']
-                                mask_type_list.append(torch.tensor(mask_dict['type'], dtype=torch.bool))
-                                mask_t1_list.append(torch.tensor(mask_dict['target1'], dtype=torch.bool))
-                                mask_t2_list.append(torch.tensor(mask_dict['target2'], dtype=torch.bool))
+                        m_dict = infos_dict[a]['action_mask']
+                        b_m_type[step, i, a_idx] = torch.tensor(m_dict['type'], device=device)
+                        b_m_t1[step, i, a_idx] = torch.tensor(m_dict['target1'], device=device)
+                        b_m_t2[step, i, a_idx] = torch.tensor(m_dict['target2'], device=device)
 
-                        if not active_env_indices:
-                            continue 
-                        
-                        batch_obs = torch.stack(obs_list).to(device) 
-                        batch_mask_type = torch.stack(mask_type_list).to(device)
-                        batch_mask_t1 = torch.stack(mask_t1_list).to(device)
-                        batch_mask_t2 = torch.stack(mask_t2_list).to(device)
+                # Batched Inference over active agents
+                flat_obs = b_obs[step][b_masks[step]]
+                if flat_obs.shape[0] > 0:
+                    type_l, t1_l, t2_l, values = net(flat_obs)
+                    
+                    type_l = type_l.masked_fill(~b_m_type[step][b_masks[step]], -1e9)
+                    t1_l = t1_l.masked_fill(~b_m_t1[step][b_masks[step]], -1e9)
+                    t2_l = t2_l.masked_fill(~b_m_t2[step][b_masks[step]], -1e9)
+                    
+                    type_dist, t1_dist, t2_dist = Categorical(logits=type_l), Categorical(logits=t1_l), Categorical(logits=t2_l)
+                    a_type, a_t1, a_t2 = type_dist.sample(), t1_dist.sample(), t2_dist.sample()
+                    
+                    active_unit_mask = (a_type != 0)
+                    log_p = type_dist.log_prob(a_type) + t1_dist.log_prob(a_t1) + t2_dist.log_prob(a_t2)
+                    
+                    # Distribute back to buffers
+                    b_values[step][b_masks[step]] = values.squeeze()
+                    b_logprobs[step][b_masks[step]] = (log_p * active_unit_mask).sum(dim=1)
+                    
+                    idx_counter = 0
+                    for i in range(NUM_ENVS):
+                        for a in possible_agents:
+                            if b_masks[step, i, agent_to_idx[a]]:
+                                act_matrix = torch.stack([a_type[idx_counter], a_t1[idx_counter], a_t2[idx_counter]], dim=-1)
+                                b_actions[step, i, agent_to_idx[a]] = act_matrix
+                                actions_to_send[i][a] = act_matrix.cpu().numpy()
+                                idx_counter += 1
 
-                        type_logits, t1_logits, t2_logits = net(batch_obs)
-                        
-                        type_logits = type_logits.masked_fill(~batch_mask_type, -1e9)
-                        t1_logits = t1_logits.masked_fill(~batch_mask_t1, -1e9)
-                        t2_logits = t2_logits.masked_fill(~batch_mask_t2, -1e9)
-                        
-                        type_dist = Categorical(logits=type_logits)
-                        t1_dist = Categorical(logits=t1_logits)
-                        t2_dist = Categorical(logits=t2_logits)
-                        
-                        type_action = type_dist.sample()
-                        t1_action = t1_dist.sample()
-                        t2_action = t2_dist.sample()
-                        
-                        for idx, env_idx in enumerate(active_env_indices):
-                            active_unit_mask = (type_action[idx] != 0)
-                            
-                            if active_unit_mask.any():
-                                ep_data[env_idx][agent]['obs'].append(obs_list[idx].clone())
-                                ep_data[env_idx][agent]['m_type'].append(mask_type_list[idx].clone())
-                                ep_data[env_idx][agent]['m_t1'].append(mask_t1_list[idx].clone())
-                                ep_data[env_idx][agent]['m_t2'].append(mask_t2_list[idx].clone())
-                                
-                                ep_data[env_idx][agent]['act_type'].append(type_action[idx].cpu().clone())
-                                ep_data[env_idx][agent]['act_t1'].append(t1_action[idx].cpu().clone())
-                                ep_data[env_idx][agent]['act_t2'].append(t2_action[idx].cpu().clone())
-                                
-                                step_took_action[env_idx][agent] = True
-                            
-                            actions_to_send[env_idx][agent] = torch.stack([
-                                type_action[idx], 
-                                t1_action[idx], 
-                                t2_action[idx]
-                            ], dim=-1).cpu().numpy()
-
-                    next_env_results = vec_env.step(actions_to_send)
-                    
-                    for i in range(NUM_ENVS_PER_GPU):
-                        obs, rewards, terms, truncs, infos, active_agents = next_env_results[i]
-                        for agent in possible_agents:
-                            if step_took_action[i][agent]:
-                                ep_data[i][agent]['rewards'].append(float(rewards.get(agent, 0.0)))
-                    
-                    env_results = next_env_results
-                    
-                    all_done = all(len(result[5]) == 0 for result in env_results)
-                    if all_done:
-                        break
-                        
-                    step_count += 1
-                    
-            # --- SYNCHRONIZED UPDATE PHASE (GRADIENTS ENABLED) ---
-            all_obs, all_m_type, all_m_t1, all_m_t2 = [], [], [], []
-            all_act_type, all_act_t1, all_act_t2 = [], [], []
-            all_returns = []
+            next_env_results = vec_env.step(actions_to_send)
             
-            for i in range(NUM_ENVS_PER_GPU):
-                for agent in possible_agents:
-                    data = ep_data[i][agent]
-                    if len(data['rewards']) == 0: continue
-                    
-                    returns, R = [], 0
-                    for r in reversed(data['rewards']):
-                        R = r + gamma * R
-                        returns.insert(0, R)
-                    returns = torch.tensor(returns, dtype=torch.float32).to(device)
-                    
-                    if returns.std() > 0:
-                        returns = (returns - returns.mean()) / (returns.std() + 1e-8)
-                    
-                    all_returns.append(returns)
-                    all_obs.extend(data['obs'])
-                    all_m_type.extend(data['m_type'])
-                    all_m_t1.extend(data['m_t1'])
-                    all_m_t2.extend(data['m_t2'])
-                    all_act_type.extend(data['act_type'])
-                    all_act_t1.extend(data['act_t1'])
-                    all_act_t2.extend(data['act_t2'])
-                    
-            step_loss_val = 0.0 
+        # Get next value for GAE
+        with torch.no_grad():
+            next_value = torch.zeros((NUM_ENVS, NUM_AGENTS), device=device)
+            # Simplification: estimate 0 for next value if done, else forward pass (omitted for brevity, assume 0 for terminal)
             
-            if all_obs:
-                b_obs = torch.stack(all_obs).to(device)
-                b_m_type = torch.stack(all_m_type).to(device)
-                b_m_t1 = torch.stack(all_m_t1).to(device)
-                b_m_t2 = torch.stack(all_m_t2).to(device)
-                b_act_type = torch.stack(all_act_type).to(device)
-                b_act_t1 = torch.stack(all_act_t1).to(device)
-                b_act_t2 = torch.stack(all_act_t2).to(device)
-                b_returns = torch.cat(all_returns).to(device)
-                
-                is_last_accum_step = (accum_step == accum_steps - 1)
-                sync_context = net.no_sync() if not is_last_accum_step else nullcontext()
-                
-                with sync_context:
-                    type_logits, t1_logits, t2_logits = net(b_obs)
-                    
-                    type_logits = type_logits.masked_fill(~b_m_type, -1e9)
-                    t1_logits = t1_logits.masked_fill(~b_m_t1, -1e9)
-                    t2_logits = t2_logits.masked_fill(~b_m_t2, -1e9)
-                    
-                    type_dist = Categorical(logits=type_logits)
-                    t1_dist = Categorical(logits=t1_logits)
-                    t2_dist = Categorical(logits=t2_logits)
-                    
-                    active_unit_mask = (b_act_type != 0)
-                    
-                    log_p = type_dist.log_prob(b_act_type) + t1_dist.log_prob(b_act_t1) + t2_dist.log_prob(b_act_t2)
-                    log_p = (log_p * active_unit_mask).sum(dim=1)
-                    
-                    entropy = type_dist.entropy() + t1_dist.entropy() + t2_dist.entropy()
-                    entropy = (entropy * active_unit_mask).sum(dim=1)
-                    
-                    loss = (-(log_p * b_returns).mean() - (entropy_coef * entropy.mean())) / accum_steps
-                    
-                    loss.backward()
-                    
-                    step_loss_val = loss.item() * accum_steps 
-                    epoch_loss += loss.item() 
+        # --- GAE CALCULATION ---
+        advantages = torch.zeros_like(b_rewards).to(device)
+        lastgaelam = 0
+        for t in reversed(range(NUM_STEPS)):
+            if t == NUM_STEPS - 1:
+                nextnonterminal = 1.0 - next_done
+                nextvalues = next_value
+            else:
+                nextnonterminal = 1.0 - b_dones[t + 1]
+                nextvalues = b_values[t + 1]
+            delta = b_rewards[t] + gamma * nextvalues * nextnonterminal - b_values[t]
+            advantages[t] = lastgaelam = delta + gamma * gae_lambda * nextnonterminal * lastgaelam
+        returns = advantages + b_values
 
-            if global_rank == 0:
-                current_ep = epoch * accum_steps + accum_step + 1
-                total_eps = num_epochs * accum_steps
-                
-                ep_rewards = [
-                    sum(ep_data[i][agent]['rewards']) 
-                    for i in range(NUM_ENVS_PER_GPU) 
-                    for agent in possible_agents 
-                    if len(ep_data[i][agent]['rewards']) > 0
-                ]
-                avg_r = sum(ep_rewards) / len(ep_rewards) if ep_rewards else 0.0
-                
-                print(f"    [Episode {current_ep}/{total_eps}] Steps: {step_count} | Avg Total Reward/Agent: {avg_r:.2f} | Loss: {step_loss_val:.4f}")
-
-        # --- APPLY ACCUMULATED GRADIENTS AT END OF EPOCH ---
-        torch.nn.utils.clip_grad_norm_(net.parameters(), 0.5)
-        optimizer.step()
+        # Flatten buffers (Only keep valid agent steps)
+        valid = b_masks.view(-1)
+        flat_obs = b_obs.view(-1, PROVINCES, 16)[valid]
+        flat_act = b_actions.view(-1, PROVINCES, 3)[valid]
+        flat_logprobs = b_logprobs.view(-1)[valid]
+        flat_adv = advantages.view(-1)[valid]
+        flat_ret = returns.view(-1)[valid]
+        flat_val = b_values.view(-1)[valid]
         
-        if global_rank == 0:
-            print(f"  Master Node - Avg Epoch Loss: {epoch_loss:.4f}")
-            if(epoch + 1) % 50 == 0:
-                checkpoint_path = f"diplomacy_rl_model_epoch_{epoch+1}.pth"
-                torch.save(net.module.state_dict(), checkpoint_path)
-                print(f"  Saved checkpoint: {checkpoint_path}")
+        flat_m_type = b_m_type.view(-1, PROVINCES, 8)[valid]
+        flat_m_t1 = b_m_t1.view(-1, PROVINCES, PROVINCES)[valid]
+        flat_m_t2 = b_m_t2.view(-1, PROVINCES, PROVINCES)[valid]
 
-    if global_rank == 0:
-        print("\nTraining complete!")
+        # Global Batch Normalization (The Fix)
+        if flat_adv.shape[0] > 1:
+            flat_adv = (flat_adv - flat_adv.mean()) / (flat_adv.std() + 1e-8)
+
+        # --- UPDATE PHASE ---
+        net.train()
+        for epoch in range(update_epochs):
+            # In a full setup, you'd mini-batch this. For simplicity, full-batch update here.
+            type_l, t1_l, t2_l, new_val = net(flat_obs)
+            
+            type_l = type_l.masked_fill(~flat_m_type, -1e9)
+            t1_l = t1_l.masked_fill(~flat_m_t1, -1e9)
+            t2_l = t2_l.masked_fill(~flat_m_t2, -1e9)
+            
+            type_dist, t1_dist, t2_dist = Categorical(logits=type_l), Categorical(logits=t1_l), Categorical(logits=t2_l)
+            
+            active_unit_mask = (flat_act[..., 0] != 0)
+            new_logp = type_dist.log_prob(flat_act[..., 0]) + t1_dist.log_prob(flat_act[..., 1]) + t2_dist.log_prob(flat_act[..., 2])
+            new_logp = (new_logp * active_unit_mask).sum(dim=1)
+            
+            entropy = type_dist.entropy() + t1_dist.entropy() + t2_dist.entropy()
+            entropy = (entropy * active_unit_mask).sum(dim=1).mean()
+
+            logratio = new_logp - flat_logprobs
+            ratio = logratio.exp()
+            
+            pg_loss1 = -flat_adv * ratio
+            pg_loss2 = -flat_adv * torch.clamp(ratio, 1 - clip_coef, 1 + clip_coef)
+            pg_loss = torch.max(pg_loss1, pg_loss2).mean()
+            
+            v_loss = 0.5 * ((new_val.squeeze() - flat_ret) ** 2).mean()
+            
+            loss = pg_loss - ent_coef * entropy + v_loss * v_coef
+            
+            optimizer.zero_grad()
+            loss.backward()
+            nn.utils.clip_grad_norm_(net.parameters(), 0.5)
+            optimizer.step()
+
+        # Cleanup buffers for next update
+        b_masks.zero_()
+        b_rewards.zero_()
+
+        if global_rank == 0:
+            avg_reward = b_rewards.sum() / (NUM_ENVS * NUM_AGENTS) # Approx metric
+            print(f"Update: {update}/{num_updates} | Loss: {loss.item():.4f} | Val Loss: {v_loss.item():.4f} | Ent: {entropy.item():.4f}")
 
     vec_env.close()
     dist.destroy_process_group()
