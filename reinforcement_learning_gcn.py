@@ -10,6 +10,7 @@ import torch.nn as nn
 import torch.optim as optim
 import os
 from torch.distributions import Categorical
+import multiprocessing as mp
 
 def get_adjacency_matrix(game):
     """
@@ -495,32 +496,97 @@ class DiplomacyGCN(nn.Module):
         
         return type_logits, t1_logits, t2_logits
 
+# --- 1. THE ASYNC CPU WORKER ---
+def worker(remote, parent_remote):
+    """Runs a dedicated Diplomacy environment on a single CPU core."""
+    parent_remote.close()
+    env = DiplomacyEnv()
+    
+    while True:
+        try:
+            cmd, data = remote.recv()
+            if cmd == 'step':
+                # data is a dict of actions for this specific environment
+                obs, rewards, terms, truncs, infos = env.step(data)
+                remote.send((obs, rewards, terms, truncs, infos, env.agents))
+            elif cmd == 'reset':
+                obs, infos = env.reset()
+                remote.send((obs, infos, env.agents))
+            elif cmd == 'close':
+                remote.close()
+                break
+            elif cmd == 'get_possible_agents':
+                remote.send(env.possible_agents)
+        except EOFError:
+            break
+
+# --- 2. THE VECTORIZER MANAGER ---
+class SubprocVecDiplomacy:
+    """Manages 7 parallel environments and handles communication."""
+    def __init__(self, num_envs=7):
+        self.num_envs = num_envs
+        self.remotes, self.work_remotes = zip(*[mp.Pipe() for _ in range(num_envs)])
+        self.ps = [
+            mp.Process(target=worker, args=(work_remote, remote))
+            for (work_remote, remote) in zip(self.work_remotes, self.remotes)
+        ]
+        for p in self.ps:
+            p.daemon = True # Ensures workers close if the main process crashes
+            p.start()
+        for remote in self.work_remotes:
+            remote.close()
+
+    def reset(self):
+        for remote in self.remotes:
+            remote.send(('reset', None))
+        return [remote.recv() for remote in self.remotes]
+
+    def step(self, actions_list):
+        for remote, action_dict in zip(self.remotes, actions_list):
+            remote.send(('step', action_dict))
+        return [remote.recv() for remote in self.remotes]
+        
+    def get_possible_agents(self):
+        self.remotes[0].send(('get_possible_agents', None))
+        return self.remotes[0].recv()
+
+    def close(self):
+        for remote in self.remotes:
+            remote.send(('close', None))
+        for p in self.ps:
+            p.join()
+
+
+# --- 3. THE DISTRIBUTED TRAINING LOOP ---
 if __name__ == "__main__":
     import torch.distributed as dist
     from torch.nn.parallel import DistributedDataParallel as DDP
 
-    # 1. Initialize Distributed Process Group (NCCL is optimized for both CUDA and ROCm)
     dist.init_process_group(backend="nccl")
     
-    # 2. Get process and hardware ranks
     local_rank = int(os.environ["LOCAL_RANK"])
     global_rank = int(os.environ["RANK"])
-    
-    # Map the 28 processes cleanly across the 4 GPUs (7 processes per GPU)
     num_gpus = torch.cuda.device_count()
     device_id = local_rank % num_gpus
     torch.cuda.set_device(device_id)
     device = torch.device(f"cuda:{device_id}")
 
-    if global_rank == 0:
-        print(f"--- STARTING DISTRIBUTED RL ---")
-        print(f"Detected {num_gpus} GPUs. Running 28 parallel environments.")
+    NUM_ENVS_PER_GPU = 7 # 4 GPUs * 7 Envs = 28 total CPU threads
 
-    env = DiplomacyEnv()
-    adj_matrix = get_adjacency_matrix(env.game).to(device)
-    target_vocab_length = len(env.prov_to_idx)
+    if global_rank == 0:
+        print(f"--- STARTING VECTORIZED DISTRIBUTED RL ---")
+        print(f"GPUs active: {num_gpus}. Parallel envs per GPU: {NUM_ENVS_PER_GPU}.")
+
+    # Initialize the 7 CPU workers
+    vec_env = SubprocVecDiplomacy(num_envs=NUM_ENVS_PER_GPU)
+    possible_agents = vec_env.get_possible_agents()
     
-    # 3. Instantiate and wrap the model in DDP
+    # We need a dummy env just to grab static map dimensions
+    dummy_env = DiplomacyEnv()
+    adj_matrix = get_adjacency_matrix(dummy_env.game).to(device)
+    target_vocab_length = len(dummy_env.prov_to_idx)
+    del dummy_env 
+    
     net = DiplomacyGCN(
         adj=adj_matrix, 
         input_dim=16, 
@@ -528,56 +594,69 @@ if __name__ == "__main__":
         target_vocab_size=target_vocab_length
     ).to(device)
     
-    # DDP syncs gradients across all 28 processes automatically during backward()
     net = DDP(net, device_ids=[device_id])
     
     model_path = "diplomacy_gcn_bc_2_5644.pth"
     if os.path.exists(model_path):
-        # map_location ensures weights load directly to the correct GPU
         net.module.load_state_dict(torch.load(model_path, map_location=device))
         if global_rank == 0:
-            print(f"Successfully loaded pre-trained BC weights.")
+            print(f"Successfully loaded BC weights.")
     
     optimizer = optim.Adam(net.parameters(), lr=1e-4)
-    
     num_episodes = 10000 
     entropy_coef = 0.05 
     gamma = 0.99 
 
     for episode in range(num_episodes):
-        obs, infos = env.reset()
+        # Reset all 7 environments simultaneously
+        env_results = vec_env.reset()
         
         if global_rank == 0:
-            print(f"\n[Episode {episode+1}/{num_episodes}] Games running across cluster...")
+            print(f"\n[Episode {episode+1}/{num_episodes}] Running 7 vectorized rollouts...")
 
-        episode_log_probs = {agent: [] for agent in env.possible_agents}
-        episode_rewards = {agent: [] for agent in env.possible_agents}
-        episode_entropies = {agent: [] for agent in env.possible_agents}
-        
-        prev_sc_counts = {agent: float(len(env.game.get_centers(agent))) for agent in env.possible_agents}
+        # Track stats for 7 distinct environments
+        episode_log_probs = {e: {a: [] for a in possible_agents} for e in range(NUM_ENVS_PER_GPU)}
+        episode_rewards = {e: {a: [] for a in possible_agents} for e in range(NUM_ENVS_PER_GPU)}
+        episode_entropies = {e: {a: [] for a in possible_agents} for e in range(NUM_ENVS_PER_GPU)}
         
         step_count = 0
         
-        # Note: Even if episodes finish at different step counts across the 28 processes,
-        # DDP handles this safely as long as every process eventually calls .backward() exactly once per loop.
-        while env.agents: 
-            actions = {}
-            turn_log_probs = {}
-            turn_entropies = {}
+        while step_count < 100: 
+            actions_to_send = [{} for _ in range(NUM_ENVS_PER_GPU)]
             
-            for agent in env.agents:
-                state_tensor = torch.tensor(obs[agent]).unsqueeze(0).to(device)
+            # --- BATCHED GPU FORWARD PASS ---
+            for agent in possible_agents:
+                # 1. Find which of the 7 environments still have this agent alive
+                active_env_indices = []
+                obs_list = []
+                mask_type_list, mask_t1_list, mask_t2_list = [], [], []
                 
-                mask_dict = infos[agent]['action_mask']
-                mask_type = torch.tensor(mask_dict['type'], dtype=torch.bool).unsqueeze(0).to(device)
-                mask_t1 = torch.tensor(mask_dict['target1'], dtype=torch.bool).unsqueeze(0).to(device)
-                mask_t2 = torch.tensor(mask_dict['target2'], dtype=torch.bool).unsqueeze(0).to(device)
+                for i in range(NUM_ENVS_PER_GPU):
+                    obs_dict, infos_dict, active_agents = env_results[i][:3]
+                    if agent in active_agents:
+                        active_env_indices.append(i)
+                        obs_list.append(torch.tensor(obs_dict[agent]))
+                        
+                        mask_dict = infos_dict[agent]['action_mask']
+                        mask_type_list.append(torch.tensor(mask_dict['type'], dtype=torch.bool))
+                        mask_t1_list.append(torch.tensor(mask_dict['target1'], dtype=torch.bool))
+                        mask_t2_list.append(torch.tensor(mask_dict['target2'], dtype=torch.bool))
+
+                if not active_env_indices:
+                    continue # Agent is dead in all 7 parallel games
                 
-                type_logits, t1_logits, t2_logits = net(state_tensor)
+                # 2. Stack the tensors into a batch for the GPU
+                batch_obs = torch.stack(obs_list).to(device) # Shape: (N_active, 81, 16)
+                batch_mask_type = torch.stack(mask_type_list).to(device)
+                batch_mask_t1 = torch.stack(mask_t1_list).to(device)
+                batch_mask_t2 = torch.stack(mask_t2_list).to(device)
+
+                # 3. Single heavy forward pass for all active environments
+                type_logits, t1_logits, t2_logits = net(batch_obs)
                 
-                type_logits = type_logits.masked_fill(~mask_type, -1e9)
-                t1_logits = t1_logits.masked_fill(~mask_t1, -1e9)
-                t2_logits = t2_logits.masked_fill(~mask_t2, -1e9)
+                type_logits = type_logits.masked_fill(~batch_mask_type, -1e9)
+                t1_logits = t1_logits.masked_fill(~batch_mask_t1, -1e9)
+                t2_logits = t2_logits.masked_fill(~batch_mask_t2, -1e9)
                 
                 type_dist = Categorical(logits=type_logits)
                 t1_dist = Categorical(logits=t1_logits)
@@ -587,87 +666,76 @@ if __name__ == "__main__":
                 t1_action = t1_dist.sample()
                 t2_action = t2_dist.sample()
                 
-                active_unit_mask = (type_action != 0)
-                
-                if active_unit_mask.any():
-                    joint_log_prob = (
-                        type_dist.log_prob(type_action)[active_unit_mask] + 
-                        t1_dist.log_prob(t1_action)[active_unit_mask] + 
-                        t2_dist.log_prob(t2_action)[active_unit_mask]
-                    )
-                    turn_log_probs[agent] = joint_log_prob.sum()
+                # 4. Map the GPU outputs back to the individual CPU environments
+                for idx, env_idx in enumerate(active_env_indices):
+                    active_unit_mask = (type_action[idx] != 0)
                     
-                    joint_entropy = (
-                        type_dist.entropy()[active_unit_mask] + 
-                        t1_dist.entropy()[active_unit_mask] + 
-                        t2_dist.entropy()[active_unit_mask]
-                    )
-                    turn_entropies[agent] = joint_entropy.sum()
-                
-                actions[agent] = torch.stack([
-                    type_action.squeeze(0), 
-                    t1_action.squeeze(0), 
-                    t2_action.squeeze(0)
-                ], dim=-1).cpu().numpy()
+                    if active_unit_mask.any():
+                        joint_log_prob = (
+                            type_dist.log_prob(type_action)[idx][active_unit_mask] + 
+                            t1_dist.log_prob(t1_action)[idx][active_unit_mask] + 
+                            t2_dist.log_prob(t2_action)[idx][active_unit_mask]
+                        )
+                        episode_log_probs[env_idx][agent].append(joint_log_prob.sum())
+                        
+                        joint_entropy = (
+                            type_dist.entropy()[idx][active_unit_mask] + 
+                            t1_dist.entropy()[idx][active_unit_mask] + 
+                            t2_dist.entropy()[idx][active_unit_mask]
+                        )
+                        episode_entropies[env_idx][agent].append(joint_entropy.sum())
+                    
+                    actions_to_send[env_idx][agent] = torch.stack([
+                        type_action[idx], 
+                        t1_action[idx], 
+                        t2_action[idx]
+                    ], dim=-1).cpu().numpy()
 
-            all_supply_centers = env.game.map.scs
-            prev_sc_owners = {sc: p for p in env.possible_agents for sc in env.game.get_centers(p)}
-
-            next_obs, rewards, terminations, truncations, next_infos = env.step(actions)
+            # --- ASYNC CPU STEP ---
+            # All 7 environments step simultaneously across 7 CPU cores
+            next_env_results = vec_env.step(actions_to_send)
             
-            for agent in env.possible_agents:
-                if agent not in turn_log_probs: continue
+            # --- REWARD TRACKING ---
+            for i in range(NUM_ENVS_PER_GPU):
+                obs, rewards, terms, truncs, infos, active_agents = next_env_results[i]
+                for agent, r in rewards.items():
+                    episode_rewards[i][agent].append(float(r))
+            
+            env_results = next_env_results
+            
+            # Check if all agents in all envs are done
+            all_done = all(len(result[5]) == 0 for result in env_results)
+            if all_done:
+                break
                 
-                current_sc_list = env.game.get_centers(agent)
-                current_sc_count = len(current_sc_list)
-                step_reward = current_sc_count * 0.1 
-
-                for sc in current_sc_list:
-                    if sc not in prev_sc_owners: step_reward += 1.0 
-                    elif prev_sc_owners[sc] != agent: step_reward += 1.5 
-
-                for sc, owner in prev_sc_owners.items():
-                    if owner == agent and sc not in current_sc_list:
-                        step_reward -= 2.0 
-
-                agent_units = env.game.get_state()['units'].get(agent, [])
-                dislodged_count = sum(1 for u in agent_units if '*' in u)
-                step_reward -= (dislodged_count * 0.5)
-
-                episode_log_probs[agent].append(turn_log_probs[agent])
-                episode_entropies[agent].append(turn_entropies[agent])
-                episode_rewards[agent].append(step_reward)
-                prev_sc_counts[agent] = current_sc_count
-
-            obs, infos = next_obs, next_infos
             step_count += 1
-            if step_count > 100: break
                 
         # --- SYNCHRONIZED UPDATE PHASE ---
         policy_loss = []
-        for agent in env.possible_agents:
-            if not episode_log_probs[agent]: continue
-            
-            returns, R = [], 0
-            for r in reversed(episode_rewards[agent]):
-                R = r + gamma * R
-                returns.insert(0, R)
-            returns = torch.tensor(returns).to(device)
-            
-            if returns.std() > 0:
-                returns = (returns - returns.mean()) / (returns.std() + 1e-8)
-            
-            agent_log_probs = torch.stack(episode_log_probs[agent])
-            agent_entropies = torch.stack(episode_entropies[agent])
-            
-            loss = -(agent_log_probs * returns).mean() - (entropy_coef * agent_entropies.mean())
-            policy_loss.append(loss)
+        for i in range(NUM_ENVS_PER_GPU):
+            for agent in possible_agents:
+                if not episode_log_probs[i][agent]: continue
+                
+                returns, R = [], 0
+                for r in reversed(episode_rewards[i][agent]):
+                    R = r + gamma * R
+                    returns.insert(0, R)
+                returns = torch.tensor(returns).to(device)
+                
+                if returns.std() > 0:
+                    returns = (returns - returns.mean()) / (returns.std() + 1e-8)
+                
+                agent_log_probs = torch.stack(episode_log_probs[i][agent])
+                agent_entropies = torch.stack(episode_entropies[i][agent])
+                
+                loss = -(agent_log_probs * returns).mean() - (entropy_coef * agent_entropies.mean())
+                policy_loss.append(loss)
             
         if policy_loss:
             optimizer.zero_grad()
-            total_loss = torch.stack(policy_loss).sum()
+            total_loss = torch.stack(policy_loss).mean() # Mean across the 7 envs
             
-            # This backward pass acts as the synchronization barrier for all 28 processes
+            # Synchronize gradients across the 4 GPUs
             total_loss.backward()
             
             torch.nn.utils.clip_grad_norm_(net.parameters(), 0.5)
@@ -677,8 +745,8 @@ if __name__ == "__main__":
                 print(f"  Master Node - Policy Loss: {total_loss.item():.4f}")
 
     if global_rank == 0:
-        # Access the underlying model using .module when saving from DDP
-        torch.save(net.module.state_dict(), "diplomacy_rl_model_ddp.pth")
-        print("\nDistributed RL Training complete! Model saved.")
+        torch.save(net.module.state_dict(), "diplomacy_rl_model_vectorized.pth")
+        print("\nVectorized RL Training complete! Model saved.")
 
+    vec_env.close()
     dist.destroy_process_group()
