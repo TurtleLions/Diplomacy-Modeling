@@ -248,12 +248,28 @@ def worker(remote, parent_remote):
     while True:
         try:
             cmd, data = remote.recv()
-            if cmd == 'step': remote.send((*env.step(data), env.agents))
-            elif cmd == 'reset': remote.send((*env.reset(), env.agents))
+            if cmd == 'step': 
+                obs, rewards, terms, truncs, infos = env.step(data)
+                
+                # --- AUTO-RESET LOGIC ---
+                # If all agents are eliminated or the game is over, restart the board
+                if len(terms) == 0 or all(terms.values()) or len(env.agents) == 0:
+                    obs, infos = env.reset()
+                    
+                remote.send((obs, rewards, terms, truncs, infos, env.agents))
+                
+            elif cmd == 'reset': 
+                remote.send((*env.reset(), env.agents))
             elif cmd == 'close':
                 remote.close()
                 break
-        except EOFError: break
+        except EOFError: 
+            break
+        except Exception as e:
+            # Catch engine crashes so we see the real error instead of a broken pipe
+            print(f"Worker crashed: {e}")
+            remote.close()
+            break
 
 class SubprocVecDiplomacy:
     def __init__(self, num_envs):
