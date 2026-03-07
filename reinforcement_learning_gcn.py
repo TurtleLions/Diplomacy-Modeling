@@ -11,6 +11,9 @@ import torch.optim as optim
 import os
 from torch.distributions import Categorical
 import multiprocessing as mp
+import multiprocessing as mp
+import torch.distributed as dist
+from torch.nn.parallel import DistributedDataParallel as DDP
 
 def get_adjacency_matrix(game):
     """
@@ -506,7 +509,6 @@ def worker(remote, parent_remote):
         try:
             cmd, data = remote.recv()
             if cmd == 'step':
-                # data is a dict of actions for this specific environment
                 obs, rewards, terms, truncs, infos = env.step(data)
                 remote.send((obs, rewards, terms, truncs, infos, env.agents))
             elif cmd == 'reset':
@@ -522,7 +524,7 @@ def worker(remote, parent_remote):
 
 # --- 2. THE VECTORIZER MANAGER ---
 class SubprocVecDiplomacy:
-    """Manages 7 parallel environments and handles communication."""
+    """Manages parallel environments and handles communication."""
     def __init__(self, num_envs=7):
         self.num_envs = num_envs
         self.remotes, self.work_remotes = zip(*[mp.Pipe() for _ in range(num_envs)])
@@ -531,7 +533,7 @@ class SubprocVecDiplomacy:
             for (work_remote, remote) in zip(self.work_remotes, self.remotes)
         ]
         for p in self.ps:
-            p.daemon = True # Ensures workers close if the main process crashes
+            p.daemon = True 
             p.start()
         for remote in self.work_remotes:
             remote.close()
@@ -559,9 +561,6 @@ class SubprocVecDiplomacy:
 
 # --- 3. THE DISTRIBUTED TRAINING LOOP ---
 if __name__ == "__main__":
-    import torch.distributed as dist
-    from torch.nn.parallel import DistributedDataParallel as DDP
-
     dist.init_process_group(backend="nccl")
     
     local_rank = int(os.environ["LOCAL_RANK"])
@@ -571,17 +570,16 @@ if __name__ == "__main__":
     torch.cuda.set_device(device_id)
     device = torch.device(f"cuda:{device_id}")
 
-    NUM_ENVS_PER_GPU = 7 # 4 GPUs * 7 Envs = 28 total CPU threads
+    NUM_ENVS_PER_GPU = 7 
 
     if global_rank == 0:
         print(f"--- STARTING VECTORIZED DISTRIBUTED RL ---")
         print(f"GPUs active: {num_gpus}. Parallel envs per GPU: {NUM_ENVS_PER_GPU}.")
 
-    # Initialize the 7 CPU workers
     vec_env = SubprocVecDiplomacy(num_envs=NUM_ENVS_PER_GPU)
     possible_agents = vec_env.get_possible_agents()
     
-    # We need a dummy env just to grab static map dimensions
+    # Dummy env to grab static map dimensions
     dummy_env = DiplomacyEnv()
     adj_matrix = get_adjacency_matrix(dummy_env.game).to(device)
     target_vocab_length = len(dummy_env.prov_to_idx)
@@ -608,31 +606,33 @@ if __name__ == "__main__":
     gamma = 0.99 
 
     for episode in range(num_episodes):
-        # Reset all 7 environments simultaneously
         env_results = vec_env.reset()
         
         if global_rank == 0:
-            print(f"\n[Episode {episode+1}/{num_episodes}] Running 7 vectorized rollouts...")
+            print(f"\n[Episode {episode+1}/{num_episodes}] Running vectorized rollouts...")
 
-        # Track stats for 7 distinct environments
         episode_log_probs = {e: {a: [] for a in possible_agents} for e in range(NUM_ENVS_PER_GPU)}
         episode_rewards = {e: {a: [] for a in possible_agents} for e in range(NUM_ENVS_PER_GPU)}
         episode_entropies = {e: {a: [] for a in possible_agents} for e in range(NUM_ENVS_PER_GPU)}
         
         step_count = 0
         
+        # --- GAME ROLLOUT PHASE ---
         while step_count < 100: 
             actions_to_send = [{} for _ in range(NUM_ENVS_PER_GPU)]
             
-            # --- BATCHED GPU FORWARD PASS ---
             for agent in possible_agents:
-                # 1. Find which of the 7 environments still have this agent alive
                 active_env_indices = []
                 obs_list = []
                 mask_type_list, mask_t1_list, mask_t2_list = [], [], []
                 
                 for i in range(NUM_ENVS_PER_GPU):
-                    obs_dict, infos_dict, active_agents = env_results[i][:3]
+                    # Unpack dynamically based on reset() vs step() outputs
+                    if len(env_results[i]) == 3:
+                        obs_dict, infos_dict, active_agents = env_results[i]
+                    else:
+                        obs_dict, _, _, _, infos_dict, active_agents = env_results[i]
+                        
                     if agent in active_agents:
                         active_env_indices.append(i)
                         obs_list.append(torch.tensor(obs_dict[agent]))
@@ -643,15 +643,13 @@ if __name__ == "__main__":
                         mask_t2_list.append(torch.tensor(mask_dict['target2'], dtype=torch.bool))
 
                 if not active_env_indices:
-                    continue # Agent is dead in all 7 parallel games
+                    continue 
                 
-                # 2. Stack the tensors into a batch for the GPU
-                batch_obs = torch.stack(obs_list).to(device) # Shape: (N_active, 81, 16)
+                batch_obs = torch.stack(obs_list).to(device) 
                 batch_mask_type = torch.stack(mask_type_list).to(device)
                 batch_mask_t1 = torch.stack(mask_t1_list).to(device)
                 batch_mask_t2 = torch.stack(mask_t2_list).to(device)
 
-                # 3. Single heavy forward pass for all active environments
                 type_logits, t1_logits, t2_logits = net(batch_obs)
                 
                 type_logits = type_logits.masked_fill(~batch_mask_type, -1e9)
@@ -666,7 +664,6 @@ if __name__ == "__main__":
                 t1_action = t1_dist.sample()
                 t2_action = t2_dist.sample()
                 
-                # 4. Map the GPU outputs back to the individual CPU environments
                 for idx, env_idx in enumerate(active_env_indices):
                     active_unit_mask = (type_action[idx] != 0)
                     
@@ -691,11 +688,8 @@ if __name__ == "__main__":
                         t2_action[idx]
                     ], dim=-1).cpu().numpy()
 
-            # --- ASYNC CPU STEP ---
-            # All 7 environments step simultaneously across 7 CPU cores
             next_env_results = vec_env.step(actions_to_send)
             
-            # --- REWARD TRACKING ---
             for i in range(NUM_ENVS_PER_GPU):
                 obs, rewards, terms, truncs, infos, active_agents = next_env_results[i]
                 for agent, r in rewards.items():
@@ -703,7 +697,6 @@ if __name__ == "__main__":
             
             env_results = next_env_results
             
-            # Check if all agents in all envs are done
             all_done = all(len(result[5]) == 0 for result in env_results)
             if all_done:
                 break
@@ -733,11 +726,9 @@ if __name__ == "__main__":
             
         if policy_loss:
             optimizer.zero_grad()
-            total_loss = torch.stack(policy_loss).mean() # Mean across the 7 envs
+            total_loss = torch.stack(policy_loss).mean()
             
-            # Synchronize gradients across the 4 GPUs
             total_loss.backward()
-            
             torch.nn.utils.clip_grad_norm_(net.parameters(), 0.5)
             optimizer.step()
             
