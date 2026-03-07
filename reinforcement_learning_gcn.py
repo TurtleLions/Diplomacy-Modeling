@@ -300,7 +300,7 @@ if __name__ == "__main__":
     VOCAB_SIZE = len(dummy_env.prov_to_idx)
     del dummy_env 
 
-    net = DiplomacyActorCritic(adj=adj_matrix, target_vocab_size=PROVINCES).to(device)
+    net = DiplomacyActorCritic(adj=adj_matrix, target_vocab_size=MAP_PROVINCES).to(device)
     net = DDP(net, device_ids=[local_rank])
     optimizer = optim.Adam(net.parameters(), lr=3e-4, eps=1e-5)
 
