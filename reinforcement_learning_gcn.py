@@ -433,10 +433,14 @@ if __name__ == "__main__":
                     a_type, a_t1, a_t2 = type_dist.sample(), t1_dist.sample(), t2_dist.sample()
                     
                     active_unit_mask = (a_type != 0)
+                    # Get the number of units this agent has (clamp to 1 to prevent division by zero)
+                    active_counts = active_unit_mask.sum(dim=1).clamp(min=1) 
+                    
                     log_p = type_dist.log_prob(a_type) + t1_dist.log_prob(a_t1) + t2_dist.log_prob(a_t2)
                     
                     b_values[step][b_masks[step]] = values.squeeze()
-                    b_logprobs[step][b_masks[step]] = (log_p * active_unit_mask).sum(dim=1)
+                    # CRITICAL FIX: Average the log probability over the active units
+                    b_logprobs[step][b_masks[step]] = (log_p * active_unit_mask).sum(dim=1) / active_counts
                     
                     idx_counter = 0
                     for i in range(NUM_ENVS):
@@ -483,37 +487,60 @@ if __name__ == "__main__":
 
         # --- UPDATE PHASE ---
         net.train()
+        b_size = flat_obs.shape[0]
+        mb_size = b_size // 4  # Break the massive batch into 4 smaller, memory-safe chunks
+        indices = np.arange(b_size)
+        
         for epoch in range(update_epochs):
-            type_l, t1_l, t2_l, new_val = net(flat_obs)
-            
-            type_l = type_l.masked_fill(~flat_m_type, -1e9)
-            t1_l = t1_l.masked_fill(~flat_m_t1, -1e9)
-            t2_l = t2_l.masked_fill(~flat_m_t2, -1e9)
-            
-            type_dist, t1_dist, t2_dist = Categorical(logits=type_l), Categorical(logits=t1_l), Categorical(logits=t2_l)
-            
-            active_unit_mask = (flat_act[..., 0] != 0)
-            new_logp = type_dist.log_prob(flat_act[..., 0]) + t1_dist.log_prob(flat_act[..., 1]) + t2_dist.log_prob(flat_act[..., 2])
-            new_logp = (new_logp * active_unit_mask).sum(dim=1)
-            
-            entropy = type_dist.entropy() + t1_dist.entropy() + t2_dist.entropy()
-            entropy = (entropy * active_unit_mask).sum(dim=1).mean()
+            np.random.shuffle(indices)
+            for start in range(0, b_size, mb_size):
+                end = start + mb_size
+                mb_idx = indices[start:end]
+                
+                mb_obs = flat_obs[mb_idx]
+                mb_act = flat_act[mb_idx]
+                mb_logprobs = flat_logprobs[mb_idx]
+                mb_adv = flat_adv[mb_idx]
+                mb_ret = flat_ret[mb_idx]
+                mb_m_type = flat_m_type[mb_idx]
+                mb_m_t1 = flat_m_t1[mb_idx]
+                mb_m_t2 = flat_m_t2[mb_idx]
 
-            logratio = new_logp - flat_logprobs
-            ratio = logratio.exp()
-            
-            pg_loss1 = -flat_adv * ratio
-            pg_loss2 = -flat_adv * torch.clamp(ratio, 1 - clip_coef, 1 + clip_coef)
-            pg_loss = torch.max(pg_loss1, pg_loss2).mean()
-            
-            v_loss = 0.5 * ((new_val.squeeze() - flat_ret) ** 2).mean()
-            
-            loss = pg_loss - ent_coef * entropy + v_loss * v_coef
-            
-            optimizer.zero_grad()
-            loss.backward()
-            nn.utils.clip_grad_norm_(net.parameters(), 0.5)
-            optimizer.step()
+                type_l, t1_l, t2_l, new_val = net(mb_obs)
+                
+                type_l = type_l.masked_fill(~mb_m_type, -1e9)
+                t1_l = t1_l.masked_fill(~mb_m_t1, -1e9)
+                t2_l = t2_l.masked_fill(~mb_m_t2, -1e9)
+                
+                type_dist, t1_dist, t2_dist = Categorical(logits=type_l), Categorical(logits=t1_l), Categorical(logits=t2_l)
+                
+                active_unit_mask = (mb_act[..., 0] != 0)
+                active_counts = active_unit_mask.sum(dim=1).clamp(min=1)
+                
+                new_logp = type_dist.log_prob(mb_act[..., 0]) + t1_dist.log_prob(mb_act[..., 1]) + t2_dist.log_prob(mb_act[..., 2])
+                # CRITICAL FIX: Average the log probability over the active units
+                new_logp = (new_logp * active_unit_mask).sum(dim=1) / active_counts 
+                
+                entropy = type_dist.entropy() + t1_dist.entropy() + t2_dist.entropy()
+                # CRITICAL FIX: Average the entropy over the active units
+                entropy = (entropy * active_unit_mask).sum(dim=1) / active_counts 
+                entropy = entropy.mean()
+
+                logratio = new_logp - mb_logprobs
+                ratio = logratio.exp()
+                
+                pg_loss1 = -mb_adv * ratio
+                pg_loss2 = -mb_adv * torch.clamp(ratio, 1 - clip_coef, 1 + clip_coef)
+                pg_loss = torch.max(pg_loss1, pg_loss2).mean()
+                
+                v_loss = 0.5 * ((new_val.squeeze() - mb_ret) ** 2).mean()
+                
+                loss = pg_loss - ent_coef * entropy + v_loss * v_coef
+                
+                optimizer.zero_grad()
+                loss.backward()
+                nn.utils.clip_grad_norm_(net.parameters(), 0.5)
+                optimizer.step()
 
         # --- RANK 0 LOGGING & SAVING ---
         if global_rank == 0:
