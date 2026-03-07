@@ -5,6 +5,7 @@ import numpy as np
 from diplomacy import Game
 from tqdm import tqdm
 from multiprocessing import Pool, Manager
+import logging
 
 # --- CONSTANTS ---
 ACTION_TYPES = ['NONE', 'H', '-', 'S', 'C', 'B', 'D', 'R']
@@ -18,10 +19,6 @@ def get_vocab():
     return {p: i for i, p in enumerate(provinces)}
 
 def robust_parse_order(parts, log_list=None):
-    """
-    Defensive parser to prevent IndexErrors. 
-    Logs short strings that don't meet the [UNIT, LOC, ACTION] format.
-    """
     if len(parts) < 3:
         if log_list is not None:
             log_list.append(" ".join(parts))
@@ -29,16 +26,11 @@ def robust_parse_order(parts, log_list=None):
     
     act_type = parts[2]
     t1, t2 = 'NONE', 'NONE'
-    
-    # Move/Retreat
     if act_type in ['-', 'R'] and len(parts) >= 4:
         t1 = parts[3]
-    # Support/Convoy
     elif act_type in ['S', 'C'] and len(parts) >= 4:
-        # Index 3 is usually 'A' or 'F', loc is index 4
         t1_idx = 4 if parts[3] in ['A', 'F'] and len(parts) > 4 else 3
         t1 = parts[t1_idx]
-        
         if '-' in parts:
             try:
                 idx = parts.index('-')
@@ -46,7 +38,6 @@ def robust_parse_order(parts, log_list=None):
                     t2 = parts[idx + 1]
             except ValueError:
                 pass
-    
     return act_type, t1, t2
 
 worker_game = None
@@ -68,10 +59,16 @@ def process_batch(args):
             worker_game.set_state(phase_data['state'])
             state_tensor = np.zeros((len(provinces), 16), dtype=np.float32)
             
-            # 1. State Tensor Generation
-            for pow_name, u_list in phase_data['state'].get('units', {}).items():
-                if pow_name not in POWER_TO_IDX: continue
-                p_idx = POWER_TO_IDX[pow_name]
+            # FIXED: Correct variable reference for units and centers
+            curr_state = phase_data['state']
+            units = curr_state.get('units', {})
+            centers = curr_state.get('centers', {})
+            
+            # Fill State Tensor
+            for pow_name, u_list in units.items():
+                upper_pow = pow_name.upper()
+                if upper_pow not in POWER_TO_IDX: continue
+                p_idx = POWER_TO_IDX[upper_pow]
                 for u_str in u_list:
                     parts = u_str.replace('*', '').split()
                     if len(parts) >= 2 and parts[1] in prov_to_idx:
@@ -80,21 +77,25 @@ def process_batch(args):
                         state_tensor[loc_idx, 7 if parts[0] == 'A' else 8] = 1.0
 
             for pow_name, c_list in centers.items():
-                if pow_name not in POWER_TO_IDX: continue
-                p_idx = POWER_TO_IDX[pow_name]
+                upper_pow = pow_name.upper()
+                if upper_pow not in POWER_TO_IDX: continue
+                p_idx = POWER_TO_IDX[upper_pow]
                 for c in c_list:
                     if c in prov_to_idx:
                         state_tensor[prov_to_idx[c]-1, 9 + p_idx] = 1.0
 
-            # 2. Sample Generation
             all_possible = worker_game.get_all_possible_orders()
+            
             for power, orders in phase_data.get('orders', {}).items():
-                if not orders: continue
+                upper_power = power.upper()
+                if not orders or upper_power not in POWER_TO_IDX: continue
                 
-                type_m, t1_m, t2_m = np.zeros((len(provinces), 8), dtype=bool), np.zeros((len(provinces), 82), dtype=bool), np.zeros((len(provinces), 82), dtype=bool)
+                type_m = np.zeros((len(provinces), 8), dtype=bool)
+                t1_m = np.zeros((len(provinces), 82), dtype=bool)
+                t2_m = np.zeros((len(provinces), 82), dtype=bool)
                 target_mat = np.zeros((len(provinces), 3), dtype=np.int64)
                 
-                orderable = worker_game.get_orderable_locations(power)
+                orderable = worker_game.get_orderable_locations(upper_power)
                 for i, prov in enumerate(provinces):
                     if prov in orderable:
                         for o in all_possible.get(prov, []):
@@ -109,7 +110,7 @@ def process_batch(args):
                     pts = o_str.replace('*', '').split()
                     if len(pts) >= 2 and pts[1] in prov_to_idx:
                         idx = prov_to_idx[pts[1]] - 1
-                        a, ta1, ta2 = robust_parse_order(pts, skipped_log) # Log skips here
+                        a, ta1, ta2 = robust_parse_order(pts, skipped_log)
                         target_mat[idx] = [ACTION_TO_IDX.get(a, 0), prov_to_idx.get(ta1, 0), prov_to_idx.get(ta2, 0)]
 
                 batch_samples.append({
@@ -119,24 +120,35 @@ def process_batch(args):
                     'mask_t2': torch.from_numpy(t2_m),
                     'targets': torch.from_numpy(target_mat)
                 })
-        except Exception:
+        except Exception as e:
+            # If you still get 0 samples, uncomment the line below to see the error
+            # print(f"Error processing phase: {e}")
             continue
             
     return batch_samples
 
 if __name__ == "__main__":
     manager = Manager()
-    skipped_log = manager.list() # Thread-safe list for multi-process logging
+    skipped_log = manager.list()
     prov_to_idx = get_vocab()
     raw_phases = []
     
     print("Loading raw JSONL data...")
-    with open("./datasets/standard_no_press.jsonl", 'r') as f:
+    dataset_path = "./datasets/standard_no_press.jsonl"
+    if not os.path.exists(dataset_path):
+        print(f"ERROR: Dataset not found at {dataset_path}")
+        exit()
+
+    with open(dataset_path, 'r') as f:
         for line in f:
             if not line.strip(): continue
             game_obj = json.loads(line)
             if game_obj.get('map') == 'standard':
                 raw_phases.extend(game_obj.get('phases', []))
+
+    if not raw_phases:
+        print("ERROR: No phases found in JSONL. Check your 'map' key.")
+        exit()
 
     chunk_size = 50
     chunks = [(raw_phases[i:i + chunk_size], prov_to_idx, skipped_log) for i in range(0, len(raw_phases), chunk_size)]
@@ -147,10 +159,11 @@ if __name__ == "__main__":
         for result_batch in tqdm(p.imap_unordered(process_batch, chunks), total=len(chunks)):
             final_data.extend(result_batch)
     
-    # Summary of skipped/malformed orders
     print(f"\nCompleted! Skipped/Malformed orders encountered: {len(skipped_log)}")
-    if len(skipped_log) > 0:
-        print("Sample of skipped orders:", list(set(skipped_log))[:10])
-    
     print(f"Saving {len(final_data)} total samples...")
-    torch.save(final_data, "processed_diplomacy.pt")
+    
+    if len(final_data) > 0:
+        torch.save(final_data, "processed_diplomacy.pt")
+        print("File saved successfully.")
+    else:
+        print("No data to save. Check the power name casing and logic.")
