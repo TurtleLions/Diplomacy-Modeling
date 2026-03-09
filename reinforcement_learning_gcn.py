@@ -161,7 +161,6 @@ class DiplomacyEnv(ParallelEnv):
         rewards = {a: 0.0 for a in self.agents}
         all_text_orders = {}
         
-        # 1. Decode all orders for all agents first
         for agent, action_matrix in actions.items():
             text_orders = []
             for i, arr in enumerate(action_matrix):
@@ -172,20 +171,12 @@ class DiplomacyEnv(ParallelEnv):
             all_text_orders[agent] = text_orders
             self.game.set_orders(agent, text_orders)
             
-        # 2. SHAPED REWARD FIX - Only reward coordinated offensive actions
         for agent, orders in all_text_orders.items():
             for order_str in orders:
-                
-                # Check for coordinated move support (e.g., "A PAR S MAR - BUR")
                 if ' S ' in order_str and ' - ' in order_str:
-                    # Extract the expected move (e.g., "MAR - BUR")
                     target_action = order_str.split(' S ')[1] 
-                    
-                    # Verify the agent actually commanded that move (e.g., "A MAR - BUR")
                     if any(o.endswith(target_action) for o in orders):
                         rewards[agent] += 0.02
-                        
-                # Check for coordinated convoy (e.g., "F ENG C LON - BRE")
                 elif ' C ' in order_str:
                     target_action = order_str.split(' C ')[1] 
                     if any(o.endswith(target_action) for o in orders):
@@ -201,7 +192,6 @@ class DiplomacyEnv(ParallelEnv):
             current_scs = self.game.get_centers(agent)
             agent_units = self.game.get_state()['units'].get(agent, [])
             
-            # Reduce passive holding reward drastically to prevent turtling
             rewards[agent] += len(current_scs) * 0.005
             
             for sc in current_scs:
@@ -367,7 +357,9 @@ if __name__ == "__main__":
 
     net = DiplomacyActorCritic(adj=adj_matrix, target_vocab_size=VOCAB_SIZE).to(device)
     net = DDP(net, device_ids=[local_rank])
-    optimizer = optim.Adam(net.parameters(), lr=1e-4, eps=1e-5)
+    
+    # --- DEBUG 1: LOWER LEARNING RATE ---
+    optimizer = optim.Adam(net.parameters(), lr=1e-5, eps=1e-5)
 
     b_obs = torch.zeros((NUM_STEPS, NUM_ENVS, NUM_AGENTS, MAP_PROVINCES, 16), dtype=torch.float32, device=device)
     b_actions = torch.zeros((NUM_STEPS, NUM_ENVS, NUM_AGENTS, MAP_PROVINCES, 3), dtype=torch.long, device=device)
@@ -390,10 +382,7 @@ if __name__ == "__main__":
     v_coef = 0.5
     update_epochs = 4
     
-    # 2. TARGET MASK FIX - Helper Tensors for identifying which actions use targets
-    # Actions needing T1: Move (2), Support (3), Convoy (4), Retreat (7)
     uses_t1 = torch.tensor([2, 3, 4, 7], device=device)
-    # Actions needing T2: Support (3), Convoy (4)
     uses_t2 = torch.tensor([3, 4], device=device)
 
     agent_to_idx = {a: i for i, a in enumerate(possible_agents)}
@@ -407,7 +396,6 @@ if __name__ == "__main__":
     for update in range(1, num_updates + 1):
         start_time = time.time()
         
-        # 3. ENTROPY SCHEDULE FIX - Keep entropy high for the first half of training
         half_updates = num_updates // 2
         if update <= half_updates:
             ent_coef = ent_coef_start
@@ -444,17 +432,29 @@ if __name__ == "__main__":
                 if flat_obs.shape[0] > 0:
                     type_l, t1_l, t2_l, values = net(flat_obs)
                     
-                    type_l = type_l.masked_fill(~b_m_type[step][b_masks[step]], -1e9)
+                    # --- DEBUG 2: VERIFY ACTION MASKS ---
+                    active_type_mask = b_m_type[step][b_masks[step]]
+                    if not active_type_mask.any(dim=1).all() and global_rank == 0:
+                        print(f"WARNING: Step {step} contains a province mask with ALL False values!")
+
+                    type_l = type_l.masked_fill(~active_type_mask, -1e9)
                     t1_l = t1_l.masked_fill(~b_m_t1[step][b_masks[step]], -1e9)
                     t2_l = t2_l.masked_fill(~b_m_t2[step][b_masks[step]], -1e9)
                     
+                    # --- DEBUG 3: INSPECT LOGITS FOR NaNs/INFs ---
+                    if (torch.isnan(type_l).any() or type_l.max() > 1e4) and global_rank == 0:
+                        print(f"CRITICAL: NaNs or exploding logits detected! Max logit: {type_l.max().item()}")
+
                     type_dist, t1_dist, t2_dist = Categorical(logits=type_l), Categorical(logits=t1_l), Categorical(logits=t2_l)
                     a_type, a_t1, a_t2 = type_dist.sample(), t1_dist.sample(), t2_dist.sample()
+                    
+                    # --- DEBUG 4: TRACK PREDICTED ACTIONS ---
+                    if update <= 5 and step == 0 and global_rank == 0:
+                        print(f"      [DEBUG Update {update}] Sample predicted actions: {a_type[:15].tolist()}")
                     
                     active_unit_mask = (a_type != 0)
                     active_counts = active_unit_mask.sum(dim=1).clamp(min=1) 
                     
-                    # Target masking fix applied during rollout
                     t1_needed_mask = torch.isin(a_type, uses_t1).float()
                     t2_needed_mask = torch.isin(a_type, uses_t2).float()
                     
@@ -548,7 +548,6 @@ if __name__ == "__main__":
                 active_unit_mask = (mb_act[..., 0] != 0)
                 active_counts = active_unit_mask.sum(dim=1).clamp(min=1)
                 
-                # Target masking fix applied during the backward pass computation
                 mb_a_type = mb_act[..., 0]
                 t1_needed_mask = torch.isin(mb_a_type, uses_t1).float()
                 t2_needed_mask = torch.isin(mb_a_type, uses_t2).float()
@@ -581,7 +580,12 @@ if __name__ == "__main__":
                 
                 optimizer.zero_grad()
                 loss.backward()
-                nn.utils.clip_grad_norm_(net.parameters(), 0.5)
+                
+                # --- DEBUG 5: TRACK GRADIENT NORMS ---
+                grad_norm = nn.utils.clip_grad_norm_(net.parameters(), 0.5)
+                if epoch == 0 and start == 0 and global_rank == 0:
+                    print(f"      [DEBUG] Pre-clip Gradient Norm: {grad_norm.item():.4f}")
+                    
                 optimizer.step()
                 
             avg_epoch_kl = approx_kl_total / 4
