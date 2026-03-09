@@ -458,8 +458,8 @@ if __name__ == "__main__":
                     a_type, a_t1, a_t2 = type_dist.sample(), t1_dist.sample(), t2_dist.sample()
                     
                     # --- DEBUG 4: TRACK PREDICTED ACTIONS ---
-                    if update <= 5 and step == 0 and global_rank == 0:
-                        print(f"      [DEBUG Update {update}] Sample predicted actions: {a_type[:15].tolist()}")
+                    # if update <= 5 and step == 0 and global_rank == 0:
+                        # print(f"      [DEBUG Update {update}] Sample predicted actions: {a_type[:15].tolist()}")
                     
                     active_unit_mask = (a_type != 0)
                     active_counts = active_unit_mask.sum(dim=1).clamp(min=1) 
