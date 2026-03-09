@@ -140,7 +140,6 @@ def decode_compositional_order(province, action_array, game, idx_to_action, idx_
     return None
 
 class DiplomacyEnv(ParallelEnv):
-class DiplomacyEnv(ParallelEnv):
     metadata = {'render_modes': ['human'], "name": "diplomacy_v0"}
 
     def __init__(self):
