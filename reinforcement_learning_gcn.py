@@ -437,7 +437,7 @@ if __name__ == "__main__":
                     
                     # --- DEBUG 2: VERIFY ACTION MASKS ---
                     active_type_mask = b_m_type[step][b_masks[step]]
-                    if not active_type_mask.any(dim=1).all() and global_rank == 0:
+                    if not active_type_mask.any(dim=-1).all() and global_rank == 0:
                         print(f"WARNING: Step {step} contains a province mask with ALL False values!")
 
                     type_l = type_l.masked_fill(~active_type_mask, -1e9)
