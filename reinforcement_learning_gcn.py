@@ -14,7 +14,7 @@ from gymnasium.spaces import Box, MultiDiscrete
 import time
 from torch.utils.tensorboard import SummaryWriter
 
-# --- 1. UTILITIES & ENVIRONMENT (Unchanged Logic, Optimized for Speed) ---
+# --- 1. UTILITIES & ENVIRONMENT ---
 def get_adjacency_matrix(game):
     provinces = game.map.locs 
     prov_to_idx = {prov: i for i, prov in enumerate(provinces)}
@@ -158,25 +158,52 @@ class DiplomacyEnv(ParallelEnv):
         self.game.clear_orders()
         prev_sc_owners = {sc: a for a in self.possible_agents for sc in self.game.get_centers(a)}
         
+        rewards = {a: 0.0 for a in self.agents}
+        all_text_orders = {}
+        
+        # 1. Decode all orders for all agents first
         for agent, action_matrix in actions.items():
-            text_orders = [
-                decode_compositional_order(self.provinces[i], arr, self.game, IDX_TO_ACTION, self.idx_to_prov)
-                for i, arr in enumerate(action_matrix)
-            ]
-            self.game.set_orders(agent, [o for o in text_orders if o])
+            text_orders = []
+            for i, arr in enumerate(action_matrix):
+                order_str = decode_compositional_order(self.provinces[i], arr, self.game, IDX_TO_ACTION, self.idx_to_prov)
+                if order_str:
+                    text_orders.append(order_str)
             
+            all_text_orders[agent] = text_orders
+            self.game.set_orders(agent, text_orders)
+            
+        # 2. SHAPED REWARD FIX - Only reward coordinated offensive actions
+        for agent, orders in all_text_orders.items():
+            for order_str in orders:
+                
+                # Check for coordinated move support (e.g., "A PAR S MAR - BUR")
+                if ' S ' in order_str and ' - ' in order_str:
+                    # Extract the expected move (e.g., "MAR - BUR")
+                    target_action = order_str.split(' S ')[1] 
+                    
+                    # Verify the agent actually commanded that move (e.g., "A MAR - BUR")
+                    if any(o.endswith(target_action) for o in orders):
+                        rewards[agent] += 0.02
+                        
+                # Check for coordinated convoy (e.g., "F ENG C LON - BRE")
+                elif ' C ' in order_str:
+                    target_action = order_str.split(' C ')[1] 
+                    if any(o.endswith(target_action) for o in orders):
+                        rewards[agent] += 0.02
+
         self.game.process()
         obs_tensor = parse_state_to_tensor({'state': self.game.get_state()})
         observations = {a: obs_tensor.copy() for a in self.agents}
         
-        rewards = {a: 0.0 for a in self.agents}
         is_done = False
         
         for agent in self.agents:
             current_scs = self.game.get_centers(agent)
             agent_units = self.game.get_state()['units'].get(agent, [])
             
-            rewards[agent] += len(current_scs) * 0.05
+            # Reduce passive holding reward drastically to prevent turtling
+            rewards[agent] += len(current_scs) * 0.005
+            
             for sc in current_scs:
                 if sc not in prev_sc_owners: rewards[agent] += 1.0
                 elif prev_sc_owners[sc] != agent: rewards[agent] += 2.0
@@ -198,7 +225,6 @@ class DiplomacyEnv(ParallelEnv):
 
 # --- 2. DEEPER GCN, MLPS & ORTHOGONAL INIT ---
 def layer_init(layer, std=np.sqrt(2), bias_const=0.0):
-    """Initializes network layers to prevent exploding early-game logits."""
     torch.nn.init.orthogonal_(layer.weight, std)
     torch.nn.init.constant_(layer.bias, bias_const)
     return layer
@@ -224,13 +250,11 @@ class DiplomacyActorCritic(nn.Module):
         super().__init__()
         self.register_buffer('adj', adj)
         
-        # 1. Spatial Feature Extractors (GCNs)
         self.gcn1 = GCNLayer(input_dim, hidden_dim)
         self.gcn2 = GCNLayer(hidden_dim, hidden_dim)
         self.gcn3 = GCNLayer(hidden_dim, hidden_dim)
         self.gcn4 = GCNLayer(hidden_dim, hidden_dim)
         
-        # 2. Deeper Strategy Brain (Actor MLP)
         self.actor_mlp = nn.Sequential(
             layer_init(nn.Linear(hidden_dim, hidden_dim)),
             nn.LayerNorm(hidden_dim),
@@ -240,38 +264,30 @@ class DiplomacyActorCritic(nn.Module):
             nn.Tanh()
         )
         
-        # 3. Deeper Evaluation Brain (Critic MLP)
         self.critic_mlp = nn.Sequential(
             layer_init(nn.Linear(hidden_dim, hidden_dim)),
             nn.LayerNorm(hidden_dim),
             nn.Tanh()
         )
         
-        # 4. Actor Heads (std=0.01 forces logits to start near zero, maximizing entropy!)
         self.type_head = layer_init(nn.Linear(hidden_dim, 8), std=0.01)
         self.t1_head = layer_init(nn.Linear(hidden_dim, target_vocab_size), std=0.01)
         self.t2_head = layer_init(nn.Linear(hidden_dim, target_vocab_size), std=0.01)
-        
-        # Critic Head (std=1.0 is standard for value prediction)
         self.value_head = layer_init(nn.Linear(hidden_dim, 1), std=1.0)
 
     def forward(self, x):
-        # Pass through Map Logic
         h = self.gcn1(x, self.adj)
         h = self.gcn2(h, self.adj)
         h = self.gcn3(h, self.adj)
         h = self.gcn4(h, self.adj)
         
-        # Split into Strategy and Value thinking
         actor_features = self.actor_mlp(h)
         critic_features = self.critic_mlp(h)
         
-        # Get Actions
         type_logits = self.type_head(actor_features)
         t1_logits = self.t1_head(actor_features)
         t2_logits = self.t2_head(actor_features)
         
-        # Get Value (Pooled across all provinces)
         state_value = self.value_head(critic_features).mean(dim=-2) 
         
         return type_logits, t1_logits, t2_logits, state_value
@@ -286,8 +302,6 @@ def worker(remote, parent_remote):
             if cmd == 'step': 
                 obs, rewards, terms, truncs, infos = env.step(data)
                 
-                # --- AUTO-RESET LOGIC ---
-                # If all agents are eliminated or the game is over, restart the board
                 if len(terms) == 0 or all(terms.values()) or len(env.agents) == 0:
                     obs, infos = env.reset()
                     
@@ -301,7 +315,6 @@ def worker(remote, parent_remote):
         except EOFError: 
             break
         except Exception as e:
-            # Catch engine crashes so we see the real error instead of a broken pipe
             print(f"Worker crashed: {e}")
             remote.close()
             break
@@ -336,7 +349,7 @@ if __name__ == "__main__":
     device = torch.device(f"cuda:{local_rank}")
     torch.cuda.set_device(device)
 
-    NUM_ENVS = 28 # Scale this up to feed the GPU
+    NUM_ENVS = 28 
     NUM_STEPS = 100
     NUM_AGENTS = 7
 
@@ -356,7 +369,6 @@ if __name__ == "__main__":
     net = DDP(net, device_ids=[local_rank])
     optimizer = optim.Adam(net.parameters(), lr=1e-4, eps=1e-5)
 
-    # Pre-allocate Tensors (Zero memory fragmentation)
     b_obs = torch.zeros((NUM_STEPS, NUM_ENVS, NUM_AGENTS, MAP_PROVINCES, 16), dtype=torch.float32, device=device)
     b_actions = torch.zeros((NUM_STEPS, NUM_ENVS, NUM_AGENTS, MAP_PROVINCES, 3), dtype=torch.long, device=device)
     b_logprobs = torch.zeros((NUM_STEPS, NUM_ENVS, NUM_AGENTS), dtype=torch.float32, device=device)
@@ -365,12 +377,10 @@ if __name__ == "__main__":
     b_values = torch.zeros((NUM_STEPS, NUM_ENVS, NUM_AGENTS), dtype=torch.float32, device=device)
     b_masks = torch.zeros((NUM_STEPS, NUM_ENVS, NUM_AGENTS), dtype=torch.bool, device=device) 
     
-    # Mask buffers (Targets use VOCAB_SIZE, types use 8)
     b_m_type = torch.zeros((NUM_STEPS, NUM_ENVS, NUM_AGENTS, MAP_PROVINCES, 8), dtype=torch.bool, device=device)
     b_m_t1 = torch.zeros((NUM_STEPS, NUM_ENVS, NUM_AGENTS, MAP_PROVINCES, VOCAB_SIZE), dtype=torch.bool, device=device)
     b_m_t2 = torch.zeros((NUM_STEPS, NUM_ENVS, NUM_AGENTS, MAP_PROVINCES, VOCAB_SIZE), dtype=torch.bool, device=device)
 
-    # PPO Hyperparams
     num_updates = 1000
     gamma = 0.99
     gae_lambda = 0.95
@@ -380,21 +390,30 @@ if __name__ == "__main__":
     v_coef = 0.5
     update_epochs = 4
     
-    agent_to_idx = {a: i for i, a in enumerate(possible_agents)}
+    # 2. TARGET MASK FIX - Helper Tensors for identifying which actions use targets
+    # Actions needing T1: Move (2), Support (3), Convoy (4), Retreat (7)
+    uses_t1 = torch.tensor([2, 3, 4, 7], device=device)
+    # Actions needing T2: Support (3), Convoy (4)
+    uses_t2 = torch.tensor([3, 4], device=device)
 
+    agent_to_idx = {a: i for i, a in enumerate(possible_agents)}
     next_env_results = vec_env.reset()
     next_done = torch.zeros((NUM_ENVS, NUM_AGENTS), device=device)
 
-    # --- TENSORBOARD & CHECKPOINT SETUP ---
     if global_rank == 0:
         os.makedirs("./checkpoints", exist_ok=True)
         writer = SummaryWriter(log_dir="./runs/diplomacy_ppo_01")
 
     for update in range(1, num_updates + 1):
         start_time = time.time()
-        # Entropy schedule
-        frac = 1.0 - (update - 1.0) / num_updates
-        ent_coef = frac * ent_coef_start + (1 - frac) * ent_coef_end
+        
+        # 3. ENTROPY SCHEDULE FIX - Keep entropy high for the first half of training
+        half_updates = num_updates // 2
+        if update <= half_updates:
+            ent_coef = ent_coef_start
+        else:
+            frac = 1.0 - (update - half_updates - 1.0) / half_updates
+            ent_coef = frac * ent_coef_start + (1 - frac) * ent_coef_end
 
         # --- ROLLOUT PHASE ---
         net.eval()
@@ -433,13 +452,17 @@ if __name__ == "__main__":
                     a_type, a_t1, a_t2 = type_dist.sample(), t1_dist.sample(), t2_dist.sample()
                     
                     active_unit_mask = (a_type != 0)
-                    # Get the number of units this agent has (clamp to 1 to prevent division by zero)
                     active_counts = active_unit_mask.sum(dim=1).clamp(min=1) 
                     
-                    log_p = type_dist.log_prob(a_type) + t1_dist.log_prob(a_t1) + t2_dist.log_prob(a_t2)
+                    # Target masking fix applied during rollout
+                    t1_needed_mask = torch.isin(a_type, uses_t1).float()
+                    t2_needed_mask = torch.isin(a_type, uses_t2).float()
+                    
+                    log_p = type_dist.log_prob(a_type) 
+                    log_p = log_p + (t1_dist.log_prob(a_t1) * t1_needed_mask)
+                    log_p = log_p + (t2_dist.log_prob(a_t2) * t2_needed_mask)
                     
                     b_values[step][b_masks[step]] = values.squeeze()
-                    # CRITICAL FIX: Average the log probability over the active units
                     b_logprobs[step][b_masks[step]] = (log_p * active_unit_mask).sum(dim=1) / active_counts
                     
                     idx_counter = 0
@@ -491,11 +514,11 @@ if __name__ == "__main__":
         mb_size = b_size // 4  
         indices = np.arange(b_size)
         
-        target_kl = 0.015 # The standard threshold for PPO policy shifts
+        target_kl = 0.015
 
         for epoch in range(update_epochs):
             np.random.shuffle(indices)
-            approx_kl_total = 0.0 # Track how much the policy changes
+            approx_kl_total = 0.0 
             
             for start in range(0, b_size, mb_size):
                 end = start + mb_size
@@ -525,17 +548,25 @@ if __name__ == "__main__":
                 active_unit_mask = (mb_act[..., 0] != 0)
                 active_counts = active_unit_mask.sum(dim=1).clamp(min=1)
                 
-                new_logp = type_dist.log_prob(mb_act[..., 0]) + t1_dist.log_prob(mb_act[..., 1]) + t2_dist.log_prob(mb_act[..., 2])
+                # Target masking fix applied during the backward pass computation
+                mb_a_type = mb_act[..., 0]
+                t1_needed_mask = torch.isin(mb_a_type, uses_t1).float()
+                t2_needed_mask = torch.isin(mb_a_type, uses_t2).float()
+                
+                new_logp = type_dist.log_prob(mb_a_type) 
+                new_logp = new_logp + (t1_dist.log_prob(mb_act[..., 1]) * t1_needed_mask)
+                new_logp = new_logp + (t2_dist.log_prob(mb_act[..., 2]) * t2_needed_mask)
                 new_logp = (new_logp * active_unit_mask).sum(dim=1) / active_counts 
                 
-                entropy = type_dist.entropy() + t1_dist.entropy() + t2_dist.entropy()
+                entropy = type_dist.entropy()
+                entropy = entropy + (t1_dist.entropy() * t1_needed_mask)
+                entropy = entropy + (t2_dist.entropy() * t2_needed_mask)
                 entropy = (entropy * active_unit_mask).sum(dim=1) / active_counts 
                 entropy = entropy.mean()
 
                 logratio = new_logp - mb_logprobs
                 ratio = logratio.exp()
                 
-                # Calculate approximate KL divergence
                 with torch.no_grad():
                     approx_kl = ((ratio - 1) - logratio).mean().item()
                     approx_kl_total += approx_kl
@@ -553,41 +584,35 @@ if __name__ == "__main__":
                 nn.utils.clip_grad_norm_(net.parameters(), 0.5)
                 optimizer.step()
                 
-            # CRITICAL FIX 2: Hit the brakes if the policy changes too much
             avg_epoch_kl = approx_kl_total / 4
             if avg_epoch_kl > target_kl:
                 if global_rank == 0:
                     print(f"      -> Early stopping at epoch {epoch+1} due to high KL: {avg_epoch_kl:.4f}")
                 break
 
-        # --- RANK 0 LOGGING & SAVING ---
         if global_rank == 0:
             end_time = time.time()  
             global_steps = NUM_ENVS * NUM_STEPS * NUM_AGENTS * dist.get_world_size()
             sps = int(global_steps / (end_time - start_time))  
             
-            # Calculate reward BEFORE wiping the buffer
             avg_reward = b_rewards.sum() / (NUM_ENVS * NUM_AGENTS) 
             
             print(f"Update: {update}/{num_updates} | SPS: {sps} | Avg Reward: {avg_reward:.2f} | Loss: {loss.item():.4f} | Val Loss: {v_loss.item():.4f} | Ent: {entropy.item():.4f}")   
             
-            # 1. Log to TensorBoard
             writer.add_scalar("Perf/SPS", sps, update)
             writer.add_scalar("Reward/Avg_Reward", avg_reward, update)
             writer.add_scalar("Loss/Policy_Loss", loss.item(), update)
             writer.add_scalar("Loss/Value_Loss", v_loss.item(), update)
             writer.add_scalar("Loss/Entropy", entropy.item(), update)
 
-            # 2. Save Checkpoint every 50 updates
             if update % 50 == 0:
                 ckpt_path = f"./checkpoints/diplomacy_ppo_update_{update}.pth"
                 torch.save(net.module.state_dict(), ckpt_path)
                 print(f"  -> Saved checkpoint to {ckpt_path}")
 
-        # Cleanup buffers for the next update
         b_masks.zero_()
         b_rewards.zero_()
-    # --- PROPER CLEANUP (OUTSIDE THE LOOP) ---
+        
     vec_env.close()
     if global_rank == 0:
         writer.close()
