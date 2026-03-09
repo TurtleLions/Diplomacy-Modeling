@@ -109,7 +109,10 @@ def get_compositional_action_mask(game, power, provinces, prov_to_idx):
                     type_mask[i, ACTION_TO_IDX.get(act_type, 0)] = 1
                     t1_mask[i, prov_to_idx.get(t1, 0)] = 1
                     t2_mask[i, prov_to_idx.get(t2, 0)] = 1
-        else:
+        
+        # THE FIX
+        # If the parser failed to find valid orders, default to NONE
+        if type_mask[i].sum() == 0:
             type_mask[i, ACTION_TO_IDX['NONE']] = 1
             t1_mask[i, prov_to_idx['NONE']] = 1
             t2_mask[i, prov_to_idx['NONE']] = 1
