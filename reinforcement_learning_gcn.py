@@ -140,6 +140,7 @@ def decode_compositional_order(province, action_array, game, idx_to_action, idx_
     return None
 
 class DiplomacyEnv(ParallelEnv):
+class DiplomacyEnv(ParallelEnv):
     metadata = {'render_modes': ['human'], "name": "diplomacy_v0"}
 
     def __init__(self):
@@ -148,16 +149,19 @@ class DiplomacyEnv(ParallelEnv):
         self.prov_to_idx, self.idx_to_prov = get_province_vocab(self.game)
         self.provinces = list(self.game.map.locs)
         self.num_provinces = len(self.provinces)
+        self.step_count = 0 # <--- NEW: Track environment length
 
     def reset(self, seed=None, options=None):
         self.agents = self.possible_agents[:]
         self.game = Game()
+        self.step_count = 0 # <--- NEW: Reset the clock
         obs_tensor = parse_state_to_tensor({'state': self.game.get_state()})
         observations = {a: obs_tensor.copy() for a in self.agents} 
         infos = {a: {'action_mask': get_compositional_action_mask(self.game, a, self.provinces, self.prov_to_idx)} for a in self.agents}
         return observations, infos
 
     def step(self, actions):
+        self.step_count += 1 # <--- NEW: Increment time
         self.game.clear_orders()
         prev_sc_owners = {sc: a for a in self.possible_agents for sc in self.game.get_centers(a)}
         
@@ -189,7 +193,10 @@ class DiplomacyEnv(ParallelEnv):
         obs_tensor = parse_state_to_tensor({'state': self.game.get_state()})
         observations = {a: obs_tensor.copy() for a in self.agents}
         
+        # <--- NEW: Terminate stuck games
         is_done = False
+        if self.step_count >= 150: 
+            is_done = True
         
         for agent in self.agents:
             current_scs = self.game.get_centers(agent)
