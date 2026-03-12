@@ -4,12 +4,14 @@ import numpy as np
 import torch
 import torch.nn as nn
 import torch.optim as optim
-import multiprocessing as mp
+import multiprocessing as smp
+import torch.multiprocessing as mp
 import psutil
 import torch.distributed as dist
 from torch.nn.parallel import DistributedDataParallel as DDP
 from torch.utils.data.distributed import DistributedSampler
 from torch.utils.data import Dataset, DataLoader
+import gc
 from diplomacy import Game
 
 from diplomacy_helpers import (
@@ -19,57 +21,53 @@ from diplomacy_helpers import (
     DiplomacyTransformer
 )
 
-# --- RESOURCE LOGGING ---
+import signal
 
+def init_worker():
+    signal.signal(signal.SIGINT, signal.SIG_IGN)
+
+# --- RESOURCE LOGGING ---
 def log_system_resources(stage_name, rank=0):
-    # Only let the main process print to avoid console spam
     if rank != 0:
         return
         
     print(f"\n[LOG] Resource Usage - {stage_name}")
-    
     ram_info = psutil.virtual_memory()
-    ram_used_gb = ram_info.used / (1024 ** 3)
-    ram_total_gb = ram_info.total / (1024 ** 3)
-    ram_percent = ram_info.percent
-    
-    print(f"System RAM Used {ram_used_gb:.1f} GB of {ram_total_gb:.1f} GB ({ram_percent}%)")
-    
-    if torch.cuda.is_available():
-        for i in range(torch.cuda.device_count()):
-            vram_allocated = torch.cuda.memory_allocated(i) / (1024 ** 3)
-            vram_reserved = torch.cuda.memory_reserved(i) / (1024 ** 3)
-            print(f"GPU {i} VRAM Allocated {vram_allocated:.2f} GB | Reserved {vram_reserved:.2f} GB")
+    print(f"System RAM Used {ram_info.used / (1024**3):.1f} GB of {ram_info.total / (1024**3):.1f} GB ({ram_info.percent}%)")
     print("-" * 40)
 
 # --- 1. DATASET PREPARATION ---
 
-class DiplomacyTransformerDataset(Dataset):
-    def __init__(self, samples):
-        self.samples = samples
+class DiplomacyMemmapDataset(Dataset):
+    def __init__(self, history_path, mask_path, targets_path, total_samples, num_provs, vocab_size):
+        self.total_samples = total_samples
+        
+        self.history = np.memmap(history_path, dtype=np.float32, mode='r', shape=(total_samples, 3, num_provs, 16))
+        self.mask = np.memmap(mask_path, dtype=np.bool_, mode='r', shape=(total_samples, num_provs, vocab_size))
+        self.targets = np.memmap(targets_path, dtype=np.int64, mode='r', shape=(total_samples, num_provs))
         
     def __len__(self):
-        return len(self.samples)
+        return self.total_samples
         
     def __getitem__(self, idx):
-        sample = self.samples[idx]
         return {
-            'history': torch.tensor(sample['history'], dtype=torch.float32),
-            'mask': torch.tensor(sample['mask'], dtype=torch.bool),
-            'targets': torch.tensor(sample['targets'], dtype=torch.long)
+            'history': torch.tensor(np.array(self.history[idx]), dtype=torch.float32),
+            'mask': torch.tensor(np.array(self.mask[idx]), dtype=torch.bool),
+            'targets': torch.tensor(np.array(self.targets[idx]), dtype=torch.long)
         }
 
 def _process_single_line(args):
-    line, prov_to_idx, order_to_idx, num_provs, none_idx = args
+    line, prov_to_idx, order_to_idx, num_provs, none_idx, vocab_size = args
     game_data = json.loads(line)
     
     if game_data.get('map', 'standard') != 'standard':
-        return []
+        return None
         
     game_engine = Game()
     provinces = list(game_engine.map.locs)
     history_buffer = np.zeros((3, num_provs, 16), dtype=np.float32)
-    game_samples = []
+    
+    g_histories, g_masks, g_targets = [], [], []
     
     for phase in game_data.get('phases', []):
         game_engine.set_state(phase['state'])
@@ -95,83 +93,142 @@ def _process_single_line(args):
                         p_idx = prov_to_idx[u_loc]
                         targets[p_idx] = order_to_idx[clean_order]
             
-            game_samples.append({
-                'history': history_buffer.copy(),
-                'mask': mask,
-                'targets': targets
-            })
+            g_histories.append(history_buffer.copy())
+            g_masks.append(mask)
+            g_targets.append(targets)
             
-    return game_samples
+    if not g_histories:
+        return None
+        
+    return (
+        np.stack(g_histories), 
+        np.stack(g_masks), 
+        np.stack(g_targets)
+    )
 
-def process_jsonl_dataset(json_path, max_games=None):
-    log_system_resources("Starting JSON Loading")
-    print(f"Loading and processing data from {json_path}")
+def process_and_save_to_disk(json_path, cache_dir="./dataset_cache", max_games=None):
+    os.makedirs(cache_dir, exist_ok=True)
+    history_path = os.path.join(cache_dir, "history.bin")
+    mask_path = os.path.join(cache_dir, "mask.bin")
+    targets_path = os.path.join(cache_dir, "targets.bin")
     
+    if os.path.exists(history_path) and os.path.exists(mask_path) and os.path.exists(targets_path):
+        print("Found existing binary cache skipping JSON parsing.")
+        order_to_idx, _ = build_global_vocab()
+        none_idx = order_to_idx['NONE']
+        num_provs = 81 
+        vocab_size = len(order_to_idx)
+        
+        targets_bytes = os.path.getsize(targets_path)
+        total_samples = targets_bytes // (8 * num_provs)
+        return history_path, mask_path, targets_path, total_samples, num_provs, vocab_size, none_idx
+
+    log_system_resources("Starting JSON Loading")
     order_to_idx, _ = build_global_vocab()
     none_idx = order_to_idx['NONE']
+    vocab_size = len(order_to_idx)
     
     temp_engine = Game()
     provinces = list(temp_engine.map.locs)
     prov_to_idx = {p: i for i, p in enumerate(provinces)}
     num_provs = len(provinces)
     
-    with open(json_path, 'r') as f:
-        lines = [line for line in f if line.strip()]
-        
-    if max_games:
-        lines = lines[:max_games]
-
-    log_system_resources("File Loaded into Memory")
-
-    args_list = [(line, prov_to_idx, order_to_idx, num_provs, none_idx) for line in lines]
-    samples = []
-    
-    num_cores = min(24, mp.cpu_count())
-    print(f"Starting multiprocessing pool with {num_cores} workers")
-    
-    with mp.Pool(processes=num_cores) as pool:
-        for i, result in enumerate(pool.imap_unordered(_process_single_line, args_list, chunksize=50)):
-            samples.extend(result)
-            if (i + 1) % 1000 == 0:
-                print(f"Processed {i + 1} games out of {len(lines)}")
+    def line_generator():
+        with open(json_path, 'r') as f:
+            games_yielded = 0
+            for line in f:
+                if not line.strip():
+                    continue
+                yield (line, prov_to_idx, order_to_idx, num_provs, none_idx, vocab_size)
                 
-    log_system_resources("Multiprocessing Pool Finished")
-            
-    print(f"Total games processed {len(lines)}")
-    print(f"Total training samples generated {len(samples)}")
-    return samples, num_provs, len(order_to_idx), none_idx
+                games_yielded += 1
+                if max_games and games_yielded >= max_games:
+                    break
+
+    num_cores = min(24, smp.cpu_count())
+    print(f"Starting standard multiprocessing pool with {num_cores} workers")
+    
+    total_samples = 0
+    buffer_limit = 500
+    
+    hist_buffer = []
+    mask_buffer = []
+    targ_buffer = []
+    
+    with open(history_path, 'wb') as f_hist, \
+         open(mask_path, 'wb') as f_mask, \
+         open(targets_path, 'wb') as f_targ:
+             
+        with smp.Pool(processes=num_cores, initializer=init_worker) as pool:
+            try:
+                for i, result in enumerate(pool.imap_unordered(_process_single_line, line_generator(), chunksize=50)):
+                    if (i + 1) % 1000 == 0:
+                        print(f"Processed {i + 1} games")
+                        
+                    if result is None:
+                        continue
+                    
+                    h_arr, m_arr, t_arr = result
+                    
+                    hist_buffer.append(h_arr)
+                    mask_buffer.append(m_arr)
+                    targ_buffer.append(t_arr)
+                    total_samples += len(h_arr)
+                    
+                    del h_arr, m_arr, t_arr, result
+                    
+                    if len(hist_buffer) >= buffer_limit:
+                        f_hist.write(np.concatenate(hist_buffer).tobytes())
+                        f_mask.write(np.concatenate(mask_buffer).tobytes())
+                        f_targ.write(np.concatenate(targ_buffer).tobytes())
+                        
+                        hist_buffer = []
+                        mask_buffer = []
+                        targ_buffer = []
+                        gc.collect()
+                
+                # Flush remaining items
+                if len(hist_buffer) > 0:
+                    f_hist.write(np.concatenate(hist_buffer).tobytes())
+                    f_mask.write(np.concatenate(mask_buffer).tobytes())
+                    f_targ.write(np.concatenate(targ_buffer).tobytes())
+                    
+                    hist_buffer = []
+                    mask_buffer = []
+                    targ_buffer = []
+                    gc.collect()
+
+            except KeyboardInterrupt:
+                print("\nRun canceled by user. Forcibly terminating workers to prevent freezing.")
+                pool.terminate()
+                pool.join()
+                raise
+                    
+    log_system_resources("Finished Writing Binary Cache")
+    print(f"Total training samples generated {total_samples}")
+    return history_path, mask_path, targets_path, total_samples, num_provs, vocab_size, none_idx
 
 # --- 2. DISTRIBUTED WORKER LOOP ---
 
-def train_worker(rank, world_size, samples, num_provs, vocab_size, none_idx):
-    # Initialize the distributed process group
+def train_worker(rank, world_size, paths_and_metadata):
+    history_path, mask_path, targets_path, total_samples, num_provs, vocab_size, none_idx = paths_and_metadata
+    
     os.environ['MASTER_ADDR'] = 'localhost'
     os.environ['MASTER_PORT'] = '12355'
     dist.init_process_group("nccl", rank=rank, world_size=world_size)
     
-    # HARDWARE ALLOCATION
-    # Calculate the block of 6 CPUs for this specific GPU
     core_start = rank * 6
     assigned_cores = list(range(core_start, core_start + 6))
-    
-    # Lock the operating system scheduler and PyTorch threads to these specific cores
     os.sched_setaffinity(0, assigned_cores)
     torch.set_num_threads(6)
     
-    print(f"Worker {rank} initialized and locked to GPU {rank} and CPU cores {assigned_cores}")
-    
-    # TRAINING HYPERPARAMETERS
-    # We divide the global batch size of 256 by 4 GPUs
     batch_size_per_gpu = 64
     learning_rate = 1e-4
     epochs = 10
     
-    dataset = DiplomacyTransformerDataset(samples)
-    
-    # The DistributedSampler ensures each GPU gets a completely unique chunk of the dataset
+    dataset = DiplomacyMemmapDataset(history_path, mask_path, targets_path, total_samples, num_provs, vocab_size)
     sampler = DistributedSampler(dataset, num_replicas=world_size, rank=rank)
     
-    # We lower num_workers to 4 here so we do not exceed the 6 CPUs allocated to this worker
     dataloader = DataLoader(
         dataset, 
         batch_size=batch_size_per_gpu, 
@@ -179,17 +236,12 @@ def train_worker(rank, world_size, samples, num_provs, vocab_size, none_idx):
         sampler=sampler,
         num_workers=4,
         pin_memory=True,
-        prefetch_factor=2
+        prefetch_factor=2,
+        multiprocessing_context="spawn" if hasattr(mp, 'get_context') else None
     )
     
-    net = DiplomacyTransformer(
-        num_provinces=num_provs, 
-        vocab_size=vocab_size
-    ).to(rank)
-    
-    # Wrap the model for distributed training
+    net = DiplomacyTransformer(num_provinces=num_provs, vocab_size=vocab_size).to(rank)
     net = DDP(net, device_ids=[rank])
-    
     criterion = nn.CrossEntropyLoss()
     optimizer = optim.Adam(net.parameters(), lr=learning_rate)
     
@@ -198,7 +250,6 @@ def train_worker(rank, world_size, samples, num_provs, vocab_size, none_idx):
         print("\n--- STARTING DISTRIBUTED BEHAVIORAL CLONING ---")
     
     for epoch in range(epochs):
-        # We must set the epoch on the sampler so the data shuffles correctly each round
         sampler.set_epoch(epoch)
         net.train()
         total_loss = 0.0
@@ -227,7 +278,6 @@ def train_worker(rank, world_size, samples, num_provs, vocab_size, none_idx):
                 optimizer.step()
                 total_loss += loss.item()
                 
-            # Only print from the main GPU to keep the terminal clean
             if rank == 0 and batch_idx % 20 == 0:
                 print(f"Epoch {epoch+1} | Batch {batch_idx}/{len(dataloader)} | Loss {loss.item():.4f}")
                 
@@ -236,7 +286,6 @@ def train_worker(rank, world_size, samples, num_provs, vocab_size, none_idx):
             print(f"==> Epoch {epoch+1} Complete | Avg Loss {avg_loss:.4f}")
             log_system_resources(f"End of Epoch {epoch+1}", rank)
             
-    # Save the model only once from the main worker
     if rank == 0:
         save_path = "diplomacy_transformer_bc.pth"
         torch.save(net.module.state_dict(), save_path)
@@ -248,23 +297,23 @@ def train_worker(rank, world_size, samples, num_provs, vocab_size, none_idx):
 
 def main():
     dataset_path = "./datasets/standard_no_press.jsonl"
-    max_games_to_load = None 
+    ssd_cache_directory = "/data/restanislao/diplomacy/"
     
-    # We parse the dataset once in the main loop to save massive amounts of system RAM
-    samples, num_provs, vocab_size, none_idx = process_jsonl_dataset(dataset_path, max_games_to_load)
+    paths_and_metadata = process_and_save_to_disk(
+        dataset_path, 
+        cache_dir=ssd_cache_directory
+    )
     
     world_size = torch.cuda.device_count()
-    
     if world_size < 1:
         print("Error no GPUs detected")
         return
         
     print(f"Spawning {world_size} distributed workers")
     
-    # Launch one distinct process per GPU
     mp.spawn(
         train_worker,
-        args=(world_size, samples, num_provs, vocab_size, none_idx),
+        args=(world_size, paths_and_metadata),
         nprocs=world_size,
         join=True
     )
