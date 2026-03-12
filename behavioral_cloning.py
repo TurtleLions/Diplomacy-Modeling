@@ -22,6 +22,15 @@ from diplomacy_helpers import (
 )
 
 import signal
+import time
+
+def log_gpu_memory(rank):
+    if rank != 0:
+        return
+    allocated = torch.cuda.memory_allocated(rank) / (1024**3)
+    reserved = torch.cuda.memory_reserved(rank) / (1024**3)
+    print(f"[LOG] GPU 0 VRAM Allocated {allocated:.2f} GB | Reserved {reserved:.2f} GB")
+    print("-" * 40)
 
 def init_worker():
     signal.signal(signal.SIGINT, signal.SIG_IGN)
@@ -40,20 +49,30 @@ def log_system_resources(stage_name, rank=0):
 
 class DiplomacyMemmapDataset(Dataset):
     def __init__(self, history_path, mask_path, targets_path, total_samples, num_provs, vocab_size):
+        self.history_path = history_path
+        self.mask_path = mask_path
+        self.targets_path = targets_path
         self.total_samples = total_samples
+        self.num_provs = num_provs
+        self.vocab_size = vocab_size
         
-        self.history = np.memmap(history_path, dtype=np.float32, mode='r', shape=(total_samples, 3, num_provs, 16))
-        self.mask = np.memmap(mask_path, dtype=np.bool_, mode='r', shape=(total_samples, num_provs, vocab_size))
-        self.targets = np.memmap(targets_path, dtype=np.int64, mode='r', shape=(total_samples, num_provs))
+        self.history = None
+        self.mask = None
+        self.targets = None
         
     def __len__(self):
         return self.total_samples
         
     def __getitem__(self, idx):
+        if self.history is None:
+            self.history = np.memmap(self.history_path, dtype=np.float32, mode='r', shape=(self.total_samples, 3, self.num_provs, 16))
+            self.mask = np.memmap(self.mask_path, dtype=np.bool_, mode='r', shape=(self.total_samples, self.num_provs, self.vocab_size))
+            self.targets = np.memmap(self.targets_path, dtype=np.int64, mode='r', shape=(self.total_samples, self.num_provs))
+            
         return {
-            'history': torch.tensor(np.array(self.history[idx]), dtype=torch.float32),
-            'mask': torch.tensor(np.array(self.mask[idx]), dtype=torch.bool),
-            'targets': torch.tensor(np.array(self.targets[idx]), dtype=torch.long)
+            'history': torch.from_numpy(np.array(self.history[idx], copy=True)),
+            'mask': torch.from_numpy(np.array(self.mask[idx], copy=True)),
+            'targets': torch.from_numpy(np.array(self.targets[idx], copy=True))
         }
 
 def _process_single_line(args):
@@ -217,81 +236,99 @@ def train_worker(rank, world_size, paths_and_metadata):
     os.environ['MASTER_PORT'] = '12355'
     dist.init_process_group("nccl", rank=rank, world_size=world_size)
     
-    core_start = rank * 6
-    assigned_cores = list(range(core_start, core_start + 6))
-    os.sched_setaffinity(0, assigned_cores)
-    torch.set_num_threads(6)
-    
-    batch_size_per_gpu = 64
-    learning_rate = 1e-4
-    epochs = 10
-    
-    dataset = DiplomacyMemmapDataset(history_path, mask_path, targets_path, total_samples, num_provs, vocab_size)
-    sampler = DistributedSampler(dataset, num_replicas=world_size, rank=rank)
-    
-    dataloader = DataLoader(
-        dataset, 
-        batch_size=batch_size_per_gpu, 
-        shuffle=False, 
-        sampler=sampler,
-        num_workers=4,
-        pin_memory=True,
-        prefetch_factor=2,
-        multiprocessing_context="spawn" if hasattr(mp, 'get_context') else None
-    )
-    
-    net = DiplomacyTransformer(num_provinces=num_provs, vocab_size=vocab_size).to(rank)
-    net = DDP(net, device_ids=[rank])
-    criterion = nn.CrossEntropyLoss()
-    optimizer = optim.Adam(net.parameters(), lr=learning_rate)
-    
-    if rank == 0:
-        log_system_resources("Model Loaded to GPUs", rank)
-        print("\n--- STARTING DISTRIBUTED BEHAVIORAL CLONING ---")
-    
-    for epoch in range(epochs):
-        sampler.set_epoch(epoch)
-        net.train()
-        total_loss = 0.0
+    try:
+        core_start = rank * 6
+        assigned_cores = list(range(core_start, core_start + 6))
+        os.sched_setaffinity(0, assigned_cores)
+        torch.set_num_threads(6)
         
-        for batch_idx, batch in enumerate(dataloader):
-            history = batch['history'].to(rank, non_blocking=True)
-            mask = batch['mask'].to(rank, non_blocking=True)
-            targets = batch['targets'].to(rank, non_blocking=True)
+        batch_size_per_gpu = 64
+        learning_rate = 1e-4
+        epochs = 10
+        
+        dataset = DiplomacyMemmapDataset(history_path, mask_path, targets_path, total_samples, num_provs, vocab_size)
+        sampler = DistributedSampler(dataset, num_replicas=world_size, rank=rank)
+        
+        dataloader = DataLoader(
+            dataset, 
+            batch_size=batch_size_per_gpu, 
+            shuffle=False, 
+            sampler=sampler,
+            num_workers=4,
+            pin_memory=True,
+            prefetch_factor=2,
+            multiprocessing_context="spawn" if hasattr(mp, 'get_context') else None
+        )
+        
+        net = DiplomacyTransformer(num_provinces=num_provs, vocab_size=vocab_size).to(rank)
+        net = DDP(net, device_ids=[rank], find_unused_parameters=True)
+        criterion = nn.CrossEntropyLoss()
+        optimizer = optim.Adam(net.parameters(), lr=learning_rate)
+        
+        if rank == 0:
+            log_system_resources("Model Loaded to GPUs", rank)
+            log_gpu_memory(rank)
+            print("\n--- STARTING DISTRIBUTED BEHAVIORAL CLONING ---")
+        
+        for epoch in range(epochs):
+            sampler.set_epoch(epoch)
+            net.train()
+            total_loss = 0.0
             
-            optimizer.zero_grad()
-            logits, _ = net(history)
+            epoch_start_time = time.time()
+            batch_start_time = time.time()
             
-            logits_flat = logits.view(-1, vocab_size)
-            targets_flat = targets.view(-1)
-            mask_flat = mask.view(-1, vocab_size)
-            
-            is_target_legal = mask_flat.gather(1, targets_flat.unsqueeze(1)).squeeze()
-            valid_training_mask = (targets_flat != none_idx) & is_target_legal
-            
-            if valid_training_mask.any():
-                logits_masked = logits_flat.masked_fill(~mask_flat, -1e4)
-                loss = criterion(logits_masked[valid_training_mask], targets_flat[valid_training_mask])
+            for batch_idx, batch in enumerate(dataloader):
+                history = batch['history'].to(rank, non_blocking=True)
+                mask = batch['mask'].to(rank, non_blocking=True)
+                targets = batch['targets'].to(rank, non_blocking=True)
                 
-                loss.backward()
+                optimizer.zero_grad()
+                logits, _ = net(history)
+                
+                logits_flat = logits.view(-1, vocab_size)
+                targets_flat = targets.view(-1)
+                mask_flat = mask.view(-1, vocab_size)
+                
+                is_target_legal = mask_flat.gather(1, targets_flat.unsqueeze(1)).squeeze()
+                valid_training_mask = (targets_flat != none_idx) & is_target_legal
+                
+                if valid_training_mask.any():
+                    logits_masked = logits_flat.masked_fill(~mask_flat, -1e4)
+                    loss = criterion(logits_masked[valid_training_mask], targets_flat[valid_training_mask])
+                    loss.backward()
+                    
+                else:
+                    loss = (logits * 0).sum()
+                    loss.backward()
+                
                 torch.nn.utils.clip_grad_norm_(net.parameters(), 0.5)
                 optimizer.step()
                 total_loss += loss.item()
-                
-            if rank == 0 and batch_idx % 20 == 0:
-                print(f"Epoch {epoch+1} | Batch {batch_idx}/{len(dataloader)} | Loss {loss.item():.4f}")
+                    
+                if rank == 0 and batch_idx % 20 == 0:
+                    elapsed = time.time() - batch_start_time
+                    samples_processed = 20 * batch_size_per_gpu * world_size
+                    throughput = samples_processed / elapsed if batch_idx > 0 else 0
+                    
+                    print(f"Epoch {epoch+1} | Batch {batch_idx}/{len(dataloader)} | Loss {loss.item():.4f} | Time {elapsed:.2f}s | Speed {throughput:.0f} samples/s")
+                    batch_start_time = time.time()
+                    
+            if rank == 0:
+                epoch_time = time.time() - epoch_start_time
+                avg_loss = total_loss / len(dataloader)
+                print(f"\n==> Epoch {epoch+1} Complete")
+                print(f"==> Average Loss {avg_loss:.4f} | Total Epoch Time {epoch_time:.2f}s")
+                log_system_resources(f"End of Epoch {epoch+1}", rank)
+                log_gpu_memory(rank)
                 
         if rank == 0:
-            avg_loss = total_loss / len(dataloader)
-            print(f"==> Epoch {epoch+1} Complete | Avg Loss {avg_loss:.4f}")
-            log_system_resources(f"End of Epoch {epoch+1}", rank)
+            save_path = "diplomacy_transformer_bc.pth"
+            torch.save(net.module.state_dict(), save_path)
+            print(f"Model saved to {save_path}")
             
-    if rank == 0:
-        save_path = "diplomacy_transformer_bc.pth"
-        torch.save(net.module.state_dict(), save_path)
-        print(f"Model saved to {save_path}")
-        
-    dist.destroy_process_group()
+    finally:
+        dist.destroy_process_group()
 
 # --- 3. MAIN EXECUTION ---
 
