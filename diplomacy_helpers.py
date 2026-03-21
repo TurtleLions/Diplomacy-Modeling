@@ -9,6 +9,8 @@ import functools
 from diplomacy import Game
 import torch.optim as optim
 from torch.distributions import Categorical
+import os
+import json
 
 class DiplomacyTransformer(nn.Module):
     def __init__(self, input_dim=16, d_model=128, nhead=8, num_layers=4, num_provinces=81, history_length=3, vocab_size=14000):
@@ -72,14 +74,45 @@ class DiplomacyTransformer(nn.Module):
         
         return action_logits, state_value
 
-def build_global_vocab():
-    dummy_game = Game()
+def build_global_vocab(json_path="./datasets/standard_no_press.jsonl", cache_path="vocab.txt"):
+    # 1. Load from cache if it exists for instant startup
+    if os.path.exists(cache_path):
+        with open(cache_path, 'r') as f:
+            sorted_orders = [line.strip() for line in f.readlines() if line.strip()]
+        order_to_idx = {order: i for i, order in enumerate(sorted_orders)}
+        return order_to_idx, {i: order for order, i in order_to_idx.items()}
+
+    print("Building global vocabulary from dataset (this may take a minute)...")
     unique_orders = set(['NONE'])
-    for prov, orders in dummy_game.get_all_possible_orders().items():
-        for order in orders:
-            unique_orders.add(order)
+    
+    # 2. Scan the dataset to find every historically played order
+    with open(json_path, 'r') as f:
+        for line in f:
+            if not line.strip(): continue
+            game_data = json.loads(line)
             
+            # Skip non-standard maps just in case
+            if game_data.get('map', 'standard') != 'standard':
+                continue
+                
+            for phase in game_data.get('phases', []):
+                for power, orders in phase.get('orders', {}).items():
+                    # NEW Add a safety check to skip None or empty lists
+                    if not orders:
+                        continue
+                        
+                    for order_str in orders:
+                        # Clean the order string to match the engine's formatting
+                        clean_order = order_str.replace('*', '')
+                        unique_orders.add(clean_order)
+                        
     sorted_orders = sorted(list(unique_orders))
+    
+    # 3. Save to a text file so we never have to parse the JSON again
+    with open(cache_path, 'w') as f:
+        for order in sorted_orders:
+            f.write(f"{order}\n")
+            
     order_to_idx = {order: i for i, order in enumerate(sorted_orders)}
     return order_to_idx, {i: order for order, i in order_to_idx.items()}
 

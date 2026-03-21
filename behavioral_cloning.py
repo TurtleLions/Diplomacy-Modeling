@@ -32,8 +32,80 @@ def log_gpu_memory(rank):
     print(f"[LOG] GPU 0 VRAM Allocated {allocated:.2f} GB | Reserved {reserved:.2f} GB")
     print("-" * 40)
 
-def init_worker():
+# Global variables for background workers
+worker_prov_to_idx = None
+worker_order_to_idx = None
+worker_num_provs = None
+worker_none_idx = None
+worker_vocab_size = None
+
+def init_worker(p_idx, o_idx, n_provs, n_idx, v_size):
     signal.signal(signal.SIGINT, signal.SIG_IGN)
+    global worker_prov_to_idx, worker_order_to_idx, worker_num_provs, worker_none_idx, worker_vocab_size
+    worker_prov_to_idx = p_idx
+    worker_order_to_idx = o_idx
+    worker_num_provs = n_provs
+    worker_none_idx = n_idx
+    worker_vocab_size = v_size
+
+def warm_os_cache(filepath):
+    print(f"Forcing OS page cache for {os.path.basename(filepath)}...")
+    mapped_file = np.memmap(filepath, mode='r')
+    
+    # Touch one byte every 4096 bytes to load every page into RAM
+    _ = mapped_file[::4096].copy()
+    
+    del mapped_file
+
+def compress_mask_file():
+    cache_dir = "/data/restanislao/diplomacy/"
+    mask_path = os.path.join(cache_dir, "mask.bin")
+    targets_path = os.path.join(cache_dir, "targets.bin")
+    packed_mask_path = os.path.join(cache_dir, "mask_packed.bin")
+    
+    num_provs = 82
+    
+    targets_bytes = os.path.getsize(targets_path)
+    total_samples = targets_bytes // (8 * num_provs)
+    
+    mask_bytes = os.path.getsize(mask_path)
+    vocab_size = mask_bytes // (total_samples * num_provs)
+    
+    print(f"Detected {total_samples} samples and a vocab size of {vocab_size}")
+    print("Loading original mask for compression...")
+    
+    mask_mmap = np.memmap(mask_path, dtype=np.bool_, mode='r', shape=(total_samples, num_provs, vocab_size))
+    
+    chunk_size = 10000
+    total_chunks = (total_samples + chunk_size - 1) // chunk_size
+    
+    print(f"Packing into {packed_mask_path}...")
+    with open(packed_mask_path, 'wb') as f:
+        for i in range(total_chunks):
+            start_idx = i * chunk_size
+            end_idx = min(start_idx + chunk_size, total_samples)
+            
+            chunk = np.array(mask_mmap[start_idx:end_idx], copy=True)
+            chunk_flat = chunk.reshape(end_idx - start_idx, -1)
+            
+            packed_chunk = np.packbits(chunk_flat, axis=1)
+            f.write(packed_chunk.tobytes())
+            
+            f.flush()
+            os.fsync(f.fileno())
+            
+            del chunk
+            del chunk_flat
+            del packed_chunk
+            gc.collect()
+            
+            if (i + 1) % 10 == 0:
+                print(f"Processed {i + 1}/{total_chunks} chunks")
+                
+    print("\nCompression complete.")
+    old_size = os.path.getsize(mask_path) / (1024**3)
+    new_size = os.path.getsize(packed_mask_path) / (1024**3)
+    print(f"Reduced mask from {old_size:.2f} GB to {new_size:.2f} GB")
 
 # --- RESOURCE LOGGING ---
 def log_system_resources(stage_name, rank=0):
@@ -48,16 +120,21 @@ def log_system_resources(stage_name, rank=0):
 # --- 1. DATASET PREPARATION ---
 
 class DiplomacyMemmapDataset(Dataset):
-    def __init__(self, history_path, mask_path, targets_path, total_samples, num_provs, vocab_size):
+    def __init__(self, history_path, mask_packed_path, targets_path, total_samples, num_provs, vocab_size):
         self.history_path = history_path
-        self.mask_path = mask_path
+        self.mask_packed_path = mask_packed_path
         self.targets_path = targets_path
+        
         self.total_samples = total_samples
         self.num_provs = num_provs
         self.vocab_size = vocab_size
         
+        # Calculate the exact number of booleans and bytes per sample
+        self.bools_per_sample = num_provs * vocab_size
+        self.bytes_per_sample = int(np.ceil(self.bools_per_sample / 8.0))
+        
         self.history = None
-        self.mask = None
+        self.mask_packed = None
         self.targets = None
         
     def __len__(self):
@@ -65,18 +142,23 @@ class DiplomacyMemmapDataset(Dataset):
         
     def __getitem__(self, idx):
         if self.history is None:
-            self.history = np.memmap(self.history_path, dtype=np.float32, mode='r', shape=(self.total_samples, 3, self.num_provs, 16))
-            self.mask = np.memmap(self.mask_path, dtype=np.bool_, mode='r', shape=(self.total_samples, self.num_provs, self.vocab_size))
+            self.history = np.memmap(self.history_path, dtype=np.int8, mode='r', shape=(self.total_samples, 3, self.num_provs, 16))
+            self.mask_packed = np.memmap(self.mask_packed_path, dtype=np.uint8, mode='r', shape=(self.total_samples, self.bytes_per_sample))
             self.targets = np.memmap(self.targets_path, dtype=np.int64, mode='r', shape=(self.total_samples, self.num_provs))
             
+        # Unpack the bits and trim any extra padding
+        packed_sample = self.mask_packed[idx]
+        unpacked_flat = np.unpackbits(packed_sample)[:self.bools_per_sample]
+        unpacked_mask = unpacked_flat.reshape(self.num_provs, self.vocab_size)
+
         return {
-            'history': torch.from_numpy(np.array(self.history[idx], copy=True)),
-            'mask': torch.from_numpy(np.array(self.mask[idx], copy=True)),
-            'targets': torch.from_numpy(np.array(self.targets[idx], copy=True))
+            'history': torch.from_numpy(self.history[idx]), # Removed np.array(..., copy=True)
+            'mask': torch.from_numpy(unpacked_mask).bool(),
+            'targets': torch.from_numpy(self.targets[idx])  # Removed np.array(..., copy=True)
         }
 
-def _process_single_line(args):
-    line, prov_to_idx, order_to_idx, num_provs, none_idx, vocab_size = args
+def _process_single_line(line):
+    global worker_prov_to_idx, worker_order_to_idx, worker_num_provs, worker_none_idx, worker_vocab_size
     game_data = json.loads(line)
     
     if game_data.get('map', 'standard') != 'standard':
@@ -84,7 +166,7 @@ def _process_single_line(args):
         
     game_engine = Game()
     provinces = list(game_engine.map.locs)
-    history_buffer = np.zeros((3, num_provs, 16), dtype=np.float32)
+    history_buffer = np.zeros((3, worker_num_provs, 16), dtype=np.int8)
     
     g_histories, g_masks, g_targets = [], [], []
     
@@ -100,20 +182,23 @@ def _process_single_line(args):
             if not text_orders:
                 continue
             
-            mask = get_global_action_mask(game_engine, power, provinces, order_to_idx)
-            targets = np.full(num_provs, none_idx, dtype=np.int64)
+            mask = get_global_action_mask(game_engine, power, provinces, worker_order_to_idx)
+            targets = np.full(worker_num_provs, worker_none_idx, dtype=np.int64)
             
             for order_str in text_orders:
                 clean_order = order_str.replace('*', '')
                 parts = clean_order.split()
                 if len(parts) >= 2:
                     u_loc = parts[1].split('/')[0]
-                    if u_loc in prov_to_idx and clean_order in order_to_idx:
-                        p_idx = prov_to_idx[u_loc]
-                        targets[p_idx] = order_to_idx[clean_order]
+                    if u_loc in worker_prov_to_idx and clean_order in worker_order_to_idx:
+                        p_idx = worker_prov_to_idx[u_loc]
+                        targets[p_idx] = worker_order_to_idx[clean_order]
+            
+            # Compress the mask immediately to save RAM
+            packed_mask = np.packbits(mask.flatten())
             
             g_histories.append(history_buffer.copy())
-            g_masks.append(mask)
+            g_masks.append(packed_mask)
             g_targets.append(targets)
             
     if not g_histories:
@@ -128,19 +213,22 @@ def _process_single_line(args):
 def process_and_save_to_disk(json_path, cache_dir="./dataset_cache", max_games=None):
     os.makedirs(cache_dir, exist_ok=True)
     history_path = os.path.join(cache_dir, "history.bin")
-    mask_path = os.path.join(cache_dir, "mask.bin")
+    mask_packed_path = os.path.join(cache_dir, "mask_packed.bin")
     targets_path = os.path.join(cache_dir, "targets.bin")
     
-    if os.path.exists(history_path) and os.path.exists(mask_path) and os.path.exists(targets_path):
+    if os.path.exists(history_path) and os.path.exists(mask_packed_path) and os.path.exists(targets_path):
         print("Found existing binary cache skipping JSON parsing.")
         order_to_idx, _ = build_global_vocab()
         none_idx = order_to_idx['NONE']
-        num_provs = 81 
+        
+        # Dynamically measure the map so it always evaluates to 82
+        temp_engine = Game()
+        num_provs = len(temp_engine.map.locs) 
         vocab_size = len(order_to_idx)
         
         targets_bytes = os.path.getsize(targets_path)
         total_samples = targets_bytes // (8 * num_provs)
-        return history_path, mask_path, targets_path, total_samples, num_provs, vocab_size, none_idx
+        return history_path, mask_packed_path, targets_path, total_samples, num_provs, vocab_size, none_idx
 
     log_system_resources("Starting JSON Loading")
     order_to_idx, _ = build_global_vocab()
@@ -158,64 +246,51 @@ def process_and_save_to_disk(json_path, cache_dir="./dataset_cache", max_games=N
             for line in f:
                 if not line.strip():
                     continue
-                yield (line, prov_to_idx, order_to_idx, num_provs, none_idx, vocab_size)
+                yield line
                 
                 games_yielded += 1
                 if max_games and games_yielded >= max_games:
                     break
 
-    num_cores = min(24, smp.cpu_count())
+    num_cores = min(8, smp.cpu_count())
     print(f"Starting standard multiprocessing pool with {num_cores} workers")
     
     total_samples = 0
-    buffer_limit = 500
-    
-    hist_buffer = []
-    mask_buffer = []
-    targ_buffer = []
-    
+    # REMOVED: buffer_limit, hist_buffer, mask_buffer, targ_buffer entirely!
+
     with open(history_path, 'wb') as f_hist, \
-         open(mask_path, 'wb') as f_mask, \
+         open(mask_packed_path, 'wb') as f_mask, \
          open(targets_path, 'wb') as f_targ:
              
-        with smp.Pool(processes=num_cores, initializer=init_worker) as pool:
+        with smp.Pool(
+            processes=num_cores, 
+            initializer=init_worker, 
+            initargs=(prov_to_idx, order_to_idx, num_provs, none_idx, vocab_size),
+            maxtasksperchild=10 # LOWERED to 10: Aggressively restarts workers to prevent Game() memory leaks
+        ) as pool:
             try:
-                for i, result in enumerate(pool.imap_unordered(_process_single_line, line_generator(), chunksize=50)):
+                # LOWERED chunksize to 5: Stops the workers from flooding the IPC queue
+                for i, result in enumerate(pool.imap_unordered(_process_single_line, line_generator(), chunksize=5)):
                     if (i + 1) % 1000 == 0:
                         print(f"Processed {i + 1} games")
+                        # Log RAM every 1000 games to prove it's stable
+                        ram_used = psutil.virtual_memory().used / (1024**3)
+                        print(f"  -> System RAM in use: {ram_used:.1f} GB")
                         
                     if result is None:
                         continue
                     
                     h_arr, m_arr, t_arr = result
                     
-                    hist_buffer.append(h_arr)
-                    mask_buffer.append(m_arr)
-                    targ_buffer.append(t_arr)
+                    # Write directly to the OS buffer! No more np.concatenate!
+                    f_hist.write(h_arr.tobytes())
+                    f_mask.write(m_arr.tobytes())
+                    f_targ.write(t_arr.tobytes())
+                    
                     total_samples += len(h_arr)
                     
+                    # Delete the arrays immediately to free RAM
                     del h_arr, m_arr, t_arr, result
-                    
-                    if len(hist_buffer) >= buffer_limit:
-                        f_hist.write(np.concatenate(hist_buffer).tobytes())
-                        f_mask.write(np.concatenate(mask_buffer).tobytes())
-                        f_targ.write(np.concatenate(targ_buffer).tobytes())
-                        
-                        hist_buffer = []
-                        mask_buffer = []
-                        targ_buffer = []
-                        gc.collect()
-                
-                # Flush remaining items
-                if len(hist_buffer) > 0:
-                    f_hist.write(np.concatenate(hist_buffer).tobytes())
-                    f_mask.write(np.concatenate(mask_buffer).tobytes())
-                    f_targ.write(np.concatenate(targ_buffer).tobytes())
-                    
-                    hist_buffer = []
-                    mask_buffer = []
-                    targ_buffer = []
-                    gc.collect()
 
             except KeyboardInterrupt:
                 print("\nRun canceled by user. Forcibly terminating workers to prevent freezing.")
@@ -225,12 +300,12 @@ def process_and_save_to_disk(json_path, cache_dir="./dataset_cache", max_games=N
                     
     log_system_resources("Finished Writing Binary Cache")
     print(f"Total training samples generated {total_samples}")
-    return history_path, mask_path, targets_path, total_samples, num_provs, vocab_size, none_idx
+    return history_path, mask_packed_path, targets_path, total_samples, num_provs, vocab_size, none_idx
 
 # --- 2. DISTRIBUTED WORKER LOOP ---
 
 def train_worker(rank, world_size, paths_and_metadata):
-    history_path, mask_path, targets_path, total_samples, num_provs, vocab_size, none_idx = paths_and_metadata
+    history_path, mask_packed_path, targets_path, total_samples, num_provs, vocab_size, none_idx = paths_and_metadata
     
     os.environ['MASTER_ADDR'] = 'localhost'
     os.environ['MASTER_PORT'] = '12355'
@@ -246,7 +321,7 @@ def train_worker(rank, world_size, paths_and_metadata):
         learning_rate = 1e-4
         epochs = 10
         
-        dataset = DiplomacyMemmapDataset(history_path, mask_path, targets_path, total_samples, num_provs, vocab_size)
+        dataset = DiplomacyMemmapDataset(history_path, mask_packed_path, targets_path, total_samples, num_provs, vocab_size)
         sampler = DistributedSampler(dataset, num_replicas=world_size, rank=rank)
         
         dataloader = DataLoader(
@@ -254,10 +329,11 @@ def train_worker(rank, world_size, paths_and_metadata):
             batch_size=batch_size_per_gpu, 
             shuffle=False, 
             sampler=sampler,
-            num_workers=4,
+            num_workers=0,
             pin_memory=True,
-            prefetch_factor=2,
-            multiprocessing_context="spawn" if hasattr(mp, 'get_context') else None
+            # prefetch_factor=4,
+            # persistent_workers=True,
+            # multiprocessing_context="spawn" if hasattr(mp, 'get_context') else None
         )
         
         net = DiplomacyTransformer(num_provinces=num_provs, vocab_size=vocab_size).to(rank)
@@ -279,7 +355,7 @@ def train_worker(rank, world_size, paths_and_metadata):
             batch_start_time = time.time()
             
             for batch_idx, batch in enumerate(dataloader):
-                history = batch['history'].to(rank, non_blocking=True)
+                history = batch['history'].to(rank, dtype=torch.float32, non_blocking=True)
                 mask = batch['mask'].to(rank, non_blocking=True)
                 targets = batch['targets'].to(rank, non_blocking=True)
                 
@@ -340,6 +416,13 @@ def main():
         dataset_path, 
         cache_dir=ssd_cache_directory
     )
+    
+    history_path, mask_packed_path, targets_path, total_samples, num_provs, vocab_size, none_idx = paths_and_metadata
+    
+    print("\nPre-loading dataset into system RAM...")
+    #warm_os_cache(history_path)
+    #warm_os_cache(targets_path)
+    print("Caching complete. Starting workers.\n")
     
     world_size = torch.cuda.device_count()
     if world_size < 1:
