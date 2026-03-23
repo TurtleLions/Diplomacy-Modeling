@@ -12,6 +12,21 @@ from torch.utils.tensorboard import SummaryWriter
 
 from diplomacy_helpers import DiplomacyTransformer, DiplomacyTransformerEnv
 
+# --- FAST SPARSE-TO-DENSE RECONSTRUCTION ---
+def rebuild_dense_mask(sparse_masks, num_provs, vocab_size, device):
+    batch_size = sparse_masks.size(0)
+    valid_mask = sparse_masks != -1
+    
+    row_offsets = torch.arange(batch_size, device=device).unsqueeze(1) * (num_provs * vocab_size)
+    global_indices = sparse_masks + row_offsets
+    valid_global_indices = global_indices[valid_mask]
+    
+    batch_mask_flat = torch.zeros(batch_size * num_provs * vocab_size, dtype=torch.bool, device=device)
+    batch_mask_flat[valid_global_indices] = True
+    
+    return batch_mask_flat.view(batch_size, num_provs, vocab_size)
+
+
 def worker(remote, parent_remote):
     parent_remote.close()
     env = DiplomacyTransformerEnv(history_length=3) 
@@ -70,16 +85,22 @@ def evaluate_and_save_game(net, device, update_num, save_dir="./eval_games"):
         
         step_count = 0
         while len(env.agents) > 0 and step_count < 150:
-            phase_name = env.game.current_phase
+            phase_name = env.game.get_current_phase()
             f.write(f"\n--- Phase {phase_name} ---\n")
             active_agents = env.agents
             
             obs_tensor = torch.stack([torch.tensor(obs[a]) for a in active_agents]).to(device)
-            masks_tensor = torch.stack([torch.tensor(infos[a]['action_mask']) for a in active_agents]).to(device)
+            
+            # --- NEW: Rebuild Dense Mask ---
+            sparse_masks_tensor = torch.stack([torch.tensor(infos[a]['action_mask'], dtype=torch.long) for a in active_agents]).to(device)
+            masks_tensor = rebuild_dense_mask(sparse_masks_tensor, env.num_provinces, env.vocab_size, device)
             
             with torch.no_grad():
-                logits, _ = net(obs_tensor)
-                logits = logits.masked_fill(~masks_tensor, -1e9)
+                with torch.autocast(device_type='cuda', dtype=torch.bfloat16):
+                    logits, _ = net(obs_tensor)
+                
+                logits = logits.float()
+                logits = logits.masked_fill(~masks_tensor, -1e4) 
                 actions = torch.argmax(logits, dim=-1)
                 
             action_dict = {a: actions[i].cpu().numpy() for i, a in enumerate(active_agents)}
@@ -109,6 +130,7 @@ def evaluate_and_save_game(net, device, update_num, save_dir="./eval_games"):
             
     print(f"  -> Saved evaluation game log to {log_path}")
 
+
 if __name__ == "__main__":
     dist.init_process_group(backend="nccl")
     local_rank = int(os.environ["LOCAL_RANK"])
@@ -124,11 +146,22 @@ if __name__ == "__main__":
     if global_rank == 0:
         print("--- STARTING NATIVE TRANSFORMER PPO ---")
 
+    if global_rank == 0:
+        # Rank 0 takes the job of building the file
+        from diplomacy_helpers import build_global_vocab
+        build_global_vocab() 
+        
+    # Ranks 1, 2, and 3 will wait at this line until Rank 0 finishes writing the file!
+    dist.barrier() 
+    # -----------------------------------
+
+    # Now all 4 ranks can safely initialize their environments.
+    # Ranks 1, 2, and 3 will instantly load from the cache Rank 0 just built.
     dummy_env = DiplomacyTransformerEnv()
     possible_agents = dummy_env.possible_agents
     MAP_PROVINCES = dummy_env.num_provinces
     VOCAB_SIZE = dummy_env.vocab_size
-    del dummy_env 
+    del dummy_env
 
     if global_rank == 0:
         print(f"Detected {MAP_PROVINCES} provinces and {VOCAB_SIZE} actions")
@@ -136,13 +169,21 @@ if __name__ == "__main__":
     vec_env = SubprocVecDiplomacy(num_envs=NUM_ENVS)
     net = DiplomacyTransformer(num_provinces=MAP_PROVINCES, history_length=HISTORY_LENGTH, vocab_size=VOCAB_SIZE).to(device)
     
-    # BC LOADING DISABLED DUE TO DIMENSION MISMATCH (81 vs 82)
-    # if os.path.exists("diplomacy_transformer_bc.pth"):
-    #     net.load_state_dict(torch.load("diplomacy_transformer_bc.pth", map_location=device))
-        
+    bc_weights_path = "diplomacy_transformer_bc.pth"
+    if os.path.exists(bc_weights_path):
+        # We set strict=False just in case the new Value Head causes a warning
+        # Since BC didn't train a value head, it will just initialize randomly
+        net.load_state_dict(torch.load(bc_weights_path, map_location=device), strict=False)
+        if global_rank == 0:
+            print(f"Successfully loaded pre-trained weights from {bc_weights_path}")
+    else:
+        if global_rank == 0:
+            print(f"WARNING: BC weights not found at {bc_weights_path}. Starting from scratch.")
+
     net = DDP(net, device_ids=[local_rank])
     optimizer = optim.Adam(net.parameters(), lr=1e-5, eps=1e-5)
 
+    # --- MEMORY FIX: Rollout Buffers ---
     b_obs = torch.zeros((NUM_STEPS, NUM_ENVS, NUM_AGENTS, HISTORY_LENGTH, MAP_PROVINCES, 16), dtype=torch.float32, device=device)
     b_actions = torch.zeros((NUM_STEPS, NUM_ENVS, NUM_AGENTS, MAP_PROVINCES), dtype=torch.long, device=device)
     b_logprobs = torch.zeros((NUM_STEPS, NUM_ENVS, NUM_AGENTS), dtype=torch.float32, device=device)
@@ -151,13 +192,14 @@ if __name__ == "__main__":
     b_values = torch.zeros((NUM_STEPS, NUM_ENVS, NUM_AGENTS), dtype=torch.float32, device=device)
     b_masks = torch.zeros((NUM_STEPS, NUM_ENVS, NUM_AGENTS), dtype=torch.bool, device=device) 
     
-    b_action_masks = torch.zeros((NUM_STEPS, NUM_ENVS, NUM_AGENTS, MAP_PROVINCES, VOCAB_SIZE), dtype=torch.bool).pin_memory()
+    # SHRUNK FROM 16.2 GB to 137 MB per GPU!
+    b_sparse_masks = torch.zeros((NUM_STEPS, NUM_ENVS, NUM_AGENTS, 1200), dtype=torch.long).pin_memory()
 
     num_updates = 1000
     gamma = 0.99
     gae_lambda = 0.95
     clip_coef = 0.2
-    ent_coef = 0.01
+    ent_coef = 0.05
     v_coef = 0.5
     update_epochs = 4
 
@@ -190,13 +232,23 @@ if __name__ == "__main__":
                         a_idx = agent_to_idx[a]
                         b_masks[step, i, a_idx] = True
                         b_obs[step, i, a_idx] = torch.tensor(obs_dict[a], device=device)
-                        b_action_masks[step, i, a_idx] = torch.tensor(infos_dict[a]['action_mask'])
+                        b_sparse_masks[step, i, a_idx] = torch.tensor(infos_dict[a]['action_mask'], dtype=torch.long)
 
                 flat_obs = b_obs[step][b_masks[step]]
                 if flat_obs.shape[0] > 0:
-                    logits, values = net(flat_obs)
-                    active_masks = b_action_masks[step][b_masks[step].cpu()].to(device)
-                    logits = logits.masked_fill(~active_masks, -1e9)
+                    
+                    # --- REBUILD DENSE MASK FOR GPU ---
+                    active_sparse = b_sparse_masks[step][b_masks[step].cpu()].to(device)
+                    active_masks = rebuild_dense_mask(active_sparse, MAP_PROVINCES, VOCAB_SIZE, device)
+                    
+                    with torch.autocast(device_type='cuda', dtype=torch.bfloat16):
+                        logits, values = net(flat_obs)
+                    
+                    # ADD THESE TWO LINES TO CAST BACK TO 32-BIT
+                    logits = logits.float()
+                    values = values.float()
+                    
+                    logits = logits.masked_fill(~active_masks, -1e4)
                     
                     dist_cat = Categorical(logits=logits)
                     sampled_actions = dist_cat.sample()
@@ -241,14 +293,14 @@ if __name__ == "__main__":
         flat_val = b_values.view(-1)[valid]
         
         valid_cpu = valid.cpu()
-        flat_action_masks = b_action_masks.view(-1, MAP_PROVINCES, VOCAB_SIZE)[valid_cpu]
+        flat_sparse_masks = b_sparse_masks.view(-1, 1200)[valid_cpu]
 
         if flat_adv.shape[0] > 1:
             flat_adv = (flat_adv - flat_adv.mean()) / (flat_adv.std() + 1e-8)
 
         net.train()
         b_size = flat_obs.shape[0]
-        mb_size = b_size // 4  
+        mb_size = 512
         indices = np.arange(b_size)
 
         for epoch in range(update_epochs):
@@ -263,11 +315,21 @@ if __name__ == "__main__":
                 mb_adv = flat_adv[mb_idx]
                 mb_ret = flat_ret[mb_idx]
                 
-                mb_masks_gpu = flat_action_masks[mb_idx].to(device)
+                # --- REBUILD DENSE MASK FOR UPDATE ---
+                mb_sparse_gpu = flat_sparse_masks[mb_idx].to(device)
+                mb_masks_gpu = rebuild_dense_mask(mb_sparse_gpu, MAP_PROVINCES, VOCAB_SIZE, device)
 
-                logits, new_val = net(mb_obs)
-                logits = logits.masked_fill(~mb_masks_gpu, -1e9)
+                optimizer.zero_grad() 
+
+                with torch.autocast(device_type='cuda', dtype=torch.bfloat16):
+                    logits, new_val = net(mb_obs)
                 
+                # ADD THESE TWO LINES TO CAST BACK TO 32-BIT
+                logits = logits.float()
+                new_val = new_val.float()
+                
+                logits = logits.masked_fill(~mb_masks_gpu, -1e4)
+                    
                 dist_cat = Categorical(logits=logits)
                 new_logp = dist_cat.log_prob(mb_act).sum(dim=1)
                 entropy = dist_cat.entropy().sum(dim=1).mean()
@@ -282,7 +344,6 @@ if __name__ == "__main__":
                 v_loss = 0.5 * ((new_val.squeeze() - mb_ret) ** 2).mean()
                 loss = pg_loss - ent_coef * entropy + v_loss * v_coef
                 
-                optimizer.zero_grad()
                 loss.backward()
                 nn.utils.clip_grad_norm_(net.parameters(), 0.5)
                 optimizer.step()

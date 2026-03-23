@@ -152,9 +152,10 @@ class DiplomacyMemmapDataset(Dataset):
         unpacked_mask = unpacked_flat.reshape(self.num_provs, self.vocab_size)
 
         return {
-            'history': torch.from_numpy(self.history[idx]), # Removed np.array(..., copy=True)
-            'mask': torch.from_numpy(unpacked_mask).bool(),
-            'targets': torch.from_numpy(self.targets[idx])  # Removed np.array(..., copy=True)
+            # Add .copy() back to history and targets to make PyTorch happy
+            'history': torch.from_numpy(self.history[idx].copy()), 
+            'mask': torch.from_numpy(unpacked_mask).to(torch.bool), # unpackbits already creates a fresh array
+            'targets': torch.from_numpy(self.targets[idx].copy())  
         }
 
 def _process_single_line(line):
@@ -317,7 +318,7 @@ def train_worker(rank, world_size, paths_and_metadata):
         os.sched_setaffinity(0, assigned_cores)
         torch.set_num_threads(6)
         
-        batch_size_per_gpu = 64
+        batch_size_per_gpu = 512
         learning_rate = 1e-4
         epochs = 10
         
@@ -329,11 +330,10 @@ def train_worker(rank, world_size, paths_and_metadata):
             batch_size=batch_size_per_gpu, 
             shuffle=False, 
             sampler=sampler,
-            num_workers=0,
+            num_workers=2,              # 2 background workers per GPU
             pin_memory=True,
-            # prefetch_factor=4,
-            # persistent_workers=True,
-            # multiprocessing_context="spawn" if hasattr(mp, 'get_context') else None
+            prefetch_factor=2,          # Each worker cues up 2 batches
+            persistent_workers=True     # Keeps workers alive between epochs
         )
         
         net = DiplomacyTransformer(num_provinces=num_provs, vocab_size=vocab_size).to(rank)
@@ -360,24 +360,26 @@ def train_worker(rank, world_size, paths_and_metadata):
                 targets = batch['targets'].to(rank, non_blocking=True)
                 
                 optimizer.zero_grad()
-                logits, _ = net(history)
                 
-                logits_flat = logits.view(-1, vocab_size)
-                targets_flat = targets.view(-1)
-                mask_flat = mask.view(-1, vocab_size)
-                
-                is_target_legal = mask_flat.gather(1, targets_flat.unsqueeze(1)).squeeze()
-                valid_training_mask = (targets_flat != none_idx) & is_target_legal
-                
-                if valid_training_mask.any():
-                    logits_masked = logits_flat.masked_fill(~mask_flat, -1e4)
-                    loss = criterion(logits_masked[valid_training_mask], targets_flat[valid_training_mask])
-                    loss.backward()
+                # --- NEW: NATIVE 16-BIT MATRIX MATH ---
+                with torch.autocast(device_type='cuda', dtype=torch.bfloat16):
+                    logits, _ = net(history)
                     
-                else:
-                    loss = (logits * 0).sum()
-                    loss.backward()
+                    logits_flat = logits.view(-1, vocab_size)
+                    targets_flat = targets.view(-1)
+                    mask_flat = mask.view(-1, vocab_size)
+                    
+                    is_target_legal = mask_flat.gather(1, targets_flat.unsqueeze(1)).squeeze()
+                    valid_training_mask = (targets_flat != none_idx) & is_target_legal
+                    
+                    if valid_training_mask.any():
+                        logits_masked = logits_flat.masked_fill(~mask_flat, -1e4)
+                        loss = criterion(logits_masked[valid_training_mask], targets_flat[valid_training_mask])
+                    else:
+                        loss = (logits * 0).sum()
                 
+                # Backward pass remains the same
+                loss.backward()
                 torch.nn.utils.clip_grad_norm_(net.parameters(), 0.5)
                 optimizer.step()
                 total_loss += loss.item()
@@ -420,8 +422,9 @@ def main():
     history_path, mask_packed_path, targets_path, total_samples, num_provs, vocab_size, none_idx = paths_and_metadata
     
     print("\nPre-loading dataset into system RAM...")
-    #warm_os_cache(history_path)
-    #warm_os_cache(targets_path)
+    # warm_os_cache(history_path)
+    # warm_os_cache(mask_packed_path)  # Added the mask file!
+    # warm_os_cache(targets_path)
     print("Caching complete. Starting workers.\n")
     
     world_size = torch.cuda.device_count()
