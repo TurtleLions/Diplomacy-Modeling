@@ -144,9 +144,18 @@ def get_sparse_action_mask(game, power, provinces, order_to_idx, max_len=1200):
     mask = np.zeros((len(provinces), len(order_to_idx)), dtype=np.bool_)
     orderable_locs = game.get_orderable_locations(power)
     
+    # --- COASTAL MAPPING FIX ---
+    # Map specific coastal locations (STP/SC) to their base province (STP)
+    base_loc_to_orders = {}
+    for loc in orderable_locs:
+        base_prov = loc.split('/')[0]
+        base_loc_to_orders[base_prov] = game.get_all_possible_orders().get(loc, [])
+    # ---------------------------
+    
     for i, prov in enumerate(provinces):
-        if prov in orderable_locs:
-            for order in game.get_all_possible_orders().get(prov, []):
+        # Check against the base province mapping instead of orderable_locs
+        if prov in base_loc_to_orders:
+            for order in base_loc_to_orders[prov]:
                 if order in order_to_idx:
                     mask[i, order_to_idx[order]] = True
         
