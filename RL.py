@@ -173,6 +173,18 @@ if __name__ == "__main__":
     # Now all 4 ranks can safely initialize their environments.
     # Ranks 1, 2, and 3 will instantly load from the cache Rank 0 just built.
     dummy_env = DiplomacyTransformerEnv()
+    # --- DEBUG: CHECK VOCABULARY FOR COASTS ---
+    if global_rank == 0:
+        coastal_orders = [order for idx, order in dummy_env.idx_to_order.items() 
+                          if '/NC' in order or '/SC' in order or '/EC' in order]
+        print(f"\n--- DEBUG ---")
+        print(f"Total coastal orders in vocab: {len(coastal_orders)}")
+        if len(coastal_orders) > 0:
+            print(f"Sample coastal orders: {coastal_orders[:5]}")
+        else:
+            print("WARNING: 0 coastal orders found in vocabulary! Model cannot predict them.")
+        print(f"-------------\n")
+    # ------------------------------------------
     possible_agents = dummy_env.possible_agents
     MAP_PROVINCES = dummy_env.num_provinces
     VOCAB_SIZE = dummy_env.vocab_size
