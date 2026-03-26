@@ -146,15 +146,10 @@ class DiplomacyMemmapDataset(Dataset):
             self.mask_packed = np.memmap(self.mask_packed_path, dtype=np.uint8, mode='r', shape=(self.total_samples, self.bytes_per_sample))
             self.targets = np.memmap(self.targets_path, dtype=np.int64, mode='r', shape=(self.total_samples, self.num_provs))
             
-        # Unpack the bits and trim any extra padding
-        packed_sample = self.mask_packed[idx]
-        unpacked_flat = np.unpackbits(packed_sample)[:self.bools_per_sample]
-        unpacked_mask = unpacked_flat.reshape(self.num_provs, self.vocab_size)
-
+        # Return the raw compressed bytes directly to PyTorch
         return {
-            # Add .copy() back to history and targets to make PyTorch happy
             'history': torch.from_numpy(self.history[idx].copy()), 
-            'mask': torch.from_numpy(unpacked_mask).to(torch.bool), # unpackbits already creates a fresh array
+            'mask_packed': torch.from_numpy(self.mask_packed[idx].copy()), 
             'targets': torch.from_numpy(self.targets[idx].copy())  
         }
 
@@ -313,31 +308,28 @@ def train_worker(rank, world_size, paths_and_metadata):
     dist.init_process_group("nccl", rank=rank, world_size=world_size)
     
     try:
-        core_start = rank * 6
-        assigned_cores = list(range(core_start, core_start + 6))
-        os.sched_setaffinity(0, assigned_cores)
-        torch.set_num_threads(6)
+        torch.set_num_threads(4) 
         
         batch_size_per_gpu = 512
         learning_rate = 1e-4
-        epochs = 10
+        epochs = 3
         
         dataset = DiplomacyMemmapDataset(history_path, mask_packed_path, targets_path, total_samples, num_provs, vocab_size)
-        sampler = DistributedSampler(dataset, num_replicas=world_size, rank=rank)
+        sampler = DistributedSampler(dataset, num_replicas=world_size, rank=rank, shuffle=False)
         
         dataloader = DataLoader(
             dataset, 
             batch_size=batch_size_per_gpu, 
             shuffle=False, 
             sampler=sampler,
-            num_workers=2,              # 2 background workers per GPU
+            num_workers=4,              # 2 background workers per GPU
             pin_memory=True,
             prefetch_factor=2,          # Each worker cues up 2 batches
             persistent_workers=True     # Keeps workers alive between epochs
         )
         
         net = DiplomacyTransformer(num_provinces=num_provs, vocab_size=vocab_size).to(rank)
-        net = DDP(net, device_ids=[rank], find_unused_parameters=True)
+        net = DDP(net, device_ids=[rank], find_unused_parameters=False)
         criterion = nn.CrossEntropyLoss()
         optimizer = optim.Adam(net.parameters(), lr=learning_rate)
         
@@ -356,14 +348,27 @@ def train_worker(rank, world_size, paths_and_metadata):
             
             for batch_idx, batch in enumerate(dataloader):
                 history = batch['history'].to(rank, dtype=torch.float32, non_blocking=True)
-                mask = batch['mask'].to(rank, non_blocking=True)
                 targets = batch['targets'].to(rank, non_blocking=True)
+                
+                # Load the tiny compressed array into VRAM
+                packed_mask = batch['mask_packed'].to(rank, non_blocking=True)
+                
+                # --- GPU BIT UNPACKING ---
+                # Shift bits 7 to 0 to extract MSB first (matching np.packbits)
+                shifts = torch.arange(7, -1, -1, device=rank, dtype=torch.uint8)
+                unpacked = (packed_mask.unsqueeze(-1) >> shifts) & 1
+                
+                # Flatten the bits and trim any trailing padding
+                bools_per_sample = num_provs * vocab_size
+                mask_flat_bits = unpacked.view(packed_mask.size(0), -1)[:, :bools_per_sample].bool()
+                mask = mask_flat_bits.view(packed_mask.size(0), num_provs, vocab_size)
+                # -------------------------
                 
                 optimizer.zero_grad()
                 
-                # --- NEW: NATIVE 16-BIT MATRIX MATH ---
                 with torch.autocast(device_type='cuda', dtype=torch.bfloat16):
-                    logits, _ = net(history)
+                    # The rest of your forward pass remains completely untouched!
+                    logits, state_value = net(history, targets)
                     
                     logits_flat = logits.view(-1, vocab_size)
                     targets_flat = targets.view(-1)
@@ -373,10 +378,17 @@ def train_worker(rank, world_size, paths_and_metadata):
                     valid_training_mask = (targets_flat != none_idx) & is_target_legal
                     
                     if valid_training_mask.any():
-                        logits_masked = logits_flat.masked_fill(~mask_flat, -1e4)
-                        loss = criterion(logits_masked[valid_training_mask], targets_flat[valid_training_mask])
+                        valid_logits = logits_flat[valid_training_mask]
+                        valid_masks = mask_flat[valid_training_mask]
+                        valid_targets = targets_flat[valid_training_mask]
+                        
+                        valid_logits_masked = valid_logits.masked_fill(~valid_masks, -1e4)
+                        loss = criterion(valid_logits_masked, valid_targets)
                     else:
-                        loss = (logits * 0).sum()
+                        loss = (logits_flat.mean() * 0.0)
+                        
+                    # TRICK DDP: Add the value_head to the autograd graph with a weight of 0
+                    loss = loss + (state_value * 0).sum()
                 
                 # Backward pass remains the same
                 loss.backward()
@@ -423,7 +435,7 @@ def main():
     
     print("\nPre-loading dataset into system RAM...")
     # warm_os_cache(history_path)
-    # warm_os_cache(mask_packed_path)  # Added the mask file!
+    # warm_os_cache(mask_packed_path)
     # warm_os_cache(targets_path)
     print("Caching complete. Starting workers.\n")
     

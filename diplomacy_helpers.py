@@ -19,6 +19,57 @@ GLOBAL_PROV_TO_IDX = {prov: i for i, prov in enumerate(GLOBAL_PROVINCES)}
 GLOBAL_POWERS = ['AUSTRIA', 'ENGLAND', 'FRANCE', 'GERMANY', 'ITALY', 'RUSSIA', 'TURKEY']
 GLOBAL_POWER_TO_IDX = {power: i for i, power in enumerate(GLOBAL_POWERS)}
 
+class KVCacheAttentionBlock(nn.Module):
+    def __init__(self, d_model, nhead, dim_feedforward=1024):
+        super().__init__()
+        self.nhead = nhead
+        self.d_model = d_model
+        self.head_dim = d_model // nhead
+        
+        self.q_proj = nn.Linear(d_model, d_model)
+        self.k_proj = nn.Linear(d_model, d_model)
+        self.v_proj = nn.Linear(d_model, d_model)
+        self.out_proj = nn.Linear(d_model, d_model)
+        
+        self.norm1 = nn.LayerNorm(d_model)
+        self.norm2 = nn.LayerNorm(d_model)
+        
+        # Standard Transformer FFN
+        self.ffn = nn.Sequential(
+            nn.Linear(d_model, dim_feedforward),
+            nn.GELU(),
+            nn.Linear(dim_feedforward, d_model)
+        )
+
+    def forward(self, x, kv_cache=None):
+        batch_size, seq_len, _ = x.size()
+        
+        x_norm = self.norm1(x)
+        
+        q = self.q_proj(x_norm).view(batch_size, seq_len, self.nhead, self.head_dim).transpose(1, 2)
+        k = self.k_proj(x_norm).view(batch_size, seq_len, self.nhead, self.head_dim).transpose(1, 2)
+        v = self.v_proj(x_norm).view(batch_size, seq_len, self.nhead, self.head_dim).transpose(1, 2)
+
+        if kv_cache is not None:
+            past_k, past_v = kv_cache
+            k = torch.cat([past_k, k], dim=2)
+            v = torch.cat([past_v, v], dim=2)
+        
+        new_kv_cache = (k, v)
+
+        is_causal = (seq_len > 1)
+        attn_out = torch.nn.functional.scaled_dot_product_attention(q, k, v, is_causal=is_causal)
+        
+        attn_out = attn_out.transpose(1, 2).reshape(batch_size, seq_len, self.d_model)
+        
+        # First residual add
+        x = x + self.out_proj(attn_out) 
+        
+        # Second residual add over the FFN
+        out = x + self.ffn(self.norm2(x))
+        
+        return out, new_kv_cache
+
 class DiplomacyTransformer(nn.Module):
     def __init__(self, input_dim=16, d_model=256, nhead=8, num_layers=8, num_provinces=81, history_length=3, vocab_size=14000):
         super().__init__()
@@ -27,59 +78,89 @@ class DiplomacyTransformer(nn.Module):
         self.history_length = history_length
         self.d_model = d_model
         
-        # 1. Project the raw 16-feature input into the hidden dimension
+        # --- THE ENCODER (Unchanged) ---
         self.feature_projection = nn.Linear(input_dim, d_model)
-        
-        # 2. Spatial and Temporal Embeddings
         self.province_embedding = nn.Embedding(num_provinces, d_model)
         self.time_embedding = nn.Embedding(history_length, d_model)
         
-        # 3. The Transformer Encoder
         encoder_layer = nn.TransformerEncoderLayer(d_model=d_model, nhead=nhead, batch_first=True)
         self.transformer = nn.TransformerEncoder(encoder_layer, num_layers=num_layers)
         
-        # 4. Single Output Head (Predicting exactly 1 legal order per province)
-        # We only predict actions for the current time-step, so we need a dedicated action head
-        self.action_head = nn.Linear(d_model, vocab_size)
-        
-        # Optional: A critic head for Actor-Critic PPO
         self.value_head = nn.Linear(d_model * num_provinces, 1)
 
-        # PRE-COMPUTE INDICES (Saves GPU allocation time during forward pass)
+        # --- NEW: THE AUTOREGRESSIVE DECODER ---
+        # 1. Embed the previously chosen action so we can feed it into the next step
+        self.action_embedding = nn.Embedding(vocab_size, d_model)
+        # Dedicated learned start token
+        self.start_token_embedding = nn.Parameter(torch.randn(1, 1, d_model))
+        
+        # 2. Our custom KV Cache block (you can stack multiple of these if needed)
+        self.causal_decoder_block = KVCacheAttentionBlock(d_model=d_model, nhead=nhead)
+        
+        # 3. The final projection to logits
+        self.action_head = nn.Linear(d_model, vocab_size)
+
+        # PRE-COMPUTE INDICES
         p_idx = torch.arange(num_provinces).unsqueeze(0).unsqueeze(0).expand(1, history_length, -1)
         t_idx = torch.arange(history_length).unsqueeze(0).unsqueeze(-1).expand(1, -1, num_provinces)
-        
-        # Registering as buffers means they move to the GPU automatically
         self.register_buffer('prov_indices', p_idx)
         self.register_buffer('time_indices', t_idx)
 
-    def forward(self, x):
+    def encode_state(self, x):
+        """
+        STEP 1: Process the board state once. 
+        Call this outside your province-loop.
+        """
         batch_size = x.size(0)
-        
-        # Expand the pre-computed buffers to match the current batch size (virtually zero cost)
         p_idx = self.prov_indices.expand(batch_size, -1, -1)
         t_idx = self.time_indices.expand(batch_size, -1, -1)
         
-        # Project features and add embeddings
         x_proj = self.feature_projection(x)
         x_emb = x_proj + self.province_embedding(p_idx) + self.time_embedding(t_idx)
         
-        # Use .reshape() instead of .view() here! 
-        # Adding embeddings can make the tensor non-contiguous in memory, which breaks .view()
         seq_input = x_emb.reshape(batch_size, self.history_length * self.num_provinces, self.d_model)
-        
         transformer_out = self.transformer(seq_input)
         
-        # Use .reshape() here too
         out_reshaped = transformer_out.reshape(batch_size, self.history_length, self.num_provinces, self.d_model)
-        
         current_state_repr = out_reshaped[:, 0, :, :] 
-        
-        action_logits = self.action_head(current_state_repr) 
         
         flat_current_state = current_state_repr.reshape(batch_size, -1)
         state_value = self.value_head(flat_current_state)
         
+        return current_state_repr, state_value
+
+    def decode_step(self, prev_action, prov_idx, state_repr, kv_cache=None):
+        batch_size = state_repr.size(0)
+        
+        # Use the start embedding for the very first province, otherwise use the action embedding
+        if prov_idx == 0:
+            action_emb = self.start_token_embedding.expand(batch_size, -1, -1).squeeze(1)
+        else:
+            action_emb = self.action_embedding(prev_action)
+            
+        prov_state = state_repr[:, prov_idx, :]
+        decoder_input = (action_emb + prov_state).unsqueeze(1)
+        
+        decoder_out, new_kv_cache = self.causal_decoder_block(decoder_input, kv_cache)
+        logits = self.action_head(decoder_out.squeeze(1))
+        
+        return logits, new_kv_cache
+
+    def forward(self, x, actions):
+        batch_size = x.size(0)
+        state_repr, state_value = self.encode_state(x)
+        
+        # Embed all actions EXCEPT the last one (shifting right)
+        action_emb = self.action_embedding(actions[:, :-1])
+        
+        # Expand the start token for the batch and prepend it
+        start_emb = self.start_token_embedding.expand(batch_size, 1, -1)
+        shifted_emb = torch.cat([start_emb, action_emb], dim=1)
+        
+        decoder_input = shifted_emb + state_repr
+        decoder_out, _ = self.causal_decoder_block(decoder_input, kv_cache=None)
+        
+        action_logits = self.action_head(decoder_out)
         return action_logits, state_value
 
 def build_global_vocab(json_path="./datasets/standard_no_press.jsonl", cache_path="vocab.txt"):
@@ -360,22 +441,50 @@ if __name__ == "__main__":
             for agent in active_agents:
                 # Shape: (1, History, 81, 16)
                 agent_obs = torch.tensor(obs[agent], device=device).unsqueeze(0)
-                mask = torch.tensor(infos[agent]['action_mask'], device=device)
+                batch_size = agent_obs.size(0) # FIXED: Define batch_size
+                
+                # FIXED: Convert Sparse Mask back to Dense Boolean Mask
+                sparse_mask = torch.tensor(infos[agent]['action_mask'], device=device)
+                dense_mask = torch.zeros((env.num_provinces, vocab_size), dtype=torch.bool, device=device)
+                valid_indices = sparse_mask[sparse_mask != -1]
+                
+                if len(valid_indices) > 0:
+                    # Map flat sparse indices back to (province, action) 2D coordinates
+                    prov_indices = valid_indices // vocab_size
+                    act_indices = valid_indices % vocab_size
+                    dense_mask[prov_indices, act_indices] = True
                 
                 with torch.no_grad():
-                    logits, value = net(agent_obs)
-                    # Apply the global mask
-                    logits = logits.squeeze(0).masked_fill(~mask, -1e9)
+                    state_repr, value = net.encode_state(agent_obs)
                     
-                    dist = Categorical(logits=logits)
-                    action = dist.sample()
-                    logprob = dist.log_prob(action)
+                    actions = []
+                    logprobs = []
                     
-                actions_to_send[agent] = action.cpu().numpy()
+                    current_action = torch.zeros(batch_size, dtype=torch.long, device=device)
+                    kv_cache = None
+                    
+                    for prov_idx in range(net.num_provinces):
+                        logits, kv_cache = net.decode_step(current_action, prov_idx, state_repr, kv_cache)
+                        
+                        # Apply the dense mask for THIS province
+                        prov_mask = dense_mask[prov_idx, :].unsqueeze(0) 
+                        logits = logits.masked_fill(~prov_mask, -1e9)
+                        
+                        dist = Categorical(logits=logits)
+                        current_action = dist.sample()
+                        
+                        actions.append(current_action)
+                        logprobs.append(dist.log_prob(current_action))
+
+                    final_actions = torch.stack(actions, dim=1)
+                    final_logprobs = torch.stack(logprobs, dim=1).sum(dim=1) 
+                    
+                # FIXED: Send final_actions instead of current_action
+                actions_to_send[agent] = final_actions.squeeze(0).cpu().numpy()
                 
                 batch_obs.append(agent_obs)
-                batch_actions.append(action)
-                batch_logprobs.append(logprob)
+                batch_actions.append(final_actions) # FIXED
+                batch_logprobs.append(final_logprobs) # FIXED
                 
             obs, rewards, terms, truncs, infos = env.step(actions_to_send)
             active_agents = env.agents

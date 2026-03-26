@@ -77,7 +77,7 @@ def evaluate_and_save_game(net, device, update_num, save_dir="./eval_games"):
     env = DiplomacyTransformerEnv(history_length=3)
     obs, infos = env.reset()
     
-    log_path = os.path.join(save_dir, f"eval_game_update_{update_num}.txt")
+    log_path = os.path.join(save_dir, f"eval_game_KV_update_{update_num}.txt")
     
     with open(log_path, "w") as f:
         f.write(f"Evaluation Game - Update {update_num}\n")
@@ -97,11 +97,26 @@ def evaluate_and_save_game(net, device, update_num, save_dir="./eval_games"):
             
             with torch.no_grad():
                 with torch.autocast(device_type='cuda', dtype=torch.bfloat16):
-                    logits, _ = net(obs_tensor)
+                    state_repr, _ = net.encode_state(obs_tensor)
                 
-                logits = logits.float()
-                logits = logits.masked_fill(~masks_tensor, -1e4) 
-                actions = torch.argmax(logits, dim=-1)
+                batch_size = obs_tensor.size(0)
+                current_action = torch.zeros(batch_size, dtype=torch.long, device=device)
+                kv_cache = None
+                actions_list = []
+                
+                for prov_idx in range(env.num_provinces):
+                    with torch.autocast(device_type='cuda', dtype=torch.bfloat16):
+                        logits, kv_cache = net.decode_step(current_action, prov_idx, state_repr, kv_cache)
+                    
+                    logits = logits.float()
+                    prov_mask = masks_tensor[:, prov_idx, :]
+                    logits = logits.masked_fill(~prov_mask, -1e4)
+                    
+                    # In eval, we take the best move (argmax) instead of random sampling
+                    current_action = torch.argmax(logits, dim=-1)
+                    actions_list.append(current_action)
+                
+                actions = torch.stack(actions_list, dim=1)
                 
             action_dict = {a: actions[i].cpu().numpy() for i, a in enumerate(active_agents)}
             
@@ -181,7 +196,7 @@ if __name__ == "__main__":
             print(f"WARNING: BC weights not found at {bc_weights_path}. Starting from scratch.")
 
     net = DDP(net, device_ids=[local_rank])
-    optimizer = optim.Adam(net.parameters(), lr=1e-5, eps=1e-5)
+    optimizer = optim.Adam(net.parameters(), lr=1e-6, eps=1e-5)
 
     # --- MEMORY FIX: Rollout Buffers ---
     b_obs = torch.zeros((NUM_STEPS, NUM_ENVS, NUM_AGENTS, HISTORY_LENGTH, MAP_PROVINCES, 16), dtype=torch.float32, device=device)
@@ -192,15 +207,14 @@ if __name__ == "__main__":
     b_values = torch.zeros((NUM_STEPS, NUM_ENVS, NUM_AGENTS), dtype=torch.float32, device=device)
     b_masks = torch.zeros((NUM_STEPS, NUM_ENVS, NUM_AGENTS), dtype=torch.bool, device=device) 
     
-    # SHRUNK FROM 16.2 GB to 137 MB per GPU!
     b_sparse_masks = torch.zeros((NUM_STEPS, NUM_ENVS, NUM_AGENTS, 1200), dtype=torch.long).pin_memory()
 
     num_updates = 1000
     gamma = 0.99
     gae_lambda = 0.95
     clip_coef = 0.2
-    ent_coef = 0.05
-    v_coef = 0.5
+    ent_coef = 0.0
+    v_coef = 0.1
     update_epochs = 4
 
     agent_to_idx = {a: i for i, a in enumerate(possible_agents)}
@@ -242,17 +256,37 @@ if __name__ == "__main__":
                     active_masks = rebuild_dense_mask(active_sparse, MAP_PROVINCES, VOCAB_SIZE, device)
                     
                     with torch.autocast(device_type='cuda', dtype=torch.bfloat16):
-                        logits, values = net(flat_obs)
-                    
-                    # ADD THESE TWO LINES TO CAST BACK TO 32-BIT
-                    logits = logits.float()
+                        # Encode the board once
+                        state_repr, values = net.module.encode_state(flat_obs)
                     values = values.float()
                     
-                    logits = logits.masked_fill(~active_masks, -1e4)
+                    batch_size = flat_obs.size(0)
+                    current_action = torch.zeros(batch_size, dtype=torch.long, device=device)
+                    kv_cache = None
                     
-                    dist_cat = Categorical(logits=logits)
-                    sampled_actions = dist_cat.sample()
-                    log_p = dist_cat.log_prob(sampled_actions)
+                    sampled_actions_list = []
+                    log_probs_list = []
+                    
+                    # Decode 81 times sequentially
+                    for prov_idx in range(MAP_PROVINCES):
+                        with torch.autocast(device_type='cuda', dtype=torch.bfloat16):
+                            logits, kv_cache = net.module.decode_step(current_action, prov_idx, state_repr, kv_cache)
+                        
+                        logits = logits.float()
+                        
+                        # Apply the mask for THIS specific province
+                        prov_mask = active_masks[:, prov_idx, :]
+                        logits = logits.masked_fill(~prov_mask, -1e4)
+                        
+                        dist_cat = Categorical(logits=logits)
+                        current_action = dist_cat.sample()
+                        
+                        sampled_actions_list.append(current_action)
+                        log_probs_list.append(dist_cat.log_prob(current_action))
+                    
+                    sampled_actions = torch.stack(sampled_actions_list, dim=1)
+                    # We keep log_p as a 2D tensor [batch, 81]. The .sum(dim=1) happens on the next line in your code!
+                    log_p = torch.stack(log_probs_list, dim=1)
                     
                     b_values[step][b_masks[step]] = values.squeeze()
                     b_logprobs[step][b_masks[step]] = log_p.sum(dim=1) 
@@ -309,8 +343,8 @@ if __name__ == "__main__":
                 end = start + mb_size
                 mb_idx = indices[start:end]
                 
-                mb_obs = flat_obs[mb_idx]
-                mb_act = flat_act[mb_idx]
+                mb_obs = flat_obs[mb_idx].contiguous()
+                mb_act = flat_act[mb_idx].contiguous()
                 mb_logprobs = flat_logprobs[mb_idx]
                 mb_adv = flat_adv[mb_idx]
                 mb_ret = flat_ret[mb_idx]
@@ -322,7 +356,7 @@ if __name__ == "__main__":
                 optimizer.zero_grad() 
 
                 with torch.autocast(device_type='cuda', dtype=torch.bfloat16):
-                    logits, new_val = net(mb_obs)
+                    logits, new_val = net(mb_obs, mb_act)
                 
                 # ADD THESE TWO LINES TO CAST BACK TO 32-BIT
                 logits = logits.float()
@@ -362,7 +396,7 @@ if __name__ == "__main__":
             writer.add_scalar("Loss/Entropy", entropy.item(), update)
 
             if update % 50 == 0:
-                ckpt_path = f"./checkpoints/diplomacy_ppo_update_{update}.pth"
+                ckpt_path = f"./checkpoints/diplomacy_ppo_KV_update_{update}.pth"
                 torch.save(net.module.state_dict(), ckpt_path)
                 print(f"  -> Saved checkpoint to {ckpt_path}")
                 evaluate_and_save_game(net.module, device, update)
