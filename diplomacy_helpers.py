@@ -13,7 +13,7 @@ import os
 import json
 
 _DUMMY_GAME = Game()
-GLOBAL_PROVINCES = list(_DUMMY_GAME.map.locs)
+GLOBAL_PROVINCES = [prov.upper() for prov in list(_DUMMY_GAME.map.locs)]
 GLOBAL_PROV_TO_IDX = {prov: i for i, prov in enumerate(GLOBAL_PROVINCES)}
 
 GLOBAL_POWERS = ['AUSTRIA', 'ENGLAND', 'FRANCE', 'GERMANY', 'ITALY', 'RUSSIA', 'TURKEY']
@@ -71,7 +71,7 @@ class KVCacheAttentionBlock(nn.Module):
         return out, new_kv_cache
 
 class DiplomacyTransformer(nn.Module):
-    def __init__(self, input_dim=16, d_model=256, nhead=8, num_layers=8, num_provinces=81, history_length=3, vocab_size=14000):
+    def __init__(self, input_dim=19, d_model=256, nhead=8, num_layers=8, num_provinces=82, history_length=3, vocab_size=14000):
         super().__init__()
         
         self.num_provinces = num_provinces
@@ -226,19 +226,22 @@ def get_sparse_action_mask(game, power, provinces, order_to_idx, max_len=1200):
     orderable_locs = game.get_orderable_locations(power)
     
     # --- COASTAL MAPPING FIX ---
-    # Map specific coastal locations (STP/SC) to their base province (STP)
     base_loc_to_orders = {}
     for loc in orderable_locs:
-        base_prov = loc.split('/')[0]
+        # Force uppercase base province
+        base_prov = loc.split('/')[0].upper()
         base_loc_to_orders[base_prov] = game.get_all_possible_orders().get(loc, [])
     # ---------------------------
     
     for i, prov in enumerate(provinces):
-        # Check against the base province mapping instead of orderable_locs
-        if prov in base_loc_to_orders:
-            for order in base_loc_to_orders[prov]:
-                if order in order_to_idx:
-                    mask[i, order_to_idx[order]] = True
+        # Force uppercase check
+        prov_upper = prov.upper()
+        if prov_upper in base_loc_to_orders:
+            for order in base_loc_to_orders[prov_upper]:
+                # Force uppercase order string to match vocab
+                clean_order = order.replace('*', '').upper()
+                if clean_order in order_to_idx:
+                    mask[i, order_to_idx[clean_order]] = True
         
         if not mask[i].any():
             mask[i, order_to_idx['NONE']] = True
@@ -273,8 +276,8 @@ class DiplomacyTransformerEnv(ParallelEnv):
         self.vocab_size = len(self.order_to_idx)
         
         # 2. State history buffer to feed the Transformer
-        # Shape: (History_Length, 81 Provinces, 16 Features)
-        self.state_history = np.zeros((self.history_length, self.num_provinces, 16), dtype=np.float32)
+        # Shape: (History_Length, 82 Provinces, 19 Features)
+        self.state_history = np.zeros((self.history_length, self.num_provinces, 19), dtype=np.float32)
 
     def _update_history(self, new_state_tensor):
         # Roll the history buffer backward (oldest state drops out)
@@ -288,7 +291,7 @@ class DiplomacyTransformerEnv(ParallelEnv):
         self.step_count = 0
         
         # Clear history buffer with zeros
-        self.state_history = np.zeros((self.history_length, self.num_provinces, 16), dtype=np.float32)
+        self.state_history = np.zeros((self.history_length, self.num_provinces, 19), dtype=np.float32)
         
         # Get first state and update history
         obs_tensor = parse_state_to_tensor({'state': self.game.get_state()})
@@ -334,44 +337,52 @@ class DiplomacyTransformerEnv(ParallelEnv):
         is_done = False
         if self.step_count >= 150: 
             is_done = True
-        
+            
         current_state_dict = self.game.get_state()
+        current_phase = self.game.get_current_phase()
         
         for agent in self.agents:
             current_scs = self.game.get_centers(agent)
-            current_units = current_state_dict['units'].get(agent, [])
-            agent_prev_units = prev_units.get(agent, [])
+            prev_scs = [sc for sc, owner in prev_sc_owners.items() if owner == agent]
             
-            # 1. Base Existence Reward
-            rewards[agent] += len(current_scs) * 0.01  
+            # 1. The Time Tax (Instead of a survival drip)
+            # Make them bleed slightly every turn so they are forced to capture SCs to survive
+            rewards[agent] -= 0.02
             
-            # 2. Strategic Milestones (Massively increased to encourage risk)
-            for sc in current_scs:
-                if sc not in prev_sc_owners: 
-                    rewards[agent] += 5.0     # Took a neutral SC
-                elif prev_sc_owners[sc] != agent: 
-                    rewards[agent] += 10.0    # Stole an enemy SC!
+            # 2. The SC Engine (Only evaluated after Fall Builds when ownership actually changes)
+            if current_phase.endswith('M') and current_phase.startswith('S') and self.step_count > 1:
+                # We are at the start of a new year. Calculate the net change in SCs from last year.
+                sc_delta = len(current_scs) - len(prev_scs)
+                
+                if sc_delta > 0:
+                    rewards[agent] += sc_delta * 5.0  # Massive reward for actual, secured expansion
+                elif sc_delta < 0:
+                    rewards[agent] += sc_delta * 5.0  # Proportionate penalty for losing ground
                     
-            for sc, owner in prev_sc_owners.items():
-                if owner == agent and sc not in current_scs: 
-                    rewards[agent] -= 10.0    # Lost an SC
-            
-            # 3. Tactical Micro-Rewards (The Loop Breaker)
-            if prev_phase_type == 'M': # Only apply to Movement phases
-                for unit in current_units:
-                    if unit not in agent_prev_units:
-                        # Unit successfully moved to a new province
-                        rewards[agent] += 0.5
-                    else:
-                        # Unit stayed in place (Held or Bounced)
-                        rewards[agent] -= 0.1 
-            
+            # 3. The Tempo Engine (Evaluated during Movement Phases)
+            if prev_phase_type == 'M':
+                agent_units = prev_units.get(agent, [])
+                if len(agent_units) > 0:
+                    # Count proactive moves (Exclude NONE and strictly static HOLDS)
+                    proactive_moves = 0
+                    for order_idx in actions[agent]:
+                        order_str = self.idx_to_order[order_idx]
+                        # Only reward them if they are actually trying to do something active
+                        if order_str != 'NONE' and not order_str.endswith(' H'):
+                            proactive_moves += 1
+                            
+                    utilization_ratio = proactive_moves / len(agent_units)
+                    if utilization_ratio > 0.7:
+                        rewards[agent] += 0.2  
+                    elif utilization_ratio < 0.3:
+                        rewards[agent] -= 0.5  # Heavy penalty for mass sleeping/holding
+                        
             # 4. Endgame Conditions
             if len(current_scs) >= 18:
                 rewards[agent] += 100.0
                 is_done = True
-            if len(current_scs) == 0 and len(current_units) == 0:
-                rewards[agent] -= 50.0
+            if len(current_scs) == 0 and len(current_state_dict['units'].get(agent, [])) == 0:
+                rewards[agent] -= 100.0  # You died.
 
         terminations = {a: is_done for a in self.agents}
         infos = {a: {'action_mask': get_sparse_action_mask(self.game, a, self.provinces, self.order_to_idx)} for a in self.agents}
@@ -381,32 +392,47 @@ class DiplomacyTransformerEnv(ParallelEnv):
         return observations, rewards, terminations, {a: False for a in self.agents}, infos
 
 def parse_state_to_tensor(turn_data):
-    # REMOVED: game = Game()
-    state_tensor = np.zeros((len(GLOBAL_PROV_TO_IDX), 16), dtype=np.float32)
+    # Increase feature dimension to 19 to support NC, SC, and EC
+    state_tensor = np.zeros((len(GLOBAL_PROV_TO_IDX), 19), dtype=np.float32)
     state_info = turn_data['state']
     units = state_info.get('units', {})
     centers = state_info.get('centers', {})
 
     for power, unit_list in units.items():
-        if power not in GLOBAL_POWER_TO_IDX: continue
-        power_idx = GLOBAL_POWER_TO_IDX[power] # Fixed to ensure alignment
+        power_upper = power.upper()
+        if power_upper not in GLOBAL_POWER_TO_IDX: continue
+        power_idx = GLOBAL_POWER_TO_IDX[power_upper] 
         for unit_str in unit_list:
-            clean_str = unit_str.replace('*', '')
+            # FORCE UPPERCASE unit string
+            clean_str = unit_str.replace('*', '').upper()
             parts = clean_str.split()
             if len(parts) >= 2:
-                u_type, u_loc = parts[0], parts[1].split('/')[0] 
+                u_type = parts[0]
+                loc_full = parts[1]
+                
+                loc_parts = loc_full.split('/')
+                u_loc = loc_parts[0]
+                coast = loc_parts[1] if len(loc_parts) > 1 else None
+
                 if u_loc in GLOBAL_PROV_TO_IDX:
                     p_idx = GLOBAL_PROV_TO_IDX[u_loc]
                     state_tensor[p_idx, power_idx] = 1.0
                     if u_type == 'A': state_tensor[p_idx, 7] = 1.0
                     elif u_type == 'F': state_tensor[p_idx, 8] = 1.0
+                    
+                    if coast == 'NC': state_tensor[p_idx, 16] = 1.0
+                    elif coast == 'SC': state_tensor[p_idx, 17] = 1.0
+                    elif coast == 'EC': state_tensor[p_idx, 18] = 1.0
 
     for power, sc_list in centers.items():
-        if power not in GLOBAL_POWER_TO_IDX: continue
-        power_idx = GLOBAL_POWER_TO_IDX[power]
+        power_upper = power.upper()
+        if power_upper not in GLOBAL_POWER_TO_IDX: continue
+        power_idx = GLOBAL_POWER_TO_IDX[power_upper]
         for sc in sc_list:
-            if sc in GLOBAL_PROV_TO_IDX:
-                p_idx = GLOBAL_PROV_TO_IDX[sc]
+            # FORCE UPPERCASE center string
+            sc_upper = sc.upper()
+            if sc_upper in GLOBAL_PROV_TO_IDX:
+                p_idx = GLOBAL_PROV_TO_IDX[sc_upper]
                 state_tensor[p_idx, 9 + power_idx] = 1.0
                 
     return state_tensor
@@ -439,7 +465,7 @@ if __name__ == "__main__":
                 
             actions_to_send = {}
             for agent in active_agents:
-                # Shape: (1, History, 81, 16)
+                # Shape: (1, History, 82, 19)
                 agent_obs = torch.tensor(obs[agent], device=device).unsqueeze(0)
                 batch_size = agent_obs.size(0) # FIXED: Define batch_size
                 

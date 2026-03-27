@@ -12,8 +12,9 @@ from torchrl.data import (
     Composite,
     UnboundedContinuous,
     UnboundedDiscrete,
-    Discrete  # <-- Changed here
+    Categorical  # <-- The new class for discrete/boolean spaces
 )
+from diplomacy_helpers import DiplomacyTransformer, DiplomacyTransformerEnv
 
 # You will need to wrap your existing env to output TensorDicts.
 class TorchRLDiplomacyEnv(EnvBase):
@@ -21,14 +22,17 @@ class TorchRLDiplomacyEnv(EnvBase):
         super().__init__(device=device)
         self.inner_env = DiplomacyTransformerEnv(history_length=history_length)
         
-        # Hardcoding environment constants based on your previous code
-        self.num_agents = 7
+        # Dynamically pull constants directly from your custom engine
+        self.num_agents = len(self.inner_env.possible_agents)
         self.history_length = history_length
-        self.num_provs = 81
-        self.vocab_size = 1200
-        self.obs_dim = 16 
+        self.num_provs = self.inner_env.num_provinces  # <--- This fixes the 81 vs 82 mismatch!
+        self.vocab_size = self.inner_env.vocab_size
         
-        # Consistent agent ordering is mandatory for Tensor stacking
+        # Peek at a dummy observation to get the exact feature dimension (usually 16)
+        dummy_obs, _ = self.inner_env.reset()
+        first_agent = list(dummy_obs.keys())[0]
+        self.obs_dim = dummy_obs[first_agent].shape[-1] 
+        
         self.agent_names = self.inner_env.possible_agents 
         
         self._make_specs()
@@ -52,7 +56,8 @@ class TorchRLDiplomacyEnv(EnvBase):
         # 2. Action Spec (81 provinces)
         self.action_spec = Composite({
             "agents": Composite({
-                "action": UnboundedDiscrete(
+                "action": Categorical(
+                    n=self.vocab_size, # <-- Bounds random actions to 0-1199
                     shape=(self.num_agents, self.num_provs),
                     dtype=torch.int64,
                 )
@@ -71,11 +76,11 @@ class TorchRLDiplomacyEnv(EnvBase):
 
         # 4. Done Spec (TorchRL needs both root-level and agent-level dones)
         self.done_spec = Composite({
-            "done": Discrete(n=2, shape=(1,), dtype=torch.bool),
-            "terminated": Discrete(n=2, shape=(1,), dtype=torch.bool),
+            "done": Categorical(n=2, shape=(1,), dtype=torch.bool),
+            "terminated": Categorical(n=2, shape=(1,), dtype=torch.bool),
             "agents": Composite({
-                "done": Discrete(n=2, shape=(self.num_agents, 1), dtype=torch.bool),
-                "terminated": Discrete(n=2, shape=(self.num_agents, 1), dtype=torch.bool),
+                "done": Categorical(n=2, shape=(self.num_agents, 1), dtype=torch.bool),
+                "terminated": Categorical(n=2, shape=(self.num_agents, 1), dtype=torch.bool),
             })
         })
 
@@ -156,6 +161,19 @@ class TorchRLDiplomacyEnv(EnvBase):
     def _set_seed(self, seed):
         pass # Handle inner env seeding if necessary
 
+def rebuild_dense_mask(sparse_masks, num_provs, vocab_size, device):
+    batch_size = sparse_masks.size(0)
+    valid_mask = sparse_masks != -1
+    
+    row_offsets = torch.arange(batch_size, device=device).unsqueeze(1) * (num_provs * vocab_size)
+    global_indices = sparse_masks + row_offsets
+    valid_global_indices = global_indices[valid_mask]
+    
+    batch_mask_flat = torch.zeros(batch_size * num_provs * vocab_size, dtype=torch.bool, device=device)
+    batch_mask_flat[valid_global_indices] = True
+    
+    return batch_mask_flat.view(batch_size, num_provs, vocab_size)
+
 class DiplomacyAutoregressiveActor(nn.Module):
     def __init__(self, base_net, num_provs, vocab_size):
         super().__init__()
@@ -218,30 +236,27 @@ def main():
     EPOCHS = 4
 
     # 1. Initialize Environments Asynchronously
-    # ParallelEnv creates subprocesses automatically, replacing SubprocVecDiplomacy
-    test_env = TorchRLDiplomacyEnv()
-    check_env_specs(test_env) # Will throw an error if shapes/dtypes don't match exactly!
-    print("Environment specs verified successfully!")
     make_env = lambda: TorchRLDiplomacyEnv(history_length=3, device="cpu")
     parallel_env = ParallelEnv(NUM_ENVS, make_env)
 
-    # 2. Initialize Networks
-    base_net = DiplomacyTransformer(num_provinces=81, history_length=3, vocab_size=1200).to(device)
-    
-    actor_module = DiplomacyAutoregressiveActor(base_net, num_provs=81, vocab_size=1200)
-    value_module = DiplomacyValue(base_net)
+    # dynamically get sizes from a dummy env so we don't hardcode 81 or 1200
+    dummy_env = DiplomacyTransformerEnv()
+    MAP_PROVINCES = dummy_env.num_provinces
+    VOCAB_SIZE = dummy_env.vocab_size
 
-    # Wrap in TensorDictModules so TorchRL knows where to pull inputs and push outputs
-    actor = TensorDictModule(
-        actor_module,
-        in_keys=[("agents", "observation"), ("agents", "action_mask")],
-        out_keys=[("agents", "action"), ("agents", "sample_log_prob")]
-    )
+    # 2. Initialize Networks
+    base_net = DiplomacyTransformer(
+        num_provinces=MAP_PROVINCES, 
+        history_length=3, 
+        vocab_size=VOCAB_SIZE
+    ).to(device)
     
-    value = ValueOperator(
-        module=value_module,
-        in_keys=[("agents", "observation")]
+    actor_module = DiplomacyAutoregressiveActor(
+        base_net, 
+        num_provs=MAP_PROVINCES, 
+        vocab_size=VOCAB_SIZE
     )
+    value_module = DiplomacyValue(base_net)
 
     # 3. Setup Async Data Collector
     # This replaces your massive manual zero-tensors and rollout loop

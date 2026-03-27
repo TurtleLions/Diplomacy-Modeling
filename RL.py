@@ -9,6 +9,7 @@ import torch.distributed as dist
 from torch.nn.parallel import DistributedDataParallel as DDP
 import time
 from torch.utils.tensorboard import SummaryWriter
+import datetime
 
 from diplomacy_helpers import DiplomacyTransformer, DiplomacyTransformerEnv
 
@@ -173,18 +174,6 @@ if __name__ == "__main__":
     # Now all 4 ranks can safely initialize their environments.
     # Ranks 1, 2, and 3 will instantly load from the cache Rank 0 just built.
     dummy_env = DiplomacyTransformerEnv()
-    # --- DEBUG: CHECK VOCABULARY FOR COASTS ---
-    if global_rank == 0:
-        coastal_orders = [order for idx, order in dummy_env.idx_to_order.items() 
-                          if '/NC' in order or '/SC' in order or '/EC' in order]
-        print(f"\n--- DEBUG ---")
-        print(f"Total coastal orders in vocab: {len(coastal_orders)}")
-        if len(coastal_orders) > 0:
-            print(f"Sample coastal orders: {coastal_orders[:5]}")
-        else:
-            print("WARNING: 0 coastal orders found in vocabulary! Model cannot predict them.")
-        print(f"-------------\n")
-    # ------------------------------------------
     possible_agents = dummy_env.possible_agents
     MAP_PROVINCES = dummy_env.num_provinces
     VOCAB_SIZE = dummy_env.vocab_size
@@ -211,7 +200,7 @@ if __name__ == "__main__":
     optimizer = optim.Adam(net.parameters(), lr=1e-6, eps=1e-5)
 
     # --- MEMORY FIX: Rollout Buffers ---
-    b_obs = torch.zeros((NUM_STEPS, NUM_ENVS, NUM_AGENTS, HISTORY_LENGTH, MAP_PROVINCES, 16), dtype=torch.float32, device=device)
+    b_obs = torch.zeros((NUM_STEPS, NUM_ENVS, NUM_AGENTS, HISTORY_LENGTH, MAP_PROVINCES, 19), dtype=torch.float32, device=device)
     b_actions = torch.zeros((NUM_STEPS, NUM_ENVS, NUM_AGENTS, MAP_PROVINCES), dtype=torch.long, device=device)
     b_logprobs = torch.zeros((NUM_STEPS, NUM_ENVS, NUM_AGENTS), dtype=torch.float32, device=device)
     b_rewards = torch.zeros((NUM_STEPS, NUM_ENVS, NUM_AGENTS), dtype=torch.float32, device=device)
@@ -235,7 +224,13 @@ if __name__ == "__main__":
 
     if global_rank == 0:
         os.makedirs("./checkpoints", exist_ok=True)
-        writer = SummaryWriter(log_dir="./runs/diplomacy_ppo_native")
+        
+        # Generates a name like: ppo_run_20260326_123045
+        timestamp = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
+        run_name = f"ppo_run_{timestamp}"
+        
+        writer = SummaryWriter(log_dir=f"./runs/{run_name}")
+        print(f"Logging TensorBoard data to: ./runs/{run_name}")
 
     for update in range(1, num_updates + 1):
         start_time = time.time()
@@ -331,7 +326,7 @@ if __name__ == "__main__":
         returns = advantages + b_values
 
         valid = b_masks.view(-1)
-        flat_obs = b_obs.view(-1, HISTORY_LENGTH, MAP_PROVINCES, 16)[valid]
+        flat_obs = b_obs.view(-1, HISTORY_LENGTH, MAP_PROVINCES, 19)[valid]
         flat_act = b_actions.view(-1, MAP_PROVINCES)[valid]
         flat_logprobs = b_logprobs.view(-1)[valid]
         flat_adv = advantages.view(-1)[valid]

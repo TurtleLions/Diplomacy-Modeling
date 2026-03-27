@@ -85,7 +85,7 @@ class DiplomacyMemmapDataset(Dataset):
         
     def __getitem__(self, idx):
         if self.history is None:
-            self.history = np.memmap(self.history_path, dtype=np.int8, mode='r', shape=(self.total_samples, 3, self.num_provs, 16))
+            self.history = np.memmap(self.history_path, dtype=np.int8, mode='r', shape=(self.total_samples, 3, self.num_provs, 19))
             # NEW: Loading the Sparse Mask (1200 integers per sample)
             self.sparse_mask = np.memmap(self.mask_sparse_path, dtype=np.int32, mode='r', shape=(self.total_samples, 1200))
             self.targets = np.memmap(self.targets_path, dtype=np.int64, mode='r', shape=(self.total_samples, self.num_provs))
@@ -105,7 +105,7 @@ def _process_single_line(line):
         
     game_engine = Game()
     provinces = list(game_engine.map.locs)
-    history_buffer = np.zeros((3, worker_num_provs, 16), dtype=np.int8)
+    history_buffer = np.zeros((3, worker_num_provs, 19), dtype=np.int8)
     
     g_histories, g_masks, g_targets = [], [], []
     
@@ -125,7 +125,7 @@ def _process_single_line(line):
             targets = np.full(worker_num_provs, worker_none_idx, dtype=np.int64)
             
             for order_str in text_orders:
-                clean_order = order_str.replace('*', '')
+                clean_order = order_str.replace('*', '').upper()
                 parts = clean_order.split()
                 if len(parts) >= 2:
                     u_loc = parts[1].split('/')[0]
@@ -321,7 +321,7 @@ def train_worker(rank, world_size, paths_and_metadata):
                 
                 # NATIVE 16-BIT MATRIX MATH
                 with torch.autocast(device_type='cuda', dtype=torch.bfloat16):
-                    logits, _ = net(history)
+                    logits, _ = net(history, targets)
                     
                     logits_flat = logits.view(-1, vocab_size)
                     targets_flat = targets.view(-1)
