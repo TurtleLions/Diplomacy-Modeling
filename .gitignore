@@ -2,3 +2,6 @@ datasets/
 venv/
 checkpoints/
 runs/
+sf2_runs/
+wandb/
+.env

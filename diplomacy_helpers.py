@@ -11,6 +11,7 @@ import torch.optim as optim
 from torch.distributions import Categorical
 import os
 import json
+from torch.utils.checkpoint import checkpoint
 
 _DUMMY_GAME = Game()
 GLOBAL_PROVINCES = [prov.upper() for prov in list(_DUMMY_GAME.map.locs)]
@@ -71,7 +72,7 @@ class KVCacheAttentionBlock(nn.Module):
         return out, new_kv_cache
 
 class DiplomacyTransformer(nn.Module):
-    def __init__(self, input_dim=19, d_model=256, nhead=8, num_layers=8, num_provinces=82, history_length=3, vocab_size=14000):
+    def __init__(self, input_dim=25, d_model=256, nhead=8, num_layers=8, num_provinces=82, history_length=3, vocab_size=14000):
         super().__init__()
         
         self.num_provinces = num_provinces
@@ -101,8 +102,8 @@ class DiplomacyTransformer(nn.Module):
         self.action_head = nn.Linear(d_model, vocab_size)
 
         # PRE-COMPUTE INDICES
-        p_idx = torch.arange(num_provinces).unsqueeze(0).unsqueeze(0).expand(1, history_length, -1)
-        t_idx = torch.arange(history_length).unsqueeze(0).unsqueeze(-1).expand(1, -1, num_provinces)
+        p_idx = torch.arange(num_provinces).unsqueeze(0).unsqueeze(0).expand(1, history_length, -1).clone()
+        t_idx = torch.arange(history_length).unsqueeze(0).unsqueeze(-1).expand(1, -1, num_provinces).clone()
         self.register_buffer('prov_indices', p_idx)
         self.register_buffer('time_indices', t_idx)
 
@@ -119,7 +120,11 @@ class DiplomacyTransformer(nn.Module):
         x_emb = x_proj + self.province_embedding(p_idx) + self.time_embedding(t_idx)
         
         seq_input = x_emb.reshape(batch_size, self.history_length * self.num_provinces, self.d_model)
-        transformer_out = self.transformer(seq_input)
+        transformer_out = checkpoint(
+            self.transformer, 
+            seq_input, 
+            use_reentrant=False
+        )
         
         out_reshaped = transformer_out.reshape(batch_size, self.history_length, self.num_provinces, self.d_model)
         current_state_repr = out_reshaped[:, 0, :, :] 
@@ -158,7 +163,11 @@ class DiplomacyTransformer(nn.Module):
         shifted_emb = torch.cat([start_emb, action_emb], dim=1)
         
         decoder_input = shifted_emb + state_repr
-        decoder_out, _ = self.causal_decoder_block(decoder_input, kv_cache=None)
+        def decoder_wrapper(inp):
+            out, _ = self.causal_decoder_block(inp, kv_cache=None)
+            return out
+
+        decoder_out = checkpoint(decoder_wrapper, decoder_input, use_reentrant=False)
         
         action_logits = self.action_head(decoder_out)
         return action_logits, state_value
@@ -276,8 +285,8 @@ class DiplomacyTransformerEnv(ParallelEnv):
         self.vocab_size = len(self.order_to_idx)
         
         # 2. State history buffer to feed the Transformer
-        # Shape: (History_Length, 82 Provinces, 19 Features)
-        self.state_history = np.zeros((self.history_length, self.num_provinces, 19), dtype=np.float32)
+        # Shape: (History_Length, 82 Provinces, 25 Features)
+        self.state_history = np.zeros((self.history_length, self.num_provinces, 25), dtype=np.float32)
 
     def _update_history(self, new_state_tensor):
         # Roll the history buffer backward (oldest state drops out)
@@ -291,10 +300,10 @@ class DiplomacyTransformerEnv(ParallelEnv):
         self.step_count = 0
         
         # Clear history buffer with zeros
-        self.state_history = np.zeros((self.history_length, self.num_provinces, 19), dtype=np.float32)
+        self.state_history = np.zeros((self.history_length, self.num_provinces, 25), dtype=np.float32)
         
         # Get first state and update history
-        obs_tensor = parse_state_to_tensor({'state': self.game.get_state()})
+        obs_tensor = parse_state_to_tensor({'name': self.game.get_current_phase(), 'state': self.game.get_state()})
         self._update_history(obs_tensor)
         
         # All agents receive the exact same global history tensor
@@ -329,7 +338,7 @@ class DiplomacyTransformerEnv(ParallelEnv):
         self.game.process()
         
         # --- UPDATE STATE & HISTORY ---
-        new_obs_tensor = parse_state_to_tensor({'state': self.game.get_state()})
+        new_obs_tensor = parse_state_to_tensor({'name': self.game.get_current_phase(), 'state': self.game.get_state()})
         self._update_history(new_obs_tensor)
         observations = {a: self.state_history.copy() for a in self.agents}
         
@@ -392,9 +401,42 @@ class DiplomacyTransformerEnv(ParallelEnv):
         return observations, rewards, terminations, {a: False for a in self.agents}, infos
 
 def parse_state_to_tensor(turn_data):
-    # Increase feature dimension to 19 to support NC, SC, and EC
-    state_tensor = np.zeros((len(GLOBAL_PROV_TO_IDX), 19), dtype=np.float32)
-    state_info = turn_data['state']
+    # Increase dimension from 19 to 25 for Phase & Time Encoding
+    state_tensor = np.zeros((len(GLOBAL_PROV_TO_IDX), 25), dtype=np.float32)
+    state_info = turn_data.get('state', {})
+    
+    # --- NEW: GLOBAL PHASE & YEAR ENCODING ---
+    phase_name = turn_data.get('name', 'S1901M') # Fetch the phase string
+    
+    is_m, is_r, is_a, is_spring, is_fall_winter, norm_year = 1.0, 0.0, 0.0, 1.0, 0.0, 0.0
+    
+    if len(phase_name) >= 6:
+        season = phase_name[0].upper()
+        year_str = phase_name[1:5]
+        p_type = phase_name[-1].upper()
+        
+        is_m = 1.0 if p_type == 'M' else 0.0
+        is_r = 1.0 if p_type == 'R' else 0.0
+        is_a = 1.0 if p_type == 'A' else 0.0
+        is_spring = 1.0 if season == 'S' else 0.0
+        is_fall_winter = 1.0 if season in ['F', 'W'] else 0.0
+        
+        try:
+            # Normalize the year: 1901 = 0.0, 1921+ = 1.0
+            year = int(year_str)
+            norm_year = min(max((year - 1901) / 20.0, 0.0), 1.0)
+        except ValueError:
+            pass
+            
+    # Broadcast these 6 time/phase features to EVERY province
+    state_tensor[:, 19] = is_m
+    state_tensor[:, 20] = is_r
+    state_tensor[:, 21] = is_a
+    state_tensor[:, 22] = is_spring
+    state_tensor[:, 23] = is_fall_winter
+    state_tensor[:, 24] = norm_year
+    # -----------------------------------------
+
     units = state_info.get('units', {})
     centers = state_info.get('centers', {})
 
@@ -403,7 +445,6 @@ def parse_state_to_tensor(turn_data):
         if power_upper not in GLOBAL_POWER_TO_IDX: continue
         power_idx = GLOBAL_POWER_TO_IDX[power_upper] 
         for unit_str in unit_list:
-            # FORCE UPPERCASE unit string
             clean_str = unit_str.replace('*', '').upper()
             parts = clean_str.split()
             if len(parts) >= 2:
@@ -429,7 +470,6 @@ def parse_state_to_tensor(turn_data):
         if power_upper not in GLOBAL_POWER_TO_IDX: continue
         power_idx = GLOBAL_POWER_TO_IDX[power_upper]
         for sc in sc_list:
-            # FORCE UPPERCASE center string
             sc_upper = sc.upper()
             if sc_upper in GLOBAL_PROV_TO_IDX:
                 p_idx = GLOBAL_PROV_TO_IDX[sc_upper]
@@ -465,7 +505,7 @@ if __name__ == "__main__":
                 
             actions_to_send = {}
             for agent in active_agents:
-                # Shape: (1, History, 82, 19)
+                # Shape: (1, History, 82, 25)
                 agent_obs = torch.tensor(obs[agent], device=device).unsqueeze(0)
                 batch_size = agent_obs.size(0) # FIXED: Define batch_size
                 

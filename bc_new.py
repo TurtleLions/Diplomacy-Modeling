@@ -85,7 +85,7 @@ class DiplomacyMemmapDataset(Dataset):
         
     def __getitem__(self, idx):
         if self.history is None:
-            self.history = np.memmap(self.history_path, dtype=np.int8, mode='r', shape=(self.total_samples, 3, self.num_provs, 19))
+            self.history = np.memmap(self.history_path, dtype=np.int8, mode='r', shape=(self.total_samples, 3, self.num_provs, 25))
             # NEW: Loading the Sparse Mask (1200 integers per sample)
             self.sparse_mask = np.memmap(self.mask_sparse_path, dtype=np.int32, mode='r', shape=(self.total_samples, 1200))
             self.targets = np.memmap(self.targets_path, dtype=np.int64, mode='r', shape=(self.total_samples, self.num_provs))
@@ -105,7 +105,7 @@ def _process_single_line(line):
         
     game_engine = Game()
     provinces = list(game_engine.map.locs)
-    history_buffer = np.zeros((3, worker_num_provs, 19), dtype=np.int8)
+    history_buffer = np.zeros((3, worker_num_provs, 25), dtype=np.int8)
     
     g_histories, g_masks, g_targets = [], [], []
     
