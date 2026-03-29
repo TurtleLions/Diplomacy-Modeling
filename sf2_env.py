@@ -26,10 +26,14 @@ class SF2DiplomacyEnv(gym.Env):
         )
 
     def _format_outputs(self, obs_dict, rewards_dict, terms_dict, infos_dict):
-        # SF2 requires LISTS of length `num_agents`, maintaining a strict agent order
         obs_list, reward_list, done_list, info_list = [], [], [], []
         
+        # 1. Determine if the global game is over
+        # If any alive agent triggers a termination, the whole board is resetting.
+        is_global_done = any(terms_dict.values()) or self.env.step_count >= 150
+        
         for agent in self.env.possible_agents:
+            info = {}
             if agent in self.env.agents:
                 # Agent is alive
                 agent_obs = {
@@ -39,30 +43,32 @@ class SF2DiplomacyEnv(gym.Env):
                 reward = float(rewards_dict.get(agent, 0.0))
                 done = terms_dict.get(agent, False)
                 
-                # --- NEW: CUSTOM TENSORBOARD LOGGING ---
-                sc_count = len(self.env.game.get_centers(agent))
-                info = {
-                    "episode_extra_stats": {
+                if done: # Game ended while they were alive
+                    sc_count = len(self.env.game.get_centers(agent))
+                    info["episode_extra_stats"] = {
                         "supply_centers": sc_count
                     }
-                }
-                # ---------------------------------------
             else:
-                # Agent is eliminated
+                # Agent is eliminated (Zombie State)
                 agent_obs = {
                     "obs": np.zeros(self.observation_space['obs'].shape, dtype=np.float32),
                     "action_mask": np.full(1200, -1, dtype=np.int32)
                 }
                 reward = 0.0
-                done = True
-                info = {} # Dead agents don't log stats
+                
+                # IMPORTANT: Only flag as done when the whole board resets!
+                done = is_global_done 
+                
+                if done: # Game ended, they finished with nothing
+                    info["episode_extra_stats"] = {
+                        "supply_centers": 0 
+                    }
 
             obs_list.append(agent_obs)
             reward_list.append(reward)
             done_list.append(done)
             info_list.append(info)
             
-        # SF2 unpacks: obs, rewards, dones, truncations, infos
         return obs_list, reward_list, done_list, [False]*self.num_agents, info_list
 
     def reset(self, **kwargs):
@@ -82,4 +88,23 @@ class SF2DiplomacyEnv(gym.Env):
                 
         obs_dict, rewards_dict, terms_dict, truncs_dict, infos_dict = self.env.step(action_dict)
              
-        return self._format_outputs(obs_dict, rewards_dict, terms_dict, infos_dict)
+        # Format the outputs of the turn that just finished
+        obs_list, reward_list, done_list, trunc_list, info_list = self._format_outputs(obs_dict, rewards_dict, terms_dict, infos_dict)
+        
+        # --- THE AUTO-RESET FIX ---
+        # If every agent is reporting that the game is over, wipe the board!
+        if all(done_list):
+            new_obs_dict, new_infos_dict = self.env.reset()
+            
+            # Format the completely fresh 1901 starting board
+            dummy_rewards = {a: 0.0 for a in self.env.possible_agents}
+            dummy_terms = {a: False for a in self.env.possible_agents}
+            new_obs_list, _, _, _, _ = self._format_outputs(new_obs_dict, dummy_rewards, dummy_terms, new_infos_dict)
+            
+            # Swap out the observations!
+            # Sample Factory will receive the "Game Over" rewards and stats, 
+            # but the actual observations passed to the neural network will be a brand new game.
+            obs_list = new_obs_list
+        # --------------------------
+        
+        return obs_list, reward_list, done_list, trunc_list, info_list

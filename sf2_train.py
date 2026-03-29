@@ -32,8 +32,10 @@ def main():
     # FIXED: Added [1:] to sys.argv to ignore the script name
     argv = sys.argv[1:] + [
         "--env=diplomacy_transformer_v0",
-        "--experiment=diplomacy_run_01_async",
-        "--train_dir=./sf2_runs",
+        "--experiment=diplomacy_run_02_async",
+        "--train_dir=/data/restanislao/sf2_runs",
+        "--save_every_sec=600", # Save every 30 minutes instead of every 2 mins
+        "--keep_checkpoints=100",  # Only keep the newest weights per policy
         
         # --- WANDB INTEGRATION ---
         "--with_wandb=True",
@@ -42,10 +44,15 @@ def main():
         "--wandb_group=PBT_Run_01",
         
         # --- CLUSTER SCALING ---
-        "--num_workers=24",          
-        "--num_envs_per_worker=4",   
+        "--num_workers=16",          
+        "--num_envs_per_worker=2",   
         "--device=gpu",              
         
+        # --- SAFETY OVERRIDES ---
+        "--heartbeat_interval=60",             # Give the GPU more time to breathe
+        "--heartbeat_reporting_interval=600",  # Don't kill the script unless 10 minutes pass without a ping
+        
+
         # --- PBT (MULTI-GPU EVOLUTION) ---
         "--num_policies=4",          
         "--with_pbt=True",
@@ -53,20 +60,31 @@ def main():
         "--pbt_start_mutation=2000000",    
         "--pbt_replace_fraction=0.3",      
         "--pbt_mutation_rate=0.15",        
-        "--pbt_optimize_gamma=False",      
+        "--pbt_target_objective=episode_extra_stats/supply_centers",
+        "--pbt_optimize_gamma=False",
+        
+        # How much to multiply the hyperparameters by when mutating (e.g., lr * 1.1)
+        "--pbt_perturb_min=1.1",
+        "--pbt_perturb_max=1.5",
         
         # --- PPO & BATCHING ---
         "--rollout=128",             
-        "--batch_size=2048",         
-        "--num_batches_per_epoch=64", 
+        "--batch_size=512",         
+        "--num_batches_per_epoch=24", 
         "--num_epochs=4",            
         "--learning_rate=1e-5",
+        "--use_rnn=False",
+
+        # --- TRAINING LENGTH ---
+        # Run for 100 million environment steps before shutting down
+        "--train_for_env_steps=50000000",
         
         # --- CUSTOM TRANSFORMER VARIABLES ---
         "--vocab_size=22231",        
         "--history_length=3",
         "--adaptive_stddev=True",
         "--continuous_tanh_scale=0.0"
+
     ]
     
     parser, partial_cfg = parse_sf_args(argv=argv)
