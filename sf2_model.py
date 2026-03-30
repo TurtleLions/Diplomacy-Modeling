@@ -64,25 +64,26 @@ class DiplomacyAutoregressiveDistribution:
         batch_size = self.state_repr.size(0)
         return torch.zeros(batch_size, device=self.state_repr.device)
 
+class DummyOldDist:
+    def __init__(self, raw_logits_buffer):
+        # Extract the stashed log probs from the first column of the dummy tensor
+        self.old_log_probs = raw_logits_buffer[:, 0]
+
+    def log_prob(self, actions):
+        # Return the exact log probs from the rollout
+        return self.old_log_probs
+
+    def entropy(self):
+        # PPO does not use the old distribution's entropy for gradients
+        return torch.zeros_like(self.old_log_probs)
+
 class DiplomacyActionParameterization(nn.Module):
-    """Forces Sample Factory to use our custom distribution instead of its defaults."""
     def __init__(self, vocab_size):
         super().__init__()
         self.vocab_size = vocab_size
 
     def get_action_distribution(self, action_logits):
-        """
-        Sample Factory calls this during PPO updates to rebuild the 'old' policy from the buffer.
-        We stored the raw logits in the buffer during forward_tail!
-        """
-        batch_size = action_logits.size(0)
-        num_provinces = 82
-        
-        class DummyOldDist:
-            def __init__(self, raw_logits, v_size):
-                self.logits = raw_logits.view(batch_size, num_provinces, v_size)
-
-        return DummyOldDist(action_logits, self.vocab_size)
+        return DummyOldDist(action_logits)
 
 
 class DiplomacySF2Model(ActorCritic):
@@ -143,10 +144,19 @@ class DiplomacySF2Model(ActorCritic):
         
         if "actions" not in normalized_obs_dict:
             actions = self._dist.sample()
+            log_probs = self._dist.log_prob(actions)
+            
             result["actions"] = actions
-            result["log_prob_actions"] = self._dist.log_prob(actions)
+            result["log_prob_actions"] = log_probs
+            
+            # --- THE FIX ---
+            # Stash the log_probs into the dummy tensor so it gets saved to the buffer safely
+            dummy_logits = torch.zeros(obs.size(0), self.num_provinces * 2, device=obs.device)
+            dummy_logits[:, 0] = log_probs
+            result["action_logits"] = dummy_logits
             
         return result
+            
 
     def forward_head(self, normalized_obs_dict, **kwargs):
         """Used by the Learner. Single-threaded, so saving state here is safe."""
@@ -181,12 +191,17 @@ class DiplomacySF2Model(ActorCritic):
 
         if sample_actions:
             actions = self._dist.sample()
+            log_probs = self._dist.log_prob(actions)
+            
             result["actions"] = actions
-            result["log_prob_actions"] = self._dist.log_prob(actions)
+            result["log_prob_actions"] = log_probs
 
-        # MANDATORY FOR MEMORY: Return a tiny dummy tensor to satisfy the Box shape.
-        # Do not return self._dist.logits, as it will overflow the buffer and crash the workers.
-        result["action_logits"] = torch.zeros(state_repr.size(0), self.num_provinces * 2, device=state_repr.device)
+            # --- THE FIX ---
+            dummy_logits = torch.zeros(state_repr.size(0), self.num_provinces * 2, device=state_repr.device)
+            dummy_logits[:, 0] = log_probs
+            result["action_logits"] = dummy_logits
+        else:
+            result["action_logits"] = torch.zeros(state_repr.size(0), self.num_provinces * 2, device=state_repr.device)
 
         return result
 

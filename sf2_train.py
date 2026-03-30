@@ -34,7 +34,7 @@ def main():
     # FIXED: Added [1:] to sys.argv to ignore the script name
     argv = sys.argv[1:] + [
         "--env=diplomacy_transformer_v0",
-        "--experiment=diplomacy_run_05_async",
+        "--experiment=diplomacy_run_06_async",
         "--train_dir=/data/restanislao/sf2_runs",
         "--save_every_sec=600", # Save every 30 minutes instead of every 2 mins
         "--keep_checkpoints=100",  # Only keep the newest weights per policy
