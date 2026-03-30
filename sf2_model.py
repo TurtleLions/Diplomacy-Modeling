@@ -40,8 +40,12 @@ class DiplomacyAutoregressiveDistribution:
         actions = actions.long()
         # When SF2 calculates losses, it passes the true actions here for teacher forcing
         if self.logits is None:
-            self.logits = self.transformer.decode_full(self.state_repr, actions)
-            self.logits = self.logits.masked_fill(~self.dense_mask, -1e4)
+            # --- FIX: FORCE LEARNER INTO 16-BIT NATIVE MATH ---
+            with torch.autocast(device_type='cuda', dtype=torch.bfloat16):
+                raw_logits = self.transformer.decode_full(self.state_repr, actions)
+            
+            # Cast back to float32 right before the Categorical distribution 
+            self.logits = raw_logits.float().masked_fill(~self.dense_mask, -1e4)
 
         dist = Categorical(logits=self.logits)
         return dist.log_prob(actions).sum(dim=-1)
@@ -95,7 +99,7 @@ class DiplomacySF2Model(ActorCritic):
         self.history_length = cfg.history_length
         
         self.transformer = DiplomacyTransformer(
-            input_dim=25, 
+            input_dim=39, 
             num_provinces=self.num_provinces, 
             history_length=self.history_length, 
             vocab_size=self.vocab_size
@@ -104,7 +108,7 @@ class DiplomacySF2Model(ActorCritic):
         bc_weights_path = "diplomacy_transformer_bc.pth"
         if os.path.exists(bc_weights_path):
             state_dict = torch.load(bc_weights_path, map_location="cpu")
-            self.transformer.load_state_dict(state_dict, strict=False)
+            self.transformer.load_state_dict(state_dict, strict=True)
             print(f"Successfully loaded BC weights from {bc_weights_path}")
         else:
             print("WARNING: BC weights not found. Starting from random initialization.")

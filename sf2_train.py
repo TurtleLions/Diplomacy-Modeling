@@ -34,7 +34,7 @@ def main():
     # FIXED: Added [1:] to sys.argv to ignore the script name
     argv = sys.argv[1:] + [
         "--env=diplomacy_transformer_v0",
-        "--experiment=diplomacy_run_03_async",
+        "--experiment=diplomacy_run_05_async",
         "--train_dir=/data/restanislao/sf2_runs",
         "--save_every_sec=600", # Save every 30 minutes instead of every 2 mins
         "--keep_checkpoints=100",  # Only keep the newest weights per policy
@@ -46,8 +46,8 @@ def main():
         "--wandb_group=PBT_Run_01",
         
         # --- CLUSTER SCALING ---
-        "--num_workers=8",          
-        "--num_envs_per_worker=4",   
+        "--num_workers=24",          
+        "--num_envs_per_worker=2",   
         "--device=gpu",              
         
         # --- SAFETY OVERRIDES ---
@@ -56,8 +56,8 @@ def main():
         
 
         # --- PBT (MULTI-GPU EVOLUTION) ---
-        "--num_policies=4",          
-        "--with_pbt=True",
+        "--num_policies=1",          
+        "--with_pbt=False",
         "--pbt_period_env_steps=500000",   
         "--pbt_start_mutation=2000000",    
         "--pbt_replace_fraction=0.3",      
@@ -70,10 +70,9 @@ def main():
         "--pbt_perturb_max=1.15", # 15% maximum mutation
         
         # --- PPO & BATCHING ---
-        "--rollout=128",             
+        "--rollout=64",             
         "--batch_size=512",         
-        "--num_batches_per_epoch=8", 
-        "--num_epochs=4",            
+        "--num_epochs=2",            
         "--learning_rate=1e-5",
         "--use_rnn=False",
         "--max_grad_norm=1.0",

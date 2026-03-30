@@ -13,7 +13,7 @@ class SF2DiplomacyEnv(gym.Env):
         
         # SF2 Dict Space mapping
         self.observation_space = gym.spaces.Dict({
-            "obs": gym.spaces.Box(low=0.0, high=1.0, shape=(3, self.num_provinces, 25), dtype=np.float32),
+            "obs": gym.spaces.Box(low=0.0, high=1.0, shape=(3, self.num_provinces, 39), dtype=np.float32),
             "action_mask": gym.spaces.Box(low=-1, high=self.vocab_size, shape=(1200,), dtype=np.int32)
         })
         
@@ -27,42 +27,32 @@ class SF2DiplomacyEnv(gym.Env):
 
     def _format_outputs(self, obs_dict, rewards_dict, terms_dict, infos_dict):
         obs_list, reward_list, done_list, info_list = [], [], [], []
-        
-        # 1. Determine if the global game is over
-        # If any alive agent triggers a termination, the whole board is resetting.
         is_global_done = any(terms_dict.values()) or self.env.step_count >= 150
         
         for agent in self.env.possible_agents:
             info = {}
-            if agent in self.env.agents:
-                # Agent is alive
+            # FIX: Check if they were alive at the START of the step
+            if agent in rewards_dict:
                 agent_obs = {
                     "obs": obs_dict[agent].astype(np.float32),
                     "action_mask": infos_dict[agent]['action_mask'].astype(np.int32)
                 }
-                reward = float(rewards_dict.get(agent, 0.0))
+                reward = float(rewards_dict[agent])
                 done = terms_dict.get(agent, False)
                 
-                if done: # Game ended while they were alive
+                if done: 
                     sc_count = len(self.env.game.get_centers(agent))
-                    info["episode_extra_stats"] = {
-                        "supply_centers": sc_count
-                    }
+                    info["episode_extra_stats"] = {"supply_centers": sc_count}
             else:
-                # Agent is eliminated (Zombie State)
+                # Zombie State
                 agent_obs = {
                     "obs": np.full(self.observation_space['obs'].shape, 1e-6, dtype=np.float32),
                     "action_mask": np.full(1200, -1, dtype=np.int32)
                 }
                 reward = 0.0
-                
-                # IMPORTANT: Only flag as done when the whole board resets!
                 done = is_global_done 
-                
-                if done: # Game ended, they finished with nothing
-                    info["episode_extra_stats"] = {
-                        "supply_centers": 0 
-                    }
+                if done: 
+                    info["episode_extra_stats"] = {"supply_centers": 0}
 
             obs_list.append(agent_obs)
             reward_list.append(reward)

@@ -434,32 +434,33 @@ class DiplomacyTransformerEnv(ParallelEnv):
                         if u_loc in all_map_scs and u_loc not in current_scs:
                             rewards[agent] += 1.0 
                             
-                # 4. The Coordinated Support Engine
+            # 4. The Coordinated Support Engine
+            if prev_phase_type == 'M':
                 support_count = 0
                 for order_idx in actions[agent]:
                     order_str = self.idx_to_order[int(order_idx)]
                     
                     if ' S ' in order_str:
                         # Split the string to get exactly what we are supporting
-                        # Example: 'A PAR S A MAR - BUR' -> supported_part = 'A MAR - BUR'
-                        supported_part = order_str.split(' S ')[1]
-                        
-                        if '-' in supported_part:
-                            # 1. Support to Move
-                            # The target unit MUST have issued this EXACT movement order.
-                            target_loc = supported_part.split()[1].split('/')[0]
-                            if global_orders.get(target_loc) == supported_part:
-                                support_count += 1
-                        else:
-                            # 2. Support to Hold
-                            # The target unit MUST NOT be moving. 
-                            # (Holding, Supporting, Convoying, or defaulting to NONE are all valid targets).
-                            target_loc = supported_part.split()[1].split('/')[0]
-                            target_actual_order = global_orders.get(target_loc, "")
+                        parts = order_str.split(' S ')
+                        if len(parts) > 1:
+                            supported_part = parts[1]
+                            supp_parts = supported_part.split()
                             
-                            if target_actual_order == "" or '-' not in target_actual_order:
-                                support_count += 1
+                            # SAFETY CHECK: Ensure the string actually has a unit type and location
+                            if len(supp_parts) >= 2:
+                                target_loc = supp_parts[1].split('/')[0]
                                 
+                                if '-' in supported_part:
+                                    # 1. Support to Move
+                                    if global_orders.get(target_loc) == supported_part:
+                                        support_count += 1
+                                else:
+                                    # 2. Support to Hold
+                                    target_actual_order = global_orders.get(target_loc, "")
+                                    if target_actual_order == "" or '-' not in target_actual_order:
+                                        support_count += 1
+                                        
                 if support_count > 0:
                     rewards[agent] += (support_count * 0.1)
                     
