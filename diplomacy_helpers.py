@@ -20,6 +20,16 @@ GLOBAL_PROV_TO_IDX = {prov: i for i, prov in enumerate(GLOBAL_PROVINCES)}
 GLOBAL_POWERS = ['AUSTRIA', 'ENGLAND', 'FRANCE', 'GERMANY', 'ITALY', 'RUSSIA', 'TURKEY']
 GLOBAL_POWER_TO_IDX = {power: i for i, power in enumerate(GLOBAL_POWERS)}
 
+GLOBAL_HSCS = {
+    'AUSTRIA': ['VIE', 'BUD', 'TRI'],
+    'ENGLAND': ['LON', 'EDI', 'LVP'],
+    'FRANCE': ['PAR', 'MAR', 'BRE'],
+    'GERMANY': ['BER', 'MUN', 'KIE'],
+    'ITALY': ['ROM', 'VEN', 'NAP'],
+    'RUSSIA': ['MOS', 'SEV', 'WAR', 'STP'],
+    'TURKEY': ['ANK', 'CON', 'SMY']
+}
+
 class KVCacheAttentionBlock(nn.Module):
     def __init__(self, d_model, nhead, dim_feedforward=1024):
         super().__init__()
@@ -72,7 +82,7 @@ class KVCacheAttentionBlock(nn.Module):
         return out, new_kv_cache
 
 class DiplomacyTransformer(nn.Module):
-    def __init__(self, input_dim=25, d_model=256, nhead=8, num_layers=8, num_provinces=82, history_length=3, vocab_size=14000):
+    def __init__(self, input_dim=39, d_model=256, nhead=8, num_layers=8, num_provinces=82, history_length=3, vocab_size=14000):
         super().__init__()
         
         self.num_provinces = num_provinces
@@ -294,7 +304,11 @@ class DiplomacyTransformerEnv(ParallelEnv):
         
         # 2. State history buffer to feed the Transformer
         # Shape: (History_Length, 82 Provinces, 25 Features)
-        self.state_history = np.zeros((self.history_length, self.num_provinces, 25), dtype=np.float32)
+        self.state_history = np.zeros((self.history_length, self.num_provinces, 39), dtype=np.float32)
+
+        self.stalemate_counter = 0
+        self.stalemate_threshold = 3 # Terminate if no SCs change hands for 3 years
+        self.last_year_sc_owners = {}
 
     def _update_history(self, new_state_tensor):
         # Roll the history buffer backward (oldest state drops out)
@@ -308,8 +322,11 @@ class DiplomacyTransformerEnv(ParallelEnv):
         self.step_count = 0
         
         # Clear history buffer with zeros
-        self.state_history = np.zeros((self.history_length, self.num_provinces, 25), dtype=np.float32)
+        self.state_history = np.zeros((self.history_length, self.num_provinces, 39), dtype=np.float32)
         
+        self.stalemate_counter = 0
+        self.last_year_sc_owners = {sc: a for a in self.agents for sc in self.game.get_centers(a)}
+
         # Get first state and update history
         obs_tensor = parse_state_to_tensor({'name': self.game.get_current_phase(), 'state': self.game.get_state()})
         self._update_history(obs_tensor)
@@ -331,6 +348,17 @@ class DiplomacyTransformerEnv(ParallelEnv):
         prev_units = {a: prev_state_dict['units'].get(a, []) for a in self.agents}
         prev_phase_type = self.game.get_current_phase()[-1] # Gets 'M', 'R', or 'A'
         
+        # --- NEW: MAP ALL ISSUED ORDERS THIS TURN ---
+        global_orders = {}
+        if prev_phase_type == 'M':
+            for a, action_indices in actions.items():
+                for order_idx in action_indices:
+                    o_str = self.idx_to_order[int(order_idx)]
+                    if o_str != 'NONE':
+                        # Extract the base location of the unit acting (e.g., 'A PAR - BUR' -> 'PAR')
+                        u_loc = o_str.split()[1].split('/')[0]
+                        global_orders[u_loc] = o_str
+                        
         rewards = {a: 0.0 for a in self.agents}
         
         # --- DECODE ACTIONS ---
@@ -352,54 +380,99 @@ class DiplomacyTransformerEnv(ParallelEnv):
         
         # --- REWARDS & TERMINATION ---
         is_done = False
-        if self.step_count >= 150: 
+        if self.step_count >= 100: 
             is_done = True
             
         current_state_dict = self.game.get_state()
         current_phase = self.game.get_current_phase()
         
+        # Helper: Get all SC locations on the map
+        all_map_scs = self.game.map.scs
+        
         for agent in self.agents:
             current_scs = self.game.get_centers(agent)
             prev_scs = [sc for sc, owner in prev_sc_owners.items() if owner == agent]
+            agent_units = current_state_dict['units'].get(agent, [])
             
-            # 1. The Time Tax (Instead of a survival drip)
-            # Make them bleed slightly every turn so they are forced to capture SCs to survive
+            # 1. The Time Tax (Force action)
             rewards[agent] -= 0.02
             
-            # 2. The SC Engine (Only evaluated after Fall Builds when ownership actually changes)
+            # 2. The SC Engine (Actual winter captures/losses)
             if current_phase.endswith('M') and current_phase.startswith('S') and self.step_count > 1:
-                # We are at the start of a new year. Calculate the net change in SCs from last year.
+                # Calculate normal rewards
                 sc_delta = len(current_scs) - len(prev_scs)
-                
                 if sc_delta > 0:
-                    rewards[agent] += sc_delta * 5.0  # Massive reward for actual, secured expansion
+                    rewards[agent] += sc_delta * 5.0  
                 elif sc_delta < 0:
-                    rewards[agent] += sc_delta * 5.0  # Proportionate penalty for losing ground
+                    rewards[agent] += sc_delta * 5.0  
+                
+                # --- NEW: STALEMATE DETECTOR ---
+                # We only need to run this check once per year, so we can arbitrarily assign it to the first agent in the loop
+                if agent == self.agents[0]:
+                    current_sc_owners = {sc: a for a in self.possible_agents for sc in self.game.get_centers(a)}
                     
-            # 3. The Tempo Engine (Evaluated during Movement Phases)
-            if prev_phase_type == 'M':
-                agent_units = prev_units.get(agent, [])
-                if len(agent_units) > 0:
-                    # Count proactive moves (Exclude NONE and strictly static HOLDS)
-                    proactive_moves = 0
-                    for order_idx in actions[agent]:
-                        order_str = self.idx_to_order[order_idx]
-                        # Only reward them if they are actually trying to do something active
-                        if order_str != 'NONE' and not order_str.endswith(' H'):
-                            proactive_moves += 1
-                            
-                    utilization_ratio = proactive_moves / len(agent_units)
-                    if utilization_ratio > 0.7:
-                        rewards[agent] += 0.2  
-                    elif utilization_ratio < 0.3:
-                        rewards[agent] -= 0.5  # Heavy penalty for mass sleeping/holding
+                    # If the exact map of SC ownership is identical to last year
+                    if current_sc_owners == self.last_year_sc_owners:
+                        self.stalemate_counter += 1
+                    else:
+                        # Someone gained or lost an SC, reset the clock!
+                        self.stalemate_counter = 0
+                        self.last_year_sc_owners = current_sc_owners.copy()
                         
-            # 4. Endgame Conditions
+                    if self.stalemate_counter >= self.stalemate_threshold:
+                        is_done = True
+                    
+            # 3. The Frontline / Occupation Engine (Solves the Spring Credit Assignment)
+            if prev_phase_type == 'M':
+                for unit_str in agent_units:
+                    # Parse where the unit is currently standing (e.g., "A PAR" -> "PAR")
+                    clean_str = unit_str.replace('*', '').upper()
+                    parts = clean_str.split()
+                    if len(parts) >= 2:
+                        u_loc = parts[1].split('/')[0]
+                        # If standing on an SC that they don't already own, give a dense reward
+                        if u_loc in all_map_scs and u_loc not in current_scs:
+                            rewards[agent] += 1.0 
+                            
+                # 4. The Coordinated Support Engine
+                support_count = 0
+                for order_idx in actions[agent]:
+                    order_str = self.idx_to_order[int(order_idx)]
+                    
+                    if ' S ' in order_str:
+                        # Split the string to get exactly what we are supporting
+                        # Example: 'A PAR S A MAR - BUR' -> supported_part = 'A MAR - BUR'
+                        supported_part = order_str.split(' S ')[1]
+                        
+                        if '-' in supported_part:
+                            # 1. Support to Move
+                            # The target unit MUST have issued this EXACT movement order.
+                            target_loc = supported_part.split()[1].split('/')[0]
+                            if global_orders.get(target_loc) == supported_part:
+                                support_count += 1
+                        else:
+                            # 2. Support to Hold
+                            # The target unit MUST NOT be moving. 
+                            # (Holding, Supporting, Convoying, or defaulting to NONE are all valid targets).
+                            target_loc = supported_part.split()[1].split('/')[0]
+                            target_actual_order = global_orders.get(target_loc, "")
+                            
+                            if target_actual_order == "" or '-' not in target_actual_order:
+                                support_count += 1
+                                
+                if support_count > 0:
+                    rewards[agent] += (support_count * 0.1)
+                    
+            # 5. Endgame & Draw Conditions
             if len(current_scs) >= 18:
                 rewards[agent] += 100.0
                 is_done = True
-            if len(current_scs) == 0 and len(current_state_dict['units'].get(agent, [])) == 0:
-                rewards[agent] -= 100.0  # You died.
+            elif len(current_scs) == 0 and len(agent_units) == 0:
+                rewards[agent] -= 100.0  # Annihilation
+            elif is_done:
+                # The game hit the step limit OR a Stalemate was detected. 
+                # Reward them based on how much of the board they controlled.
+                rewards[agent] += (len(current_scs) * 2.5)
 
         terminations = {a: is_done for a in self.agents}
         infos = {a: {'action_mask': get_sparse_action_mask(self.game, a, self.provinces, self.order_to_idx)} for a in self.agents}
@@ -409,18 +482,16 @@ class DiplomacyTransformerEnv(ParallelEnv):
         return observations, rewards, terminations, {a: False for a in self.agents}, infos
 
 def parse_state_to_tensor(turn_data):
-    # Increase dimension from 19 to 25 for Phase & Time Encoding
-    state_tensor = np.zeros((len(GLOBAL_PROV_TO_IDX), 25), dtype=np.float32)
+    # Dimension updated to 39
+    state_tensor = np.zeros((len(GLOBAL_PROV_TO_IDX), 39), dtype=np.float32)
     state_info = turn_data.get('state', {})
     
-    # --- NEW: GLOBAL PHASE & YEAR ENCODING ---
-    phase_name = turn_data.get('name', 'S1901M') # Fetch the phase string
+    phase_name = turn_data.get('name', 'S1901M') 
     
-    is_m, is_r, is_a, is_spring, is_fall_winter, norm_year = 1.0, 0.0, 0.0, 1.0, 0.0, 0.0
+    is_m, is_r, is_a, is_spring, is_fall_winter = 1.0, 0.0, 0.0, 1.0, 0.0
     
     if len(phase_name) >= 6:
         season = phase_name[0].upper()
-        year_str = phase_name[1:5]
         p_type = phase_name[-1].upper()
         
         is_m = 1.0 if p_type == 'M' else 0.0
@@ -428,26 +499,35 @@ def parse_state_to_tensor(turn_data):
         is_a = 1.0 if p_type == 'A' else 0.0
         is_spring = 1.0 if season == 'S' else 0.0
         is_fall_winter = 1.0 if season in ['F', 'W'] else 0.0
-        
-        try:
-            # Normalize the year: 1901 = 0.0, 1921+ = 1.0
-            year = int(year_str)
-            norm_year = min(max((year - 1901) / 20.0, 0.0), 1.0)
-        except ValueError:
-            pass
             
-    # Broadcast these 6 time/phase features to EVERY province
+    # [Indices 19-23] Phase Features
     state_tensor[:, 19] = is_m
     state_tensor[:, 20] = is_r
     state_tensor[:, 21] = is_a
     state_tensor[:, 22] = is_spring
     state_tensor[:, 23] = is_fall_winter
-    state_tensor[:, 24] = norm_year
-    # -----------------------------------------
 
     units = state_info.get('units', {})
     centers = state_info.get('centers', {})
+    dislodged = state_info.get('dislodged', {})
 
+    # [Indices 32-38] Home Supply Centers (Static map geography)
+    for power, hsc_list in GLOBAL_HSCS.items():
+        power_idx = GLOBAL_POWER_TO_IDX[power]
+        for hsc in hsc_list:
+            if hsc in GLOBAL_PROV_TO_IDX:
+                p_idx = GLOBAL_PROV_TO_IDX[hsc]
+                state_tensor[p_idx, 32 + power_idx] = 1.0
+
+    # [Indices 25-31] Build Deficits (Broadcasted globally per power)
+    for power_upper, power_idx in GLOBAL_POWER_TO_IDX.items():
+        power_scs = len(centers.get(power_upper, []))
+        power_units = len(units.get(power_upper, []))
+        # Positive = builds available, Negative = must disband
+        deficit = float(power_scs - power_units)
+        state_tensor[:, 25 + power_idx] = deficit
+
+    # [Indices 0-8, 16-18] Active Units
     for power, unit_list in units.items():
         power_upper = power.upper()
         if power_upper not in GLOBAL_POWER_TO_IDX: continue
@@ -473,6 +553,27 @@ def parse_state_to_tensor(turn_data):
                     elif coast == 'SC': state_tensor[p_idx, 17] = 1.0
                     elif coast == 'EC': state_tensor[p_idx, 18] = 1.0
 
+    # [Index 24] Dislodged Units
+    for power, unit_list in dislodged.items():
+        power_upper = power.upper()
+        if power_upper not in GLOBAL_POWER_TO_IDX: continue
+        power_idx = GLOBAL_POWER_TO_IDX[power_upper]
+        for unit_str in unit_list:
+            clean_str = unit_str.replace('*', '').upper()
+            parts = clean_str.split()
+            if len(parts) >= 2:
+                u_loc = parts[1].split('/')[0]
+                if u_loc in GLOBAL_PROV_TO_IDX:
+                    p_idx = GLOBAL_PROV_TO_IDX[u_loc]
+                    # Mark the unit's ownership and type so the model knows WHAT needs saving
+                    u_type = parts[0]
+                    state_tensor[p_idx, power_idx] = 1.0
+                    if u_type == 'A': state_tensor[p_idx, 7] = 1.0
+                    elif u_type == 'F': state_tensor[p_idx, 8] = 1.0
+                    # Flag it specifically as a dislodged unit
+                    state_tensor[p_idx, 24] = 1.0
+
+    # [Indices 9-15] Supply Centers
     for power, sc_list in centers.items():
         power_upper = power.upper()
         if power_upper not in GLOBAL_POWER_TO_IDX: continue

@@ -4,7 +4,9 @@ from sample_factory.cfg.arguments import parse_full_cfg, parse_sf_args
 from sample_factory.envs.env_utils import register_env
 from sample_factory.algo.utils.context import global_model_factory
 from sample_factory.train import run_rl
-
+import torch
+import numpy as np
+torch.serialization.add_safe_globals([np.core.multiarray.scalar])
 from sf2_env import SF2DiplomacyEnv
 from sf2_model import DiplomacySF2Model
 
@@ -32,7 +34,7 @@ def main():
     # FIXED: Added [1:] to sys.argv to ignore the script name
     argv = sys.argv[1:] + [
         "--env=diplomacy_transformer_v0",
-        "--experiment=diplomacy_run_02_async",
+        "--experiment=diplomacy_run_03_async",
         "--train_dir=/data/restanislao/sf2_runs",
         "--save_every_sec=600", # Save every 30 minutes instead of every 2 mins
         "--keep_checkpoints=100",  # Only keep the newest weights per policy
@@ -44,8 +46,8 @@ def main():
         "--wandb_group=PBT_Run_01",
         
         # --- CLUSTER SCALING ---
-        "--num_workers=16",          
-        "--num_envs_per_worker=2",   
+        "--num_workers=8",          
+        "--num_envs_per_worker=4",   
         "--device=gpu",              
         
         # --- SAFETY OVERRIDES ---
@@ -64,16 +66,17 @@ def main():
         "--pbt_optimize_gamma=False",
         
         # How much to multiply the hyperparameters by when mutating (e.g., lr * 1.1)
-        "--pbt_perturb_min=1.1",
-        "--pbt_perturb_max=1.5",
+        "--pbt_perturb_min=1.05", # 5% minimum mutation
+        "--pbt_perturb_max=1.15", # 15% maximum mutation
         
         # --- PPO & BATCHING ---
         "--rollout=128",             
         "--batch_size=512",         
-        "--num_batches_per_epoch=24", 
+        "--num_batches_per_epoch=8", 
         "--num_epochs=4",            
         "--learning_rate=1e-5",
         "--use_rnn=False",
+        "--max_grad_norm=1.0",
 
         # --- TRAINING LENGTH ---
         # Run for 100 million environment steps before shutting down

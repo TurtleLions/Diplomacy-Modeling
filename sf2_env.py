@@ -51,7 +51,7 @@ class SF2DiplomacyEnv(gym.Env):
             else:
                 # Agent is eliminated (Zombie State)
                 agent_obs = {
-                    "obs": np.zeros(self.observation_space['obs'].shape, dtype=np.float32),
+                    "obs": np.full(self.observation_space['obs'].shape, 1e-6, dtype=np.float32),
                     "action_mask": np.full(1200, -1, dtype=np.int32)
                 }
                 reward = 0.0

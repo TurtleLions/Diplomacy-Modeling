@@ -10,6 +10,7 @@ from torch.nn.parallel import DistributedDataParallel as DDP
 import time
 from torch.utils.tensorboard import SummaryWriter
 import datetime
+from gymnasium.vector import AsyncVectorEnv
 
 from diplomacy_helpers import DiplomacyTransformer, DiplomacyTransformerEnv
 
@@ -29,6 +30,7 @@ def rebuild_dense_mask(sparse_masks, num_provs, vocab_size, device):
 
 
 def worker(remote, parent_remote):
+    torch.set_num_threads(1)
     parent_remote.close()
     env = DiplomacyTransformerEnv(history_length=3) 
     while True:
@@ -154,8 +156,10 @@ if __name__ == "__main__":
     device = torch.device(f"cuda:{local_rank}")
     torch.cuda.set_device(device)
 
-    NUM_ENVS = 16 
-    NUM_STEPS = 128
+    torch.set_num_threads(1)
+
+    NUM_ENVS = 6
+    NUM_STEPS = 512
     NUM_AGENTS = 7
     HISTORY_LENGTH = 3
 
@@ -200,7 +204,7 @@ if __name__ == "__main__":
     optimizer = optim.Adam(net.parameters(), lr=1e-6, eps=1e-5)
 
     # --- MEMORY FIX: Rollout Buffers ---
-    b_obs = torch.zeros((NUM_STEPS, NUM_ENVS, NUM_AGENTS, HISTORY_LENGTH, MAP_PROVINCES, 25), dtype=torch.float32, device=device)
+    b_obs = torch.zeros((NUM_STEPS, NUM_ENVS, NUM_AGENTS, HISTORY_LENGTH, MAP_PROVINCES, 39), dtype=torch.float32, device=device)
     b_actions = torch.zeros((NUM_STEPS, NUM_ENVS, NUM_AGENTS, MAP_PROVINCES), dtype=torch.long, device=device)
     b_logprobs = torch.zeros((NUM_STEPS, NUM_ENVS, NUM_AGENTS), dtype=torch.float32, device=device)
     b_rewards = torch.zeros((NUM_STEPS, NUM_ENVS, NUM_AGENTS), dtype=torch.float32, device=device)
@@ -326,7 +330,7 @@ if __name__ == "__main__":
         returns = advantages + b_values
 
         valid = b_masks.view(-1)
-        flat_obs = b_obs.view(-1, HISTORY_LENGTH, MAP_PROVINCES, 25)[valid]
+        flat_obs = b_obs.view(-1, HISTORY_LENGTH, MAP_PROVINCES, 39)[valid]
         flat_act = b_actions.view(-1, MAP_PROVINCES)[valid]
         flat_logprobs = b_logprobs.view(-1)[valid]
         flat_adv = advantages.view(-1)[valid]
