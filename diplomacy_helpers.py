@@ -82,7 +82,7 @@ class KVCacheAttentionBlock(nn.Module):
         return out, new_kv_cache
 
 class DiplomacyTransformer(nn.Module):
-    def __init__(self, input_dim=39, d_model=256, nhead=8, num_layers=8, num_provinces=82, history_length=3, vocab_size=14000):
+    def __init__(self, input_dim=39, d_model=256, nhead=8, num_layers=8, num_provinces=82, history_length=3, vocab_size=22231):
         super().__init__()
         
         self.num_provinces = num_provinces
@@ -144,16 +144,20 @@ class DiplomacyTransformer(nn.Module):
         
         return current_state_repr, state_value
 
-    def decode_step(self, prev_action, prov_idx, state_repr, kv_cache=None):
+    def decode_step(self, prev_action, prov_indices, state_repr, kv_cache=None):
         batch_size = state_repr.size(0)
         
-        # Use the start embedding for the very first province, otherwise use the action embedding
-        if prov_idx == 0:
+        # 1. Initialize with start token ONLY on the first step when the cache is empty
+        if kv_cache is None:
             action_emb = self.start_token_embedding.expand(batch_size, -1, -1).squeeze(1)
         else:
             action_emb = self.action_embedding(prev_action)
             
-        prov_state = state_repr[:, prov_idx, :]
+        # 2. Advanced indexing to pluck out the specific active province for each batch item
+        batch_indices = torch.arange(batch_size, device=state_repr.device)
+        prov_state = state_repr[batch_indices, prov_indices, :]
+        
+        # 3. Add embeddings and decode
         decoder_input = (action_emb + prov_state).unsqueeze(1)
         
         decoder_out, new_kv_cache = self.causal_decoder_block(decoder_input, kv_cache)
