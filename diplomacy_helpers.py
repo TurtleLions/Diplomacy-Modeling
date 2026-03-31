@@ -398,7 +398,7 @@ class DiplomacyTransformerEnv(ParallelEnv):
             rewards[agent] -= 0.02
             
             # 2. The SC Engine (Actual winter captures/losses)
-            if current_phase.endswith('M') and current_phase.startswith('S') and self.step_count > 1:
+            if current_phase.startswith('F') and self.step_count > 1:
                 # Calculate normal rewards
                 sc_delta = len(current_scs) - len(prev_scs)
                 if sc_delta > 0:
@@ -432,7 +432,7 @@ class DiplomacyTransformerEnv(ParallelEnv):
                         u_loc = parts[1].split('/')[0]
                         # If standing on an SC that they don't already own, give a dense reward
                         if u_loc in all_map_scs and u_loc not in current_scs:
-                            rewards[agent] += 1.0 
+                            rewards[agent] += 0.25 
                             
             # 4. The Coordinated Support Engine
             if prev_phase_type == 'M':
@@ -441,24 +441,17 @@ class DiplomacyTransformerEnv(ParallelEnv):
                     order_str = self.idx_to_order[int(order_idx)]
                     
                     if ' S ' in order_str:
-                        # Split the string to get exactly what we are supporting
                         parts = order_str.split(' S ')
                         if len(parts) > 1:
                             supported_part = parts[1]
                             supp_parts = supported_part.split()
                             
-                            # SAFETY CHECK: Ensure the string actually has a unit type and location
                             if len(supp_parts) >= 2:
                                 target_loc = supp_parts[1].split('/')[0]
                                 
+                                # --- ONLY REWARD SUPPORT TO MOVE (Attacks) ---
                                 if '-' in supported_part:
-                                    # 1. Support to Move
                                     if global_orders.get(target_loc) == supported_part:
-                                        support_count += 1
-                                else:
-                                    # 2. Support to Hold
-                                    target_actual_order = global_orders.get(target_loc, "")
-                                    if target_actual_order == "" or '-' not in target_actual_order:
                                         support_count += 1
                                         
                 if support_count > 0:
@@ -474,7 +467,11 @@ class DiplomacyTransformerEnv(ParallelEnv):
                 # The game hit the step limit OR a Stalemate was detected. 
                 # Reward them based on how much of the board they controlled.
                 rewards[agent] += (len(current_scs) * 2.5)
-
+            # 6. The Combat Penalty
+            current_dislodged = current_state_dict.get('dislodged', {}).get(agent, [])
+            if len(current_dislodged) > 0:
+                # -1.0 penalty for every unit that got pushed off its tile this turn
+                rewards[agent] -= (len(current_dislodged) * 1.0)
         terminations = {a: is_done for a in self.agents}
         infos = {a: {'action_mask': get_sparse_action_mask(self.game, a, self.provinces, self.order_to_idx)} for a in self.agents}
         

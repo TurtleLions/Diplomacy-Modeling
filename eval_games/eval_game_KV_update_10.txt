@@ -1,0 +1,2606 @@
+Evaluation Game - Update 10
+========================================
+
+--- Phase S1901M ---
+AUSTRIA Orders
+  A BUD - SER
+  F TRI - ALB
+  A VIE - GAL
+ENGLAND Orders
+  F EDI - NWG
+  F LON - NTH
+  A LVP - YOR
+FRANCE Orders
+  F BRE - MAO
+  A MAR - SPA
+  A PAR - BUR
+GERMANY Orders
+  A BER - KIE
+  F KIE - DEN
+  A MUN - RUH
+ITALY Orders
+  F NAP - ION
+  A ROM - VEN
+  A VEN - TYR
+RUSSIA Orders
+  A MOS - UKR
+  F SEV - BLA
+  F STP/SC - LVN
+  A WAR - GAL
+TURKEY Orders
+  F ANK - BLA
+  A CON - BUL
+  A SMY - CON
+
+--- Phase F1901M ---
+AUSTRIA Orders
+  F ALB - GRE
+  A SER S F ALB - GRE
+  A VIE - GAL
+ENGLAND Orders
+  F NTH C A YOR - NWY
+  F NWG - BAR
+  A YOR - NWY VIA
+FRANCE Orders
+  A BUR - BEL
+  F MAO - POR
+  A SPA - POR VIA
+GERMANY Orders
+  F DEN - SWE
+  A KIE - HOL
+  A RUH - BEL
+ITALY Orders
+  F ION - TUN
+  A TYR S A VEN - TRI
+  A VEN - TRI
+RUSSIA Orders
+  F LVN - BAL
+  F SEV S A UKR - RUM
+  A UKR - RUM
+  A WAR - GAL
+TURKEY Orders
+  F ANK - BLA
+  A BUL - CON
+  A CON - BUL
+
+--- Phase W1901A ---
+AUSTRIA Orders
+  A BUD B
+ENGLAND Orders
+  F EDI B
+  F LON B
+  A LVP B
+FRANCE Orders
+  F BRE B
+  A MAR B
+  A PAR B
+GERMANY Orders
+  A BER B
+  F KIE B
+  A MUN B
+ITALY Orders
+  F NAP B
+  F ROM B
+  A VEN B
+RUSSIA Orders
+  A MOS B
+  F STP/NC B
+TURKEY Orders
+  A ANK B
+  F SMY B
+
+--- Phase S1902M ---
+AUSTRIA Orders
+  A BUD S A VIE - TRI
+  F GRE - BUL/SC
+  A SER S A VIE - TRI
+  A VIE - TRI
+ENGLAND Orders
+  F BAR - STP/NC
+  F EDI - NTH
+  A NWY S F BAR - STP
+  F NTH - SKA
+FRANCE Orders
+  F BRE - MAO
+  A BUR - BEL
+  F MAO - POR
+  A SPA - BRE VIA
+GERMANY Orders
+  A BER - KIE
+  A HOL - BEL
+  F KIE - DEN
+  A RUH S A HOL - BEL
+  F SWE S F KIE - DEN
+ITALY Orders
+  F NAP - ION
+  F ROM - TYS
+  A TRI - VIE
+  F TUN S F NAP - ION
+  A TYR S A TRI - VIE
+RUSSIA Orders
+  F BAL - SWE
+  A MOS - STP
+  A RUM S A WAR - GAL
+  F SEV S A RUM
+  A WAR - GAL
+TURKEY Orders
+  A ANK - ARM
+  F BLA S A ANK - ARM
+  A BUL S A RUM - CON
+  A CON S A BUL
+
+--- Phase S1902R ---
+AUSTRIA Orders
+  (No valid orders)
+ENGLAND Orders
+  (No valid orders)
+FRANCE Orders
+  (No valid orders)
+GERMANY Orders
+  (No valid orders)
+ITALY Orders
+  A TRI R VEN
+RUSSIA Orders
+  (No valid orders)
+TURKEY Orders
+  (No valid orders)
+
+--- Phase F1902M ---
+AUSTRIA Orders
+  A BUD S A TRI
+  F GRE S A BUL
+  A SER S A TRI
+  A TRI H
+ENGLAND Orders
+  A NWY S F SKA - SWE
+  F NTH - DEN
+  F SKA - SWE
+  F STP/NC S F SWE - NWY
+FRANCE Orders
+  A BUR S A BEL
+  F MAO - WES
+  F POR - MAO
+  A SPA S A BUR - MAR
+GERMANY Orders
+  A BEL S A BUR
+  F DEN S F SWE
+  A KIE S F DEN
+  A RUH - HOL
+  F SWE S F DEN
+ITALY Orders
+  F ION - ADR
+  F TUN - ION
+  A TYR S A VEN - TRI
+  F TYS - ION
+  A VEN - TRI
+RUSSIA Orders
+  F BAL - BER
+  A GAL - BUD
+  A MOS S F SEV
+  A RUM S A GAL - BUD
+  F SEV S A RUM
+TURKEY Orders
+  A ARM - SEV
+  F BLA S A ARM - SEV
+  A BUL S A BUD - RUM
+  A CON - BUL
+
+--- Phase F1902R ---
+AUSTRIA Orders
+  A BUD R VIE
+ENGLAND Orders
+  (No valid orders)
+FRANCE Orders
+  (No valid orders)
+GERMANY Orders
+  F SWE R BAL
+ITALY Orders
+  (No valid orders)
+RUSSIA Orders
+  (No valid orders)
+TURKEY Orders
+  (No valid orders)
+
+--- Phase W1902A ---
+AUSTRIA Orders
+  (No valid orders)
+ENGLAND Orders
+  F EDI B
+  F LON B
+  F LVP B
+FRANCE Orders
+  (No valid orders)
+GERMANY Orders
+  (No valid orders)
+ITALY Orders
+  F ADR D
+  F TUN D
+  A TYR D
+  F TYS D
+  A VEN D
+RUSSIA Orders
+  A WAR B
+TURKEY Orders
+  (No valid orders)
+
+--- Phase S1903M ---
+AUSTRIA Orders
+  F GRE S A BUL
+  A SER S A TRI
+  A TRI S A VIE - BUD
+  A VIE - BUD
+ENGLAND Orders
+  F EDI - NTH
+  F LON S F EDI - NTH
+  A NWY S F SWE
+  F NTH - SKA
+  F STP/NC S F SWE - NWY
+  F SWE S F DEN
+FRANCE Orders
+  A BUR S A BEL
+  F MAO - POR
+  A SPA - POR VIA
+  F WES - MAO
+GERMANY Orders
+  F BAL S A KIE - BER
+  A BEL S A BUR
+  F DEN - KIE
+  A HOL S A BEL
+  A KIE - BER
+ITALY Orders
+  F TUN - ION
+  A TYR S A VEN - TRI
+  F TYS - ION
+  A VEN - TRI
+RUSSIA Orders
+  F BER H
+  A BUD - SER
+  A MOS S F SEV
+  A RUM S A BUD - SER
+  F SEV S A RUM
+  A WAR - GAL
+TURKEY Orders
+  A ARM - SEV
+  F BLA S A ARM - SEV
+  A BUL S A BUD - RUM
+  A CON - BUL
+
+--- Phase S1903R ---
+AUSTRIA Orders
+  A SER R ALB
+  A TRI R VIE
+ENGLAND Orders
+  (No valid orders)
+FRANCE Orders
+  (No valid orders)
+GERMANY Orders
+  (No valid orders)
+ITALY Orders
+  (No valid orders)
+RUSSIA Orders
+  F BER R PRU
+TURKEY Orders
+  (No valid orders)
+
+--- Phase F1903M ---
+AUSTRIA Orders
+  A ALB - SER
+  A BUD S A ALB - SER
+  F GRE - BUL/SC
+  A VIE S A BUD
+ENGLAND Orders
+  F LON - ENG
+  A NWY S F SWE
+  F NTH S F LON - ENG
+  F SKA - DEN
+  F STP/NC S F SWE - NWY
+  F SWE S F SKA - DEN
+FRANCE Orders
+  A BUR S A BEL
+  F MAO - POR
+  A SPA - POR VIA
+  F WES - TUN
+GERMANY Orders
+  F BAL - DEN
+  A BEL S A BUR
+  A BER S F PRU
+  A HOL S A BEL
+  F KIE S F BAL - DEN
+ITALY Orders
+  A TRI - VIE
+  F TUN - ION
+  A TYR S A TRI - VIE
+  F TYS - ION
+RUSSIA Orders
+  A GAL - BUD
+  A MOS S F SEV
+  F PRU - BAL
+  A RUM S A GAL - BUD
+  A SER S A GAL - BUD
+  F SEV S A RUM
+TURKEY Orders
+  A ARM - SEV
+  F BLA C A CON - RUM
+  A BUL - ARM VIA
+  A CON - RUM VIA
+
+--- Phase F1903R ---
+AUSTRIA Orders
+  A VIE R BOH
+ENGLAND Orders
+  (No valid orders)
+FRANCE Orders
+  (No valid orders)
+GERMANY Orders
+  (No valid orders)
+ITALY Orders
+  (No valid orders)
+RUSSIA Orders
+  (No valid orders)
+TURKEY Orders
+  (No valid orders)
+
+--- Phase W1903A ---
+AUSTRIA Orders
+  A ALB D
+  A BOH D
+  A BUD D
+  F GRE D
+ENGLAND Orders
+  (No valid orders)
+FRANCE Orders
+  (No valid orders)
+GERMANY Orders
+  A MUN B
+ITALY Orders
+  F NAP B
+  A ROM B
+  A VEN B
+RUSSIA Orders
+  A GAL D
+  A MOS D
+  F PRU D
+  A RUM D
+  A SER D
+  F SEV D
+TURKEY Orders
+  (No valid orders)
+
+--- Phase S1904M ---
+AUSTRIA Orders
+  A BOH - VIE
+  A BUD S A BOH - VIE
+  F GRE H
+ENGLAND Orders
+  F ENG - NTH
+  A NWY - SWE
+  F NTH - HEL
+  F SKA S A NWY - SWE
+  F STP/NC S F SKA - NWY
+  F SWE - BOT
+FRANCE Orders
+  A BUR S A BEL
+  F MAO - POR
+  A SPA - POR VIA
+  F WES - MAO
+GERMANY Orders
+  F BAL S F KIE - DEN
+  A BEL S A BUR
+  A BER S A BOH - SIL
+  A HOL S A BEL
+  F KIE - DEN
+  A MUN - SIL
+ITALY Orders
+  F NAP - ION
+  F TUN S F NAP - ION
+  A TYR - TRI
+  F TYS S F NAP - ION
+  A VIE S A TYR - TRI
+RUSSIA Orders
+  A MOS S F SEV
+  F PRU - BAL
+  A RUM S A SER
+  A SER S A RUM
+  F SEV S A RUM
+TURKEY Orders
+  A ARM - SEV
+  F BLA - RUM
+  A BUL - ARM VIA
+  A CON S A BUL
+
+--- Phase S1904R ---
+AUSTRIA Orders
+  (No valid orders)
+ENGLAND Orders
+  (No valid orders)
+FRANCE Orders
+  (No valid orders)
+GERMANY Orders
+  (No valid orders)
+ITALY Orders
+  A VIE R TYR
+RUSSIA Orders
+  (No valid orders)
+TURKEY Orders
+  (No valid orders)
+
+--- Phase F1904M ---
+AUSTRIA Orders
+  A BUD S A VIE
+  F GRE H
+  A VIE S A BUD
+ENGLAND Orders
+  F BOT - BAL
+  F HEL - DEN
+  F NTH S F HEL - DEN
+  F SKA S F HEL - DEN
+  F STP/NC - BAR
+  A SWE S F HEL - DEN
+FRANCE Orders
+  A BUR S A BEL
+  F MAO - POR
+  A SPA - BRE VIA
+  F WES - SPA/SC
+GERMANY Orders
+  F BAL S F DEN
+  A BEL S A HOL
+  A BER - PRU
+  F DEN S F BOT - SWE
+  A HOL S A BEL
+  A SIL - WAR
+ITALY Orders
+  F ION - GRE
+  A TRI S A TYR - VIE
+  F TUN - WES
+  A TYR - VIE
+  F TYS S F TUN - WES
+RUSSIA Orders
+  A MOS S F SEV
+  F PRU - BAL
+  A RUM S A SER
+  A SER S A RUM
+  F SEV S A RUM
+TURKEY Orders
+  A ARM - SEV
+  F BLA S A ARM - SEV
+  A BUL - ARM VIA
+  A CON - BUL
+
+--- Phase F1904R ---
+AUSTRIA Orders
+  (No valid orders)
+ENGLAND Orders
+  (No valid orders)
+FRANCE Orders
+  F WES R MAO
+GERMANY Orders
+  F DEN R KIE
+ITALY Orders
+  (No valid orders)
+RUSSIA Orders
+  (No valid orders)
+TURKEY Orders
+  (No valid orders)
+
+--- Phase W1904A ---
+AUSTRIA Orders
+  (No valid orders)
+ENGLAND Orders
+  F EDI B
+  A LON B
+  A LVP B
+FRANCE Orders
+  F BRE B
+  F MAR B
+  A PAR B
+GERMANY Orders
+  (No valid orders)
+ITALY Orders
+  (No valid orders)
+RUSSIA Orders
+  A MOS D
+  F PRU D
+  A RUM D
+  A SER D
+  F SEV D
+TURKEY Orders
+  (No valid orders)
+
+--- Phase S1905M ---
+AUSTRIA Orders
+  A BUD S A VIE
+  F GRE S A BUL
+  A VIE S A BUD
+ENGLAND Orders
+  F BAR - STP/NC
+  F BOT - BAL
+  F DEN S F BOT - BAL
+  F EDI - NTH
+  F NTH - HEL
+  F SKA S F EDI - NTH
+  A SWE S F DEN
+FRANCE Orders
+  F BRE - ENG
+  A BUR S A BEL
+  F MAO S F BRE - ENG
+  F POR - MAO
+  A SPA - TUN VIA
+GERMANY Orders
+  F BAL - DEN
+  A BEL S A HOL
+  A BER - KIE
+  A HOL S A BEL
+  F KIE - HEL
+  A WAR - MOS
+ITALY Orders
+  F ION - AEG
+  A TRI S A TYR - VIE
+  A TYR - VIE
+  F TYS - ION
+  F WES - SPA/SC
+RUSSIA Orders
+  F PRU - LVN
+  A RUM S F SEV
+  A SER S A RUM
+  F SEV S A RUM
+TURKEY Orders
+  A ARM - SEV
+  F BLA S A ARM - SEV
+  A BUL S A BUD - RUM
+  A CON - BUL
+
+--- Phase S1905R ---
+AUSTRIA Orders
+  (No valid orders)
+ENGLAND Orders
+  (No valid orders)
+FRANCE Orders
+  (No valid orders)
+GERMANY Orders
+  F BAL R PRU
+ITALY Orders
+  (No valid orders)
+RUSSIA Orders
+  (No valid orders)
+TURKEY Orders
+  (No valid orders)
+
+--- Phase F1905M ---
+AUSTRIA Orders
+  A BUD S A VIE
+  F GRE S A BUL
+  A VIE S A BUD
+ENGLAND Orders
+  F BAL - DEN
+  F DEN - NTH
+  F EDI - CLY
+  F NTH - LON
+  F SKA - NWY
+  F STP/NC - BAR
+  A SWE S F BAL - DEN
+FRANCE Orders
+  A BUR S A BEL
+  F ENG - LON
+  F MAO - IRI
+  F POR - MAO
+  A SPA - TUN VIA
+GERMANY Orders
+  A BEL S A BUR
+  A BER S F KIE
+  A HOL S A BEL
+  F KIE S A BER
+  A MOS S F PRU - LVN
+  F PRU - LVN
+ITALY Orders
+  F AEG S F ION - GRE
+  F ION - GRE
+  A TRI S A TYR - VIE
+  A TYR - VIE
+  F WES - SPA/SC
+RUSSIA Orders
+  F LVN - STP/SC
+  A RUM S F SEV
+  A SER S A RUM
+  F SEV S A RUM
+TURKEY Orders
+  A ARM - SEV
+  F BLA S A ARM - SEV
+  A BUL - ARM VIA
+  A CON - SMY
+
+--- Phase F1905R ---
+AUSTRIA Orders
+  F GRE R ALB
+ENGLAND Orders
+  (No valid orders)
+FRANCE Orders
+  (No valid orders)
+GERMANY Orders
+  (No valid orders)
+ITALY Orders
+  (No valid orders)
+RUSSIA Orders
+  (No valid orders)
+TURKEY Orders
+  (No valid orders)
+
+--- Phase W1905A ---
+AUSTRIA Orders
+  F ALB D
+  A BUD D
+  A VIE D
+ENGLAND Orders
+  F BAL D
+  F BAR D
+  F CLY D
+  F DEN D
+  F NWY D
+  F NTH D
+  A SWE D
+FRANCE Orders
+  (No valid orders)
+GERMANY Orders
+  A MUN B
+ITALY Orders
+  F NAP B
+  A ROM B
+  A VEN B
+RUSSIA Orders
+  (No valid orders)
+TURKEY Orders
+  (No valid orders)
+
+--- Phase S1906M ---
+AUSTRIA Orders
+  A BUD S A VIE
+  A VIE S A BUD
+ENGLAND Orders
+  F BAR - NWY
+  F CLY - LVP
+  F DEN S F KIE
+  F NWY - NTH
+  F NTH - LON
+  A SWE S F DEN
+FRANCE Orders
+  A BUR S A BEL
+  F ENG - LON
+  F IRI - LVP
+  F MAO - SPA/SC
+  A SPA - BRE VIA
+GERMANY Orders
+  A BEL S A BUR
+  A BER - PRU
+  A HOL S A BEL
+  F KIE - DEN
+  F LVN - STP/SC
+  A MOS S F LVN - STP
+  A MUN S A BUR
+ITALY Orders
+  F AEG - BUL/SC
+  F GRE S F AEG - BUL
+  F NAP - ION
+  A TRI S A TYR - VIE
+  A TYR - VIE
+  F WES - SPA/SC
+RUSSIA Orders
+  A RUM S F SEV
+  A SER S A RUM
+  F SEV S A RUM
+  F STP/SC S A MOS - LVN
+TURKEY Orders
+  A ARM - SEV
+  F BLA S A ARM - SEV
+  A BUL - ARM VIA
+  A SMY - CON
+
+--- Phase S1906R ---
+AUSTRIA Orders
+  (No valid orders)
+ENGLAND Orders
+  (No valid orders)
+FRANCE Orders
+  (No valid orders)
+GERMANY Orders
+  (No valid orders)
+ITALY Orders
+  (No valid orders)
+RUSSIA Orders
+  F STP/SC R FIN
+TURKEY Orders
+  (No valid orders)
+
+--- Phase F1906M ---
+AUSTRIA Orders
+  A BUD S A VIE
+  A VIE S A BUD
+ENGLAND Orders
+  F BAR - STP/NC
+  F CLY - LVP
+  F DEN - NTH
+  F NWY S F BAR - STP
+  F NTH - LON
+  A SWE - FIN
+FRANCE Orders
+  A BUR S A BEL
+  F ENG - LON
+  F IRI - LVP
+  F MAO - NAO
+  A SPA - BRE VIA
+GERMANY Orders
+  A BEL S A BUR
+  A HOL S A BEL
+  F KIE - DEN
+  A MOS S F STP/SC
+  A MUN - KIE
+  A PRU - WAR
+  F STP/SC S A MOS - LVN
+ITALY Orders
+  F BUL/SC S A CON
+  F GRE S F BUL/SC
+  F ION - AEG
+  A TRI - VIE
+  A TYR S A TRI - VIE
+  F WES - MAO
+RUSSIA Orders
+  F FIN - STP/SC
+  A RUM S F SEV
+  A SER S A RUM
+  F SEV S A RUM
+TURKEY Orders
+  A ARM - SEV
+  F BLA S A ARM - SEV
+  A CON - BUL
+
+--- Phase W1906A ---
+AUSTRIA Orders
+  (No valid orders)
+ENGLAND Orders
+  (No valid orders)
+FRANCE Orders
+  (No valid orders)
+GERMANY Orders
+  A BER B
+ITALY Orders
+  F NAP B
+  F ROM B
+  A VEN B
+RUSSIA Orders
+  F FIN D
+  A RUM D
+  A SER D
+  F SEV D
+TURKEY Orders
+  (No valid orders)
+
+--- Phase S1907M ---
+AUSTRIA Orders
+  A BUD S A VIE
+  A VIE S A BUD
+ENGLAND Orders
+  F BAR - NWG
+  F CLY - LVP
+  F DEN S F KIE
+  F NWY - NTH
+  F NTH - LON
+  A SWE S F DEN
+FRANCE Orders
+  A BUR S A BEL
+  F ENG - LON
+  F IRI - LVP
+  F NAO S F IRI - LVP
+  A SPA - BRE VIA
+GERMANY Orders
+  A BEL S A HOL
+  A BER - KIE
+  A HOL S A BEL
+  F KIE - BAL
+  A MOS S F SEV
+  A MUN S A BER - KIE
+  F STP/SC - BOT
+  A WAR - UKR
+ITALY Orders
+  F AEG - CON
+  F BUL/SC S A CON
+  F GRE S F BUL/SC
+  F MAO - SPA/SC
+  F NAP - TYS
+  A TRI S A TYR - VIE
+  A TYR - VIE
+RUSSIA Orders
+  A RUM S A SER - BUD
+  A SER - BUD
+  F SEV S A RUM
+TURKEY Orders
+  A ARM - SEV
+  F BLA S A ARM - SEV
+  A CON - BUL
+
+--- Phase S1907R ---
+AUSTRIA Orders
+  A BUD R GAL
+  A VIE R BOH
+ENGLAND Orders
+  (No valid orders)
+FRANCE Orders
+  (No valid orders)
+GERMANY Orders
+  (No valid orders)
+ITALY Orders
+  (No valid orders)
+RUSSIA Orders
+  (No valid orders)
+TURKEY Orders
+  (No valid orders)
+
+--- Phase F1907M ---
+AUSTRIA Orders
+  A BOH - VIE
+  A GAL S A BOH - VIE
+ENGLAND Orders
+  F CLY - LVP
+  F DEN S A SWE
+  F NWY S A SWE
+  F NTH - LON
+  F NWG - CLY
+  A SWE S F DEN
+FRANCE Orders
+  A BUR - MAR
+  F ENG - LON
+  F LVP H
+  F NAO - MAO
+  A SPA - NWY VIA
+GERMANY Orders
+  F BAL S F BOT - SWE
+  A BEL S A HOL
+  F BOT - SWE
+  A HOL S A BEL
+  A KIE - DEN
+  A MOS - SEV
+  A MUN - SIL
+  A UKR S F SEV
+ITALY Orders
+  F AEG - CON
+  F BUL/SC S A CON
+  F GRE S F BUL/SC
+  F MAO - POR
+  A TRI S A VIE
+  F TYS - WES
+  A VIE S A TRI
+RUSSIA Orders
+  A BUD S A RUM
+  A RUM S F SEV
+  F SEV S A RUM
+TURKEY Orders
+  A ARM - SEV
+  F BLA S A ARM - SEV
+  A CON - BUL
+
+--- Phase W1907A ---
+AUSTRIA Orders
+  A BOH D
+  A GAL D
+ENGLAND Orders
+  F CLY D
+  F DEN D
+  F NWY D
+  F NTH D
+  F NWG D
+  A SWE D
+FRANCE Orders
+  (No valid orders)
+GERMANY Orders
+  (No valid orders)
+ITALY Orders
+  F NAP B
+  A ROM B
+  A VEN B
+RUSSIA Orders
+  (No valid orders)
+TURKEY Orders
+  (No valid orders)
+
+--- Phase S1908M ---
+ENGLAND Orders
+  F DEN S A SWE
+  F NWY S A SWE
+  F NTH - LON
+  F NWG - NAO
+  A SWE S F DEN
+FRANCE Orders
+  F ENG - MAO
+  F LVP - WAL
+  F MAO - POR
+  A MAR S A SPA
+  A SPA - NAF VIA
+GERMANY Orders
+  F BAL S F BOT - SWE
+  A BEL H
+  F BOT - SWE
+  A HOL - KIE
+  A KIE - MUN
+  A MOS - STP
+  A SIL - GAL
+  A UKR S A SIL - GAL
+ITALY Orders
+  F AEG S F BUL/SC - CON
+  F BUL/SC - CON
+  F GRE - BUL/SC
+  F NAP - TYS
+  F POR S F WES - MAO
+  A ROM - VEN
+  A TRI - BUD
+  A VIE S A TRI - BUD
+  F WES - MAO
+RUSSIA Orders
+  A BUD S A RUM
+  A RUM S F SEV
+  F SEV S A RUM
+TURKEY Orders
+  A ARM - SEV
+  F BLA S A ARM - SEV
+  A CON - BUL
+
+--- Phase S1908R ---
+ENGLAND Orders
+  (No valid orders)
+FRANCE Orders
+  F MAO R BRE
+GERMANY Orders
+  (No valid orders)
+ITALY Orders
+  (No valid orders)
+RUSSIA Orders
+  A BUD R SER
+TURKEY Orders
+  A CON R ANK
+
+--- Phase F1908M ---
+ENGLAND Orders
+  F DEN - NTH
+  F LON - ENG
+  F NAO - LVP
+  F NWY S A SWE
+  A SWE S F DEN
+FRANCE Orders
+  F BRE - MAO
+  F ENG S F WAL - LON
+  A MAR S A SPA
+  A SPA - BEL VIA
+  F WAL - LON
+GERMANY Orders
+  F BAL - DEN
+  A BEL H
+  F BOT - SWE
+  A GAL - RUM
+  A KIE S F BAL - DEN
+  A MUN - TYR
+  A STP H
+  A UKR S A GAL - RUM
+ITALY Orders
+  F AEG - SMY
+  A BUD S A SER - RUM
+  F BUL/SC S F CON - AEG
+  F CON S F AEG - SMY
+  F MAO S F POR - SPA
+  F POR - SPA/SC
+  F TYS - WES
+  A VEN - TYR
+  A VIE S A BUD
+RUSSIA Orders
+  A RUM S F SEV
+  A SER S A RUM
+  F SEV S A RUM
+TURKEY Orders
+  A ANK S A ARM - SMY
+  A ARM - SMY
+  F BLA - CON
+
+--- Phase F1908R ---
+ENGLAND Orders
+  F LON D
+FRANCE Orders
+  (No valid orders)
+GERMANY Orders
+  (No valid orders)
+ITALY Orders
+  (No valid orders)
+RUSSIA Orders
+  (No valid orders)
+TURKEY Orders
+  (No valid orders)
+
+--- Phase W1908A ---
+ENGLAND Orders
+  (No valid orders)
+FRANCE Orders
+  (No valid orders)
+GERMANY Orders
+  A BER B
+ITALY Orders
+  F NAP B
+  A ROM B
+RUSSIA Orders
+  (No valid orders)
+TURKEY Orders
+  A ANK D
+  F BLA D
+  A SMY D
+
+--- Phase S1909M ---
+ENGLAND Orders
+  F LVP - WAL
+  F NWY S A SWE
+  F NTH - DEN
+  A SWE S F NTH - DEN
+FRANCE Orders
+  F BRE - MAO
+  F ENG S F BRE - MAO
+  F LON - NTH
+  A MAR S A SPA
+  A SPA - WAL VIA
+GERMANY Orders
+  A BEL H
+  A BER - SIL
+  F BOT - SWE
+  F DEN S F BOT - SWE
+  A GAL - RUM
+  A KIE S F DEN
+  A MUN - TYR
+  A STP S A SPA - NWY
+  A UKR S A GAL - RUM
+ITALY Orders
+  F AEG - CON
+  A BUD S A SER - RUM
+  F BUL/SC - CON
+  F CON - ANK
+  F MAO - NAO
+  F NAP - TYS
+  F POR S F WES - MAO
+  A ROM - VEN
+  A VEN - TYR
+  A VIE S A BUD
+  F WES - MAO
+RUSSIA Orders
+  A RUM S F SEV
+  A SER S A RUM
+  F SEV S A RUM
+TURKEY Orders
+  F BLA - ANK
+  A SMY S F BLA - ANK
+
+--- Phase F1909M ---
+ENGLAND Orders
+  F NWY S A SWE
+  F NTH S F WAL - LON
+  A SWE S F DEN
+  F WAL - LON
+FRANCE Orders
+  F BRE S F ENG - MAO
+  F ENG - MAO
+  F LON H
+  A MAR S A SPA
+  A SPA - POR
+GERMANY Orders
+  A BEL H
+  F BOT - SWE
+  F DEN S F BOT - SWE
+  A GAL - RUM
+  A KIE S F DEN
+  A MUN - BOH
+  A SIL - GAL
+  A STP - FIN VIA
+  A UKR S A GAL - RUM
+ITALY Orders
+  F AEG S F CON - SMY
+  A BUD S A SER - RUM
+  F BUL/SC - CON
+  F CON - SMY
+  F NAO - CLY
+  F POR S F WES - SPA
+  A ROM - VEN
+  F TYS - WES
+  A VEN - TRI
+  A VIE S A BUD
+  F WES - SPA/SC
+RUSSIA Orders
+  A RUM S F SEV
+  A SER S A RUM
+  F SEV S A RUM
+TURKEY Orders
+  F ANK - CON
+  A SMY S F ANK - CON
+
+--- Phase F1909R ---
+ENGLAND Orders
+  (No valid orders)
+FRANCE Orders
+  F LON R ENG
+  A SPA R GAS
+GERMANY Orders
+  (No valid orders)
+ITALY Orders
+  (No valid orders)
+RUSSIA Orders
+  (No valid orders)
+TURKEY Orders
+  A SMY R ARM
+
+--- Phase W1909A ---
+ENGLAND Orders
+  A EDI B
+  F LVP B
+FRANCE Orders
+  F BRE D
+  F ENG D
+  A GAS D
+  F MAO D
+  A MAR D
+GERMANY Orders
+  (No valid orders)
+ITALY Orders
+  F NAP B
+  A ROM B
+RUSSIA Orders
+  (No valid orders)
+TURKEY Orders
+  F ANK D
+  A ARM D
+
+--- Phase S1910M ---
+ENGLAND Orders
+  A EDI - LVP
+  F LON - WAL
+  F NWY S A SWE
+  F NTH - EDI
+  A SWE S F DEN
+FRANCE Orders
+  A GAS - SPA
+  F MAO S A GAS - SPA
+  A MAR S A GAS - SPA
+GERMANY Orders
+  A BEL H
+  A BOH - VIE
+  F BOT - SWE
+  F DEN S F BOT - SWE
+  A FIN S F BOT - SWE
+  A GAL S A BOH - VIE
+  A KIE S F DEN
+  A SIL - WAR
+  A UKR - RUM
+ITALY Orders
+  F AEG - CON
+  A BUD S A SER - RUM
+  F BUL/SC - CON
+  F CLY - LVP
+  F NAP - TYS
+  F POR - MAO
+  A ROM - VEN
+  F SMY S F AEG - CON
+  F SPA/SC S F MAO - WES
+  A TRI S A VEN - TYR
+  A VEN - TYR
+  A VIE - GAL
+  F WES S F POR - MAO
+RUSSIA Orders
+  A RUM S F SEV
+  A SER S A RUM
+  F SEV S A RUM
+TURKEY Orders
+  A ARM - ANK
+
+--- Phase S1910R ---
+ENGLAND Orders
+  (No valid orders)
+FRANCE Orders
+  F MAO R BRE
+GERMANY Orders
+  (No valid orders)
+ITALY Orders
+  F SPA/SC R POR
+RUSSIA Orders
+  (No valid orders)
+TURKEY Orders
+  (No valid orders)
+
+--- Phase F1910M ---
+ENGLAND Orders
+  A EDI S F WAL - LVP
+  F NWY - STP/NC
+  F NTH - EDI
+  F WAL - LVP
+FRANCE Orders
+  F BRE - MAO
+  A MAR S A SPA
+  A SPA - TUN VIA
+GERMANY Orders
+  A BEL H
+  F DEN - NTH
+  A FIN S F SWE - NWY
+  A GAL - BUD
+  A KIE - HOL
+  F SWE - NWY
+  A UKR - RUM
+  A VIE S A GAL - BUD
+  A WAR - GAL
+ITALY Orders
+  A BUD S A TRI - VIE
+  F BUL/SC - CON
+  F CLY - LVP
+  F CON - ANK
+  F MAO - IRI
+  F POR S F WES - MAO
+  F SMY H
+  A TRI - VIE
+  A TYR S A TRI - VIE
+  F TYS - LYO
+  A VEN - PIE
+  F WES - MAO
+RUSSIA Orders
+  A RUM S A SER - BUD
+  A SER - BUD
+  F SEV S A RUM
+TURKEY Orders
+  A ANK H
+
+--- Phase F1910R ---
+ENGLAND Orders
+  (No valid orders)
+FRANCE Orders
+  (No valid orders)
+GERMANY Orders
+  A VIE R BOH
+ITALY Orders
+  (No valid orders)
+RUSSIA Orders
+  (No valid orders)
+TURKEY Orders
+  (No valid orders)
+
+--- Phase W1910A ---
+ENGLAND Orders
+  F LON B
+FRANCE Orders
+  A PAR B
+GERMANY Orders
+  (No valid orders)
+ITALY Orders
+  (No valid orders)
+RUSSIA Orders
+  (No valid orders)
+TURKEY Orders
+  (No valid orders)
+
+--- Phase S1911M ---
+ENGLAND Orders
+  A EDI - LVP
+  F LON - ENG
+  F LVP - IRI
+  F NTH S F LON - ENG
+  F STP/NC - BAR
+FRANCE Orders
+  F BRE - MAO
+  A MAR S A SPA
+  A PAR - BUR
+  A SPA - POR
+GERMANY Orders
+  A BEL H
+  A BOH - VIE
+  F DEN S A FIN - SWE
+  A FIN - SWE
+  A GAL S A BOH - VIE
+  A HOL H
+  F NWY S A FIN - SWE
+  A UKR - RUM
+  A WAR - UKR
+ITALY Orders
+  A BUD S A VIE
+  F BUL/SC - CON
+  F CLY S F MAO - NAO
+  F CON - ANK
+  F IRI - LVP
+  F LYO - SPA/SC
+  F MAO - NAO
+  A PIE - MAR
+  F POR - MAO
+  F SMY - CON
+  A TYR S A VIE
+  A VIE S A BUD
+RUSSIA Orders
+  A RUM S F SEV
+  A SER S A RUM
+  F SEV S A RUM
+TURKEY Orders
+  A ANK H
+
+--- Phase F1911M ---
+ENGLAND Orders
+  F BAR - NWG
+  A EDI - LVP
+  F ENG - MAO
+  F LVP - IRI
+  F NTH - EDI
+FRANCE Orders
+  F BRE - MAO
+  A BUR S A MAR
+  A MAR S A SPA
+  A SPA S A BUR - GAS
+GERMANY Orders
+  A BEL S A BUR
+  A BOH - VIE
+  F DEN - NTH
+  A GAL S A BOH - VIE
+  A HOL S A BEL
+  F NWY S F DEN - NTH
+  A SWE H
+  A UKR - RUM
+  A WAR - UKR
+ITALY Orders
+  A BUD S A VIE
+  F BUL/SC - CON
+  F CLY - LVP
+  F CON - ANK
+  F IRI S F CLY - LVP
+  F LYO - SPA/SC
+  F NAO - NWG
+  A PIE - MAR
+  F POR S F LYO - SPA
+  F SMY H
+  A TYR S A VIE
+  A VIE S A BUD
+RUSSIA Orders
+  A RUM S F SEV
+  A SER S A RUM
+  F SEV S A RUM
+TURKEY Orders
+  A ANK - CON
+
+--- Phase F1911R ---
+ENGLAND Orders
+  F LVP R WAL
+  F NTH R LON
+FRANCE Orders
+  A SPA R GAS
+GERMANY Orders
+  (No valid orders)
+ITALY Orders
+  (No valid orders)
+RUSSIA Orders
+  (No valid orders)
+TURKEY Orders
+  (No valid orders)
+
+--- Phase W1911A ---
+ENGLAND Orders
+  F BAR D
+  A EDI D
+  F ENG D
+  F LON D
+  F WAL D
+FRANCE Orders
+  F BRE D
+  A BUR D
+  A GAS D
+  A MAR D
+GERMANY Orders
+  A BER B
+  A KIE B
+  A MUN B
+ITALY Orders
+  F NAP B
+  A ROM B
+  A VEN B
+RUSSIA Orders
+  (No valid orders)
+TURKEY Orders
+  (No valid orders)
+
+--- Phase S1912M ---
+ENGLAND Orders
+  F ENG - MAO
+  F LON H
+  F WAL - LVP
+FRANCE Orders
+  A BUR S A MAR
+  A GAS - SPA
+  A MAR S A GAS - SPA
+GERMANY Orders
+  A BEL H
+  A BER - SIL
+  A BOH - VIE
+  A GAL S A BOH - VIE
+  A HOL - EDI VIA
+  F NWY - NWG
+  F NTH C A HOL - EDI
+  A SWE - NWY
+  A UKR - RUM
+  A WAR - UKR
+ITALY Orders
+  A BUD S A VIE
+  F BUL/SC - CON
+  F CON - ANK
+  F IRI - WAL
+  F LVP S F IRI - WAL
+  F NAO S F LVP
+  F NAP - ION
+  A PIE - MAR
+  F POR - MAO
+  A ROM - VEN
+  F SMY H
+  F SPA/SC - LYO
+  A TYR S A VIE
+  A VIE S A TYR
+RUSSIA Orders
+  A RUM S F SEV
+  A SER S A BUD
+  F SEV S A RUM
+TURKEY Orders
+  A ANK H
+
+--- Phase F1912M ---
+ENGLAND Orders
+  F ENG - BRE
+  F LON H
+FRANCE Orders
+  A BUR S A MAR
+  A MAR S A SPA
+  A SPA S A BUR - GAS
+GERMANY Orders
+  A BEL H
+  A BOH - VIE
+  A EDI H
+  A GAL S A BOH - VIE
+  A NWY - STP
+  F NTH S A BEL
+  F NWG - EDI
+  A SIL - BOH
+  A UKR - RUM
+  A WAR - UKR
+ITALY Orders
+  A BUD S A VIE
+  F BUL/SC - CON
+  F CON - ANK
+  F ION - TUN
+  F LVP H
+  F LYO - SPA/SC
+  F NAO - NWG
+  A PIE - TYR
+  F POR - MAO
+  F SMY - CON
+  A TYR - BOH
+  A VEN - TRI
+  A VIE S A TYR - BOH
+  F WAL - LON
+RUSSIA Orders
+  A RUM S F SEV
+  A SER S A RUM
+  F SEV S A RUM
+TURKEY Orders
+  A ANK - CON
+
+--- Phase F1912R ---
+ENGLAND Orders
+  (No valid orders)
+FRANCE Orders
+  (No valid orders)
+GERMANY Orders
+  A BOH R MUN
+ITALY Orders
+  (No valid orders)
+RUSSIA Orders
+  (No valid orders)
+TURKEY Orders
+  (No valid orders)
+
+--- Phase W1912A ---
+ENGLAND Orders
+  (No valid orders)
+FRANCE Orders
+  (No valid orders)
+GERMANY Orders
+  A BER B
+  A KIE B
+ITALY Orders
+  A BOH D
+  A BUD D
+  F BUL/SC D
+  F CON D
+  F LVP D
+  F LYO D
+  F MAO D
+  F NAO D
+  F SMY D
+  A TRI D
+  F TUN D
+  A TYR D
+  A VIE D
+  F WAL D
+RUSSIA Orders
+  (No valid orders)
+TURKEY Orders
+  (No valid orders)
+
+--- Phase S1913M ---
+ENGLAND Orders
+  F BRE H
+  F LON H
+FRANCE Orders
+  A BUR S A MAR
+  A MAR S A SPA
+  A SPA S A BEL - POR
+GERMANY Orders
+  A BEL - PIC
+  A BER - SIL
+  A EDI - YOR
+  A GAL - RUM
+  A KIE - RUH
+  A MUN S A SIL - BOH
+  F NTH S A EDI - YOR
+  F NWG - NAO
+  A SIL - BOH
+  A STP S A EDI - NWY
+  A UKR S A GAL - RUM
+  A WAR - GAL
+ITALY Orders
+  A BUD - RUM
+  F BUL/SC S A ANK - CON
+  F CON - ANK
+  F LVP - WAL
+  F LYO - SPA/SC
+  F MAO - GAS
+  F NAO - MAO
+  F SMY - CON
+  A TRI - SER
+  F TUN - NAF
+  A TYR - MUN
+  A VIE - BUD
+  F WAL - LON
+RUSSIA Orders
+  A RUM S F SEV
+  A SER S A BUD
+  F SEV S A RUM
+TURKEY Orders
+  A ANK H
+
+--- Phase F1913M ---
+ENGLAND Orders
+  F BRE S F NAF - MAO
+  F LON H
+FRANCE Orders
+  A BUR - PAR
+  A MAR S A SPA
+  A SPA - POR
+GERMANY Orders
+  A BOH - VIE
+  A GAL S A BOH - VIE
+  A MUN - TYR
+  F NAO - MAO
+  F NTH - LON
+  A PIC - PAR
+  A RUH - BEL
+  A SIL - BOH
+  A STP S A UKR - MOS
+  A UKR - RUM
+  A WAR - GAL
+  A YOR S F NTH - LON
+ITALY Orders
+  A BUD S A VIE
+  F BUL/SC - CON
+  F CON - ANK
+  F GAS S F MAO - BRE
+  F LVP H
+  F LYO - SPA/SC
+  F MAO - BRE
+  F NAF - MAO
+  F SMY - CON
+  A TRI S A BUD
+  A TYR S A VIE
+  A VIE S A BUD
+  F WAL - LON
+RUSSIA Orders
+  A RUM S F SEV
+  A SER S A RUM
+  F SEV S A RUM
+TURKEY Orders
+  A ANK - CON
+
+--- Phase F1913R ---
+ENGLAND Orders
+  F BRE R ENG
+  F LON R ENG
+FRANCE Orders
+  (No valid orders)
+GERMANY Orders
+  (No valid orders)
+ITALY Orders
+  (No valid orders)
+RUSSIA Orders
+  (No valid orders)
+TURKEY Orders
+  (No valid orders)
+
+--- Phase W1913A ---
+FRANCE Orders
+  (No valid orders)
+GERMANY Orders
+  A BER B
+  A KIE B
+ITALY Orders
+  F NAP B
+  A ROM B
+  A VEN B
+RUSSIA Orders
+  (No valid orders)
+TURKEY Orders
+  (No valid orders)
+
+--- Phase S1914M ---
+FRANCE Orders
+  A BUR S A MAR
+  A MAR S A POR - SPA
+  A POR - SPA
+GERMANY Orders
+  A BEL - BUR
+  A BER - PRU
+  A BOH H
+  A GAL H
+  F LON H
+  A MUN H
+  F NAO H
+  A PIC - PAR
+  A SIL H
+  A STP S A UKR - MOS
+  A UKR H
+  A WAR H
+  A YOR - LVP
+ITALY Orders
+  F BRE H
+  A BUD S A VIE
+  F BUL/SC - CON
+  F CON - BLA
+  F GAS - MAO
+  F LVP H
+  F NAF S F GAS - MAO
+  F NAP - TYS
+  F SMY - CON
+  F SPA/SC S F BRE - MAO
+  A TRI S A BUD
+  A TYR S A VIE
+  A VIE S A TYR
+  F WAL S F LVP
+RUSSIA Orders
+  A RUM S F SEV
+  A SER H
+  F SEV H
+TURKEY Orders
+  A ANK H
+
+--- Phase S1914R ---
+FRANCE Orders
+  (No valid orders)
+GERMANY Orders
+  (No valid orders)
+ITALY Orders
+  F SPA/SC R WES
+RUSSIA Orders
+  (No valid orders)
+TURKEY Orders
+  (No valid orders)
+
+--- Phase F1914M ---
+FRANCE Orders
+  A BUR S A MAR
+  A MAR S A SPA
+  A SPA - TUN VIA
+GERMANY Orders
+  A BEL H
+  A BOH H
+  A GAL H
+  F LON H
+  A MUN H
+  F NAO H
+  A PAR H
+  A PRU H
+  A SIL H
+  A STP - MOS
+  A UKR H
+  A WAR H
+  A YOR H
+ITALY Orders
+  F BLA - ANK
+  F BRE H
+  A BUD S A VIE
+  F BUL/SC - CON
+  F LVP H
+  F MAO H
+  F NAF H
+  F SMY H
+  A TRI S A TYR
+  A TYR S A VIE
+  F TYS - LYO
+  A VIE S A TYR
+  F WAL S F LVP
+  F WES H
+RUSSIA Orders
+  A RUM S F SEV
+  A SER H
+  F SEV H
+TURKEY Orders
+  A ANK H
+
+--- Phase W1914A ---
+FRANCE Orders
+  (No valid orders)
+GERMANY Orders
+  A BER B
+  A KIE B
+ITALY Orders
+  F BLA D
+  F BRE D
+  A BUD D
+  F CON D
+  F LVP D
+  F LYO D
+  F MAO D
+  F NAF D
+  F SMY D
+  A TRI D
+  A TYR D
+  A VIE D
+  F WAL D
+  F WES D
+RUSSIA Orders
+  (No valid orders)
+TURKEY Orders
+  (No valid orders)
+
+--- Phase S1915M ---
+FRANCE Orders
+  A BUR S A MAR
+  A MAR S A SPA
+  A SPA - TUN VIA
+GERMANY Orders
+  A BEL H
+  A BER H
+  A BOH H
+  A GAL H
+  F LON H
+  A MOS H
+  A MUN H
+  F NAO H
+  A PAR H
+  A PRU H
+  A SIL H
+  A UKR H
+  A WAR H
+  A YOR H
+ITALY Orders
+  F BRE H
+  A BUD S A VIE
+  F CON H
+  F LVP H
+  F LYO H
+  F MAO H
+  F NAF H
+  F SMY H
+  A TRI S A TYR
+  A TYR H
+  A VIE H
+  F WAL H
+  F WES H
+RUSSIA Orders
+  A RUM S F SEV
+  A SER H
+  F SEV H
+TURKEY Orders
+  A ANK H
+
+--- Phase F1915M ---
+FRANCE Orders
+  A BUR H
+  A MAR H
+  A SPA S A BUR - GAS
+GERMANY Orders
+  A BEL H
+  A BER H
+  A BOH H
+  A GAL H
+  F LON H
+  A MOS H
+  A MUN H
+  F NAO H
+  A PAR H
+  A PRU H
+  A SIL H
+  A UKR H
+  A WAR H
+  A YOR H
+ITALY Orders
+  F BRE H
+  A BUD S A VIE
+  F CON S F SMY
+  F LVP H
+  F LYO S A MAR
+  F MAO - POR
+  F NAF - MAO
+  F SMY H
+  A TRI S A TYR
+  A TYR S A VIE
+  A VIE S A TYR
+  F WAL S F LVP
+  F WES S A SPA
+RUSSIA Orders
+  A RUM S F SEV
+  A SER H
+  F SEV H
+TURKEY Orders
+  A ANK H
+
+--- Phase W1915A ---
+FRANCE Orders
+  A BUR D
+  A MAR D
+  A SPA D
+GERMANY Orders
+  (No valid orders)
+ITALY Orders
+  F NAP B
+  A ROM B
+  A VEN B
+RUSSIA Orders
+  (No valid orders)
+TURKEY Orders
+  (No valid orders)
+
+--- Phase S1916M ---
+FRANCE Orders
+  A MAR S A SPA
+  A SPA - TUN VIA
+GERMANY Orders
+  A BEL - BUR
+  A BER - SIL
+  A BOH - VIE
+  A GAL S A BOH - VIE
+  F LON - ENG
+  A MOS - SEV
+  A MUN - TYR
+  F NAO - MAO
+  A PAR S A BEL - BUR
+  A PRU - WAR
+  A SIL - BOH
+  A UKR S A MOS - SEV
+  A WAR - UKR
+  A YOR - LVP
+ITALY Orders
+  F BRE H
+  A BUD S A VIE
+  F CON - BLA
+  F LVP H
+  F LYO S A MAR
+  F MAO H
+  F NAP - TYS
+  F POR H
+  F SMY H
+  A TRI S A VIE
+  A TYR S A VIE
+  A VIE S A TYR
+  F WAL H
+  F WES H
+RUSSIA Orders
+  A RUM S F SEV
+  A SER - BUL
+  F SEV S A RUM
+TURKEY Orders
+  A ANK - CON
+
+--- Phase F1916M ---
+FRANCE Orders
+  A MAR S A SPA
+  A SPA - TUN VIA
+GERMANY Orders
+  A BER H
+  A BOH H
+  A BUR H
+  F ENG H
+  A GAL H
+  A MOS H
+  A MUN H
+  F NAO H
+  A PAR H
+  A PRU H
+  A SIL H
+  A UKR H
+  A WAR H
+  A YOR H
+ITALY Orders
+  F BLA - ANK
+  F BRE H
+  A BUD S A VIE
+  F LVP H
+  F LYO S A MAR
+  F MAO H
+  F POR H
+  F SMY H
+  A TRI S A TYR
+  A TYR H
+  F TYS H
+  A VIE H
+  F WAL H
+  F WES H
+RUSSIA Orders
+  A BUL S A CON - RUM
+  A RUM S F SEV
+  F SEV S A RUM
+TURKEY Orders
+  A CON H
+
+--- Phase W1916A ---
+FRANCE Orders
+  (No valid orders)
+GERMANY Orders
+  (No valid orders)
+ITALY Orders
+  F ANK D
+  F BRE D
+  A BUD D
+  F LVP D
+  F LYO D
+  F MAO D
+  F POR D
+  F SMY D
+  A TRI D
+  A TYR D
+  F TYS D
+  A VIE D
+  F WAL D
+  F WES D
+RUSSIA Orders
+  (No valid orders)
+TURKEY Orders
+  (No valid orders)
+
+--- Phase S1917M ---
+FRANCE Orders
+  A MAR S A SPA
+  A SPA - TUN VIA
+GERMANY Orders
+  A BER H
+  A BOH H
+  A BUR H
+  F ENG H
+  A GAL H
+  A MOS H
+  A MUN H
+  F NAO H
+  A PAR H
+  A PRU H
+  A SIL H
+  A UKR H
+  A WAR H
+  A YOR H
+ITALY Orders
+  F BRE H
+  A BUD S A VIE
+  F LVP H
+  F LYO S A MAR
+  F MAO H
+  F POR H
+  F SMY H
+  A TRI S A TYR
+  A TYR H
+  F TYS H
+  A VIE H
+  F WAL H
+  F WES H
+RUSSIA Orders
+  A BUL S A RUM - SER
+  A RUM S F SEV
+  F SEV S A RUM
+TURKEY Orders
+  A CON H
+
+--- Phase F1917M ---
+FRANCE Orders
+  A MAR S A SPA
+  A SPA - TUN VIA
+GERMANY Orders
+  A BER H
+  A BOH H
+  A BUR H
+  F ENG H
+  A GAL H
+  A MOS H
+  A MUN H
+  F NAO H
+  A PAR H
+  A PRU H
+  A SIL H
+  A UKR H
+  A WAR H
+  A YOR H
+ITALY Orders
+  F BRE H
+  A BUD S A VIE
+  F LVP H
+  F LYO S A MAR
+  F MAO H
+  F POR H
+  F SMY H
+  A TRI H
+  A TYR H
+  F TYS H
+  A VIE H
+  F WAL H
+  F WES H
+RUSSIA Orders
+  A BUL S A RUM
+  A RUM S F SEV
+  F SEV S A RUM
+TURKEY Orders
+  A CON H
+
+--- Phase S1918M ---
+FRANCE Orders
+  A MAR S A SPA
+  A SPA - TUN VIA
+GERMANY Orders
+  A BER H
+  A BOH H
+  A BUR H
+  F ENG H
+  A GAL H
+  A MOS H
+  A MUN H
+  F NAO H
+  A PAR H
+  A PRU H
+  A SIL H
+  A UKR H
+  A WAR H
+  A YOR H
+ITALY Orders
+  F BRE H
+  A BUD S A VIE
+  F LVP H
+  F LYO S A MAR
+  F MAO H
+  F POR H
+  F SMY H
+  A TRI - SER
+  A TYR H
+  F TYS - ION
+  A VIE S A BUD
+  F WAL H
+  F WES H
+RUSSIA Orders
+  A BUL - CON
+  A RUM S F SEV
+  F SEV S A RUM
+TURKEY Orders
+  A CON H
+
+--- Phase F1918M ---
+FRANCE Orders
+  A MAR S A SPA
+  A SPA - TUN VIA
+GERMANY Orders
+  A BER H
+  A BOH H
+  A BUR H
+  F ENG H
+  A GAL H
+  A MOS H
+  A MUN H
+  F NAO H
+  A PAR H
+  A PRU H
+  A SIL H
+  A UKR H
+  A WAR H
+  A YOR H
+ITALY Orders
+  F BRE H
+  A BUD S A VIE
+  F ION - TUN
+  F LVP H
+  F LYO S A MAR
+  F MAO H
+  F POR H
+  A SER H
+  F SMY H
+  A TYR H
+  A VIE H
+  F WAL H
+  F WES H
+RUSSIA Orders
+  A BUL S A RUM
+  A RUM S F SEV
+  F SEV S A RUM
+TURKEY Orders
+  A CON H
+
+--- Phase W1918A ---
+FRANCE Orders
+  (No valid orders)
+GERMANY Orders
+  (No valid orders)
+ITALY Orders
+  F NAP B
+  A ROM B
+  A VEN B
+RUSSIA Orders
+  (No valid orders)
+TURKEY Orders
+  (No valid orders)
+
+--- Phase S1919M ---
+FRANCE Orders
+  A MAR S A SPA
+  A SPA - WAL VIA
+GERMANY Orders
+  A BER H
+  A BOH H
+  A BUR H
+  F ENG H
+  A GAL H
+  A MOS H
+  A MUN H
+  F NAO H
+  A PAR H
+  A PRU H
+  A SIL H
+  A UKR H
+  A WAR H
+  A YOR H
+ITALY Orders
+  F BRE H
+  A BUD S A VIE
+  F LVP H
+  F LYO S A MAR
+  F MAO H
+  F NAP - ION
+  F POR H
+  A SER H
+  F SMY - CON
+  F TUN - NAF
+  A TYR H
+  A VIE H
+  F WAL H
+  F WES H
+RUSSIA Orders
+  A BUL S A RUM - SER
+  A RUM S F SEV
+  F SEV S A RUM
+TURKEY Orders
+  A CON H
+
+--- Phase F1919M ---
+FRANCE Orders
+  A MAR S A SPA
+  A SPA - TUN VIA
+GERMANY Orders
+  A BER H
+  A BOH H
+  A BUR H
+  F ENG H
+  A GAL H
+  A MOS H
+  A MUN H
+  F NAO H
+  A PAR H
+  A PRU H
+  A SIL H
+  A UKR H
+  A WAR H
+  A YOR H
+ITALY Orders
+  F BRE H
+  A BUD S A VIE
+  F ION - AEG
+  F LVP H
+  F LYO S A MAR
+  F MAO H
+  F NAF H
+  F POR H
+  A SER H
+  F SMY H
+  A TYR H
+  A VIE H
+  F WAL H
+  F WES H
+RUSSIA Orders
+  A BUL S A RUM
+  A RUM S F SEV
+  F SEV S A RUM
+TURKEY Orders
+  A CON H
+
+--- Phase S1920M ---
+FRANCE Orders
+  A MAR S A SPA
+  A SPA - TUN VIA
+GERMANY Orders
+  A BER H
+  A BOH H
+  A BUR H
+  F ENG H
+  A GAL H
+  A MOS H
+  A MUN H
+  F NAO H
+  A PAR H
+  A PRU H
+  A SIL H
+  A UKR H
+  A WAR H
+  A YOR H
+ITALY Orders
+  F AEG - CON
+  F BRE H
+  A BUD S A VIE
+  F LVP H
+  F LYO S A MAR
+  F MAO S A SPA
+  F NAF H
+  F POR H
+  A SER S A BUD
+  F SMY S F AEG - CON
+  A TYR S A VIE
+  A VIE S A TYR
+  F WAL H
+  F WES H
+RUSSIA Orders
+  A BUL S A RUM - SER
+  A RUM S F SEV
+  F SEV S A RUM
+TURKEY Orders
+  A CON H
+
+--- Phase S1920R ---
+FRANCE Orders
+  (No valid orders)
+GERMANY Orders
+  (No valid orders)
+ITALY Orders
+  (No valid orders)
+RUSSIA Orders
+  (No valid orders)
+TURKEY Orders
+  A CON R ANK
+
+--- Phase F1920M ---
+FRANCE Orders
+  A MAR S A SPA
+  A SPA - TUN VIA
+GERMANY Orders
+  A BER H
+  A BOH H
+  A BUR H
+  F ENG H
+  A GAL H
+  A MOS H
+  A MUN H
+  F NAO H
+  A PAR H
+  A PRU H
+  A SIL H
+  A UKR H
+  A WAR H
+  A YOR H
+ITALY Orders
+  F BRE H
+  A BUD S A VIE
+  F CON H
+  F LVP H
+  F LYO H
+  F MAO H
+  F NAF H
+  F POR H
+  A SER H
+  F SMY H
+  A TYR H
+  A VIE H
+  F WAL H
+  F WES H
+RUSSIA Orders
+  A BUL S A RUM - SER
+  A RUM S F SEV
+  F SEV S A RUM
+TURKEY Orders
+  A ANK H
+
+--- Phase S1921M ---
+FRANCE Orders
+  A MAR S A SPA
+  A SPA - TUN VIA
+GERMANY Orders
+  A BER H
+  A BOH H
+  A BUR H
+  F ENG H
+  A GAL H
+  A MOS H
+  A MUN H
+  F NAO H
+  A PAR H
+  A PRU H
+  A SIL H
+  A UKR H
+  A WAR H
+  A YOR H
+ITALY Orders
+  F BRE H
+  A BUD S A VIE
+  F CON S F SMY
+  F LVP H
+  F LYO S A MAR
+  F MAO H
+  F NAF H
+  F POR H
+  A SER H
+  F SMY H
+  A TYR H
+  A VIE H
+  F WAL H
+  F WES H
+RUSSIA Orders
+  A BUL S A RUM
+  A RUM - UKR
+  F SEV H
+TURKEY Orders
+  A ANK H
+
+--- Phase F1921M ---
+FRANCE Orders
+  A MAR S A SPA
+  A SPA - TUN VIA
+GERMANY Orders
+  A BER H
+  A BOH H
+  A BUR H
+  F ENG H
+  A GAL H
+  A MOS H
+  A MUN H
+  F NAO H
+  A PAR H
+  A PRU H
+  A SIL H
+  A UKR H
+  A WAR H
+  A YOR H
+ITALY Orders
+  F BRE H
+  A BUD S A VIE
+  F CON H
+  F LVP H
+  F LYO S A MAR
+  F MAO H
+  F NAF H
+  F POR H
+  A SER H
+  F SMY H
+  A TYR H
+  A VIE H
+  F WAL H
+  F WES H
+RUSSIA Orders
+  A BUL S A RUM
+  A RUM S F SEV
+  F SEV S A RUM
+TURKEY Orders
+  A ANK H
+
+--- Phase S1922M ---
+FRANCE Orders
+  A MAR S A SPA
+  A SPA - TUN VIA
+GERMANY Orders
+  A BER H
+  A BOH H
+  A BUR H
+  F ENG H
+  A GAL H
+  A MOS H
+  A MUN H
+  F NAO H
+  A PAR H
+  A PRU H
+  A SIL H
+  A UKR H
+  A WAR H
+  A YOR H
+ITALY Orders
+  F BRE H
+  A BUD S A VIE
+  F CON S F SMY
+  F LVP H
+  F LYO S A MAR
+  F MAO H
+  F NAF H
+  F POR H
+  A SER H
+  F SMY H
+  A TYR H
+  A VIE H
+  F WAL H
+  F WES H
+RUSSIA Orders
+  A BUL S A RUM
+  A RUM S F SEV
+  F SEV S A RUM
+TURKEY Orders
+  A ANK H
+
+--- Phase F1922M ---
+FRANCE Orders
+  A MAR S A SPA
+  A SPA - TUN VIA
+GERMANY Orders
+  A BER H
+  A BOH H
+  A BUR H
+  F ENG H
+  A GAL H
+  A MOS H
+  A MUN H
+  F NAO H
+  A PAR H
+  A PRU H
+  A SIL H
+  A UKR H
+  A WAR H
+  A YOR H
+ITALY Orders
+  F BRE H
+  A BUD S A VIE
+  F CON S F SMY
+  F LVP H
+  F LYO S A MAR
+  F MAO S F BRE
+  F NAF S F MAO
+  F POR S A SPA
+  A SER S A BUD
+  F SMY H
+  A TYR S A VIE
+  A VIE S A TYR
+  F WAL S F LVP
+  F WES S A SPA
+RUSSIA Orders
+  A BUL S F SEV - RUM
+  A RUM S F SEV
+  F SEV S A RUM
+TURKEY Orders
+  A ANK H
+
+--- Phase S1923M ---
+FRANCE Orders
+  A MAR S A SPA
+  A SPA - TUN VIA
+GERMANY Orders
+  A BER H
+  A BOH H
+  A BUR H
+  F ENG H
+  A GAL H
+  A MOS H
+  A MUN H
+  F NAO H
+  A PAR H
+  A PRU H
+  A SIL H
+  A UKR H
+  A WAR H
+  A YOR H
+ITALY Orders
+  F BRE H
+  A BUD S A VIE
+  F CON S F SMY
+  F LVP H
+  F LYO S A MAR
+  F MAO H
+  F NAF H
+  F POR H
+  A SER H
+  F SMY H
+  A TYR H
+  A VIE H
+  F WAL H
+  F WES H
+RUSSIA Orders
+  A BUL S A BUD - RUM
+  A RUM H
+  F SEV H
+TURKEY Orders
+  A ANK H
+
+--- Phase F1923M ---
+FRANCE Orders
+  A MAR S A SPA
+  A SPA - TUN VIA
+GERMANY Orders
+  A BER H
+  A BOH H
+  A BUR H
+  F ENG H
+  A GAL H
+  A MOS H
+  A MUN H
+  F NAO H
+  A PAR H
+  A PRU H
+  A SIL H
+  A UKR H
+  A WAR H
+  A YOR H
+ITALY Orders
+  F BRE H
+  A BUD S A VIE
+  F CON - BLA
+  F LVP H
+  F LYO S A MAR
+  F MAO H
+  F NAF H
+  F POR H
+  A SER H
+  F SMY H
+  A TYR H
+  A VIE H
+  F WAL H
+  F WES H
+RUSSIA Orders
+  A BUL S A RUM - SER
+  A RUM S F SEV
+  F SEV S A RUM
+TURKEY Orders
+  A ANK H
+
+--- Phase S1924M ---
+FRANCE Orders
+  A MAR S A SPA
+  A SPA - TUN VIA
+GERMANY Orders
+  A BER H
+  A BOH H
+  A BUR H
+  F ENG H
+  A GAL H
+  A MOS H
+  A MUN H
+  F NAO H
+  A PAR H
+  A PRU H
+  A SIL H
+  A UKR H
+  A WAR H
+  A YOR H
+ITALY Orders
+  F BLA - ANK
+  F BRE H
+  A BUD S A VIE
+  F LVP H
+  F LYO H
+  F MAO H
+  F NAF H
+  F POR H
+  A SER H
+  F SMY H
+  A TYR H
+  A VIE H
+  F WAL H
+  F WES H
+RUSSIA Orders
+  A BUL S F BLA - CON
+  A RUM S F SEV
+  F SEV S A RUM
+TURKEY Orders
+  A ANK H
+
+========================================
+FINAL SUPPLY CENTER COUNTS
+AUSTRIA 0
+ENGLAND 0
+FRANCE 2
+GERMANY 14
+ITALY 14
+RUSSIA 3
+TURKEY 1

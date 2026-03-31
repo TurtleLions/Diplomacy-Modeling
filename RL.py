@@ -11,8 +11,10 @@ import time
 from torch.utils.tensorboard import SummaryWriter
 import datetime
 from gymnasium.vector import AsyncVectorEnv
-
+import wandb
+from dotenv import load_dotenv
 from diplomacy_helpers import DiplomacyTransformer, DiplomacyTransformerEnv
+import contextlib
 
 # --- FAST SPARSE-TO-DENSE RECONSTRUCTION ---
 def rebuild_dense_mask(sparse_masks, num_provs, vocab_size, device):
@@ -158,13 +160,20 @@ if __name__ == "__main__":
 
     torch.set_num_threads(1)
 
-    NUM_ENVS = 6
+    NUM_ENVS = 32
     NUM_STEPS = 512
     NUM_AGENTS = 7
     HISTORY_LENGTH = 3
 
     if global_rank == 0:
         print("--- STARTING NATIVE TRANSFORMER PPO ---")
+
+        load_dotenv() # Loads the .env file
+        wandb_key = os.environ.get("WANDB_KEY")
+        if wandb_key:
+            wandb.login(key=wandb_key)
+        else:
+            print("WARNING: WANDB_KEY not found in .env file!")
 
     if global_rank == 0:
         # Rank 0 takes the job of building the file
@@ -201,7 +210,7 @@ if __name__ == "__main__":
             print(f"WARNING: BC weights not found at {bc_weights_path}. Starting from scratch.")
 
     net = DDP(net, device_ids=[local_rank])
-    optimizer = optim.Adam(net.parameters(), lr=1e-6, eps=1e-5)
+    optimizer = optim.Adam(net.parameters(), lr=1e-5, eps=1e-5)
 
     # --- MEMORY FIX: Rollout Buffers ---
     b_obs = torch.zeros((NUM_STEPS, NUM_ENVS, NUM_AGENTS, HISTORY_LENGTH, MAP_PROVINCES, 39), dtype=torch.float32, device=device)
@@ -220,7 +229,7 @@ if __name__ == "__main__":
     clip_coef = 0.2
     ent_coef = 0.0
     v_coef = 0.1
-    update_epochs = 4
+    update_epochs = 2
 
     agent_to_idx = {a: i for i, a in enumerate(possible_agents)}
     next_env_results = vec_env.reset()
@@ -236,10 +245,31 @@ if __name__ == "__main__":
         writer = SummaryWriter(log_dir=f"./runs/{run_name}")
         print(f"Logging TensorBoard data to: ./runs/{run_name}")
 
+        wandb.init(
+            project="diplomacy-ppo", # Give your project a name
+            name=run_name,
+            config={
+                "num_envs": NUM_ENVS,
+                "num_steps": NUM_STEPS,
+                "num_agents": NUM_AGENTS,
+                "history_length": HISTORY_LENGTH,
+                "num_updates": num_updates,
+                "gamma": gamma,
+                "gae_lambda": gae_lambda,
+                "clip_coef": clip_coef,
+                "ent_coef": ent_coef,
+                "v_coef": v_coef,
+                "update_epochs": update_epochs
+            }
+        )
+
     for update in range(1, num_updates + 1):
         start_time = time.time()
         net.eval()
         
+
+        env_step_time = 0.0
+        gpu_forward_time = 0.0
         for step in range(NUM_STEPS):
             b_dones[step] = next_done
             actions_to_send = [{} for _ in range(NUM_ENVS)]
@@ -261,7 +291,7 @@ if __name__ == "__main__":
 
                 flat_obs = b_obs[step][b_masks[step]]
                 if flat_obs.shape[0] > 0:
-                    
+                    t_gpu_start = time.time()
                     # --- REBUILD DENSE MASK FOR GPU ---
                     active_sparse = b_sparse_masks[step][b_masks[step].cpu()].to(device)
                     active_masks = rebuild_dense_mask(active_sparse, MAP_PROVINCES, VOCAB_SIZE, device)
@@ -310,8 +340,11 @@ if __name__ == "__main__":
                                 b_actions[step, i, agent_to_idx[a]] = act_array
                                 actions_to_send[i][a] = act_array.cpu().numpy()
                                 idx_counter += 1
+                    gpu_forward_time += (time.time() - t_gpu_start)
 
+            t_env_start = time.time()
             next_env_results = vec_env.step(actions_to_send)
+            env_step_time += (time.time() - t_env_start)
             
         with torch.no_grad():
             next_value = torch.zeros((NUM_ENVS, NUM_AGENTS), device=device)
@@ -343,14 +376,25 @@ if __name__ == "__main__":
         if flat_adv.shape[0] > 1:
             flat_adv = (flat_adv - flat_adv.mean()) / (flat_adv.std() + 1e-8)
 
+        t_update_start = time.time()
         net.train()
         b_size = flat_obs.shape[0]
-        mb_size = 512
+        
+        # --- GRADIENT ACCUMULATION SETUP ---
+        mb_size = 716
+        accum_steps = 4  # Accumulate gradients over 4 minibatches before syncing
         indices = np.arange(b_size)
+
+        # Ensure we start with a clean slate before the epoch loops begin
+        optimizer.zero_grad() 
 
         for epoch in range(update_epochs):
             np.random.shuffle(indices)
-            for start in range(0, b_size, mb_size):
+            
+            # Create a list of all start indices for the minibatches
+            start_indices = list(range(0, b_size, mb_size))
+            
+            for step_idx, start in enumerate(start_indices):
                 end = start + mb_size
                 mb_idx = indices[start:end]
                 
@@ -364,53 +408,90 @@ if __name__ == "__main__":
                 mb_sparse_gpu = flat_sparse_masks[mb_idx].to(device)
                 mb_masks_gpu = rebuild_dense_mask(mb_sparse_gpu, MAP_PROVINCES, VOCAB_SIZE, device)
 
-                optimizer.zero_grad() 
+                # Are we syncing on this step? (Yes, if we hit accum_steps or the very last batch)
+                is_last_batch = (step_idx + 1) == len(start_indices)
+                sync_this_step = (step_idx + 1) % accum_steps == 0 or is_last_batch
 
-                with torch.autocast(device_type='cuda', dtype=torch.bfloat16):
-                    logits, new_val = net(mb_obs, mb_act)
+                # --- DDP NO_SYNC CONTEXT MANAGER ---
+                my_context = net.no_sync() if not sync_this_step else contextlib.nullcontext()
                 
-                # ADD THESE TWO LINES TO CAST BACK TO 32-BIT
-                logits = logits.float()
-                new_val = new_val.float()
-                
-                logits = logits.masked_fill(~mb_masks_gpu, -1e4)
+                with my_context:
+                    with torch.autocast(device_type='cuda', dtype=torch.bfloat16):
+                        logits, new_val = net(mb_obs, mb_act)
                     
-                dist_cat = Categorical(logits=logits)
-                new_logp = dist_cat.log_prob(mb_act).sum(dim=1)
-                entropy = dist_cat.entropy().sum(dim=1).mean()
+                    # ADD THESE TWO LINES TO CAST BACK TO 32-BIT
+                    logits = logits.float()
+                    new_val = new_val.float()
+                    
+                    logits = logits.masked_fill(~mb_masks_gpu, -1e4)
+                        
+                    dist_cat = Categorical(logits=logits)
+                    new_logp = dist_cat.log_prob(mb_act).sum(dim=1)
+                    entropy = dist_cat.entropy().sum(dim=1).mean()
 
-                logratio = new_logp - mb_logprobs
-                ratio = logratio.exp()
-                
-                pg_loss1 = -mb_adv * ratio
-                pg_loss2 = -mb_adv * torch.clamp(ratio, 1 - clip_coef, 1 + clip_coef)
-                pg_loss = torch.max(pg_loss1, pg_loss2).mean()
-                
-                v_loss = 0.5 * ((new_val.squeeze() - mb_ret) ** 2).mean()
-                loss = pg_loss - ent_coef * entropy + v_loss * v_coef
-                
-                loss.backward()
-                nn.utils.clip_grad_norm_(net.parameters(), 0.5)
-                optimizer.step()
+                    logratio = new_logp - mb_logprobs
+                    ratio = logratio.exp()
+                    
+                    pg_loss1 = -mb_adv * ratio
+                    pg_loss2 = -mb_adv * torch.clamp(ratio, 1 - clip_coef, 1 + clip_coef)
+                    pg_loss = torch.max(pg_loss1, pg_loss2).mean()
+                    
+                    v_loss = 0.5 * ((new_val.squeeze() - mb_ret) ** 2).mean()
+                    loss = pg_loss - ent_coef * entropy + v_loss * v_coef
+                    
+                    # Divide loss by accum_steps so the accumulated gradients average out correctly
+                    loss = loss / accum_steps
+                    
+                    loss.backward()
+
+                # --- ONLY STEP AND ZERO IF WE SYNCED ---
+                if sync_this_step:
+                    nn.utils.clip_grad_norm_(net.parameters(), 0.5)
+                    optimizer.step()
+                    optimizer.zero_grad()
+                    
+        update_time = time.time() - t_update_start
 
         if global_rank == 0:
             end_time = time.time()  
+            total_time = end_time - start_time
             global_steps = NUM_ENVS * NUM_STEPS * NUM_AGENTS * dist.get_world_size()
-            sps = int(global_steps / (end_time - start_time))  
+            sps = int(global_steps / total_time)  
             avg_reward = b_rewards.sum() / (NUM_ENVS * NUM_AGENTS) 
-            
+            print(f"--- Timing Breakdown for Update {update} ---")
+            print(f"  Total Time: {total_time:.2f}s")
+            print(f"  CPU Env Step Time: {env_step_time:.2f}s ({(env_step_time/total_time)*100:.1f}%)")
+            print(f"  GPU Forward Pass:  {gpu_forward_time:.2f}s ({(gpu_forward_time/total_time)*100:.1f}%)")
+            print(f"  GPU Update Loop:   {update_time:.2f}s ({(update_time/total_time)*100:.1f}%)")
+            print("--------------------------------------")
             print(f"Update {update}/{num_updates} | SPS {sps} | Avg Reward {avg_reward:.2f} | Loss {loss.item():.4f} | Ent {entropy.item():.4f}")   
+            
             writer.add_scalar("Perf/SPS", sps, update)
             writer.add_scalar("Reward/Avg_Reward", avg_reward, update)
             writer.add_scalar("Loss/Policy_Loss", loss.item(), update)
             writer.add_scalar("Loss/Value_Loss", v_loss.item(), update)
             writer.add_scalar("Loss/Entropy", entropy.item(), update)
 
-            if update % 50 == 0:
+            # --- WANDB LOGGING ---
+            wandb.log({
+                "Perf/SPS": sps,
+                "Reward/Avg_Reward": avg_reward,
+                "Loss/Policy_Loss": loss.item(),
+                "Loss/Value_Loss": v_loss.item(),
+                "Loss/Entropy": entropy.item(),
+                "global_step": update * global_steps # Optional: tracks total environment steps
+            }, step=update)
+
+            if update % 10 == 0:
                 ckpt_path = f"./checkpoints/diplomacy_ppo_KV_update_{update}.pth"
                 torch.save(net.module.state_dict(), ckpt_path)
                 print(f"  -> Saved checkpoint to {ckpt_path}")
                 evaluate_and_save_game(net.module, device, update)
+                
+                # Optional: Log your evaluation text file to WandB as an artifact
+                eval_log_path = f"./eval_games/eval_game_KV_update_{update}.txt"
+                if os.path.exists(eval_log_path):
+                    wandb.save(eval_log_path)
 
         b_masks.zero_()
         b_rewards.zero_()
@@ -418,4 +499,5 @@ if __name__ == "__main__":
     vec_env.close()
     if global_rank == 0:
         writer.close()
+        wandb.finish()
     dist.destroy_process_group()

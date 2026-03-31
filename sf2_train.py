@@ -6,7 +6,12 @@ from sample_factory.algo.utils.context import global_model_factory
 from sample_factory.train import run_rl
 import torch
 import numpy as np
-torch.serialization.add_safe_globals([np.core.multiarray.scalar])
+torch.serialization.add_safe_globals([
+    np.core.multiarray.scalar, 
+    np.dtype,
+    np.dtypes.Float64DType, # Adding these just in case SF2 has other nested types
+    np.dtypes.Int64DType
+])
 from sf2_env import SF2DiplomacyEnv
 from sf2_model import DiplomacySF2Model
 
@@ -34,7 +39,7 @@ def main():
     # FIXED: Added [1:] to sys.argv to ignore the script name
     argv = sys.argv[1:] + [
         "--env=diplomacy_transformer_v0",
-        "--experiment=diplomacy_run_06_async",
+        "--experiment=diplomacy_run_07_async",
         "--train_dir=/data/restanislao/sf2_runs",
         "--save_every_sec=600", # Save every 30 minutes instead of every 2 mins
         "--keep_checkpoints=100",  # Only keep the newest weights per policy

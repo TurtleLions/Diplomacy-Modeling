@@ -106,13 +106,18 @@ class DiplomacySF2Model(ActorCritic):
             vocab_size=self.vocab_size
         )
 
-        bc_weights_path = "diplomacy_transformer_bc.pth"
+        # 1. Get the absolute path of the directory containing this script
+        current_dir = os.path.dirname(os.path.abspath(__file__))
+        
+        # 2. Join it with your weights filename
+        bc_weights_path = os.path.join(current_dir, "diplomacy_transformer_bc.pth")
         if os.path.exists(bc_weights_path):
             state_dict = torch.load(bc_weights_path, map_location="cpu")
             self.transformer.load_state_dict(state_dict, strict=True)
             print(f"Successfully loaded BC weights from {bc_weights_path}")
         else:
             print("WARNING: BC weights not found. Starting from random initialization.")
+            raise FileNotFoundError(f"FATAL: Could not find BC weights at {bc_weights_path}. Aborting to prevent random initialization.")
 
         self._dist = None
 
