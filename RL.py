@@ -244,7 +244,7 @@ if __name__ == "__main__":
     optimizer = optim.Adam(net.parameters(), lr=1e-5, eps=1e-5)
 
     # --- MEMORY FIX: Rollout Buffers ---
-    b_obs = torch.zeros((NUM_STEPS, NUM_ENVS, NUM_AGENTS, HISTORY_LENGTH, MAP_PROVINCES, 39), dtype=torch.bool, device=device)
+    b_obs = torch.zeros((NUM_STEPS, NUM_ENVS, NUM_AGENTS, HISTORY_LENGTH, MAP_PROVINCES, 46), dtype=torch.bool, device=device)
     b_actions = torch.zeros((NUM_STEPS, NUM_ENVS, NUM_AGENTS, MAP_PROVINCES), dtype=torch.long, device=device)
     b_logprobs = torch.zeros((NUM_STEPS, NUM_ENVS, NUM_AGENTS), dtype=torch.float32, device=device)
     b_rewards = torch.zeros((NUM_STEPS, NUM_ENVS, NUM_AGENTS), dtype=torch.float32, device=device)
@@ -421,7 +421,7 @@ if __name__ == "__main__":
 
         valid = b_masks.view(-1)
         valid_cpu = valid.cpu()
-        flat_obs = b_obs.view(-1, HISTORY_LENGTH, MAP_PROVINCES, 39)[valid]
+        flat_obs = b_obs.view(-1, HISTORY_LENGTH, MAP_PROVINCES, 46)[valid]
         flat_act = b_actions.view(-1, MAP_PROVINCES)[valid]
         flat_logprobs = b_logprobs.view(-1)[valid]
         flat_adv = advantages.view(-1)[valid]

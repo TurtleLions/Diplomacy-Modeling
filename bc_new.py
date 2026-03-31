@@ -24,6 +24,8 @@ from diplomacy_helpers import (
 import signal
 import time
 
+GLOBAL_POWERS = ['AUSTRIA', 'ENGLAND', 'FRANCE', 'GERMANY', 'ITALY', 'RUSSIA', 'TURKEY']
+
 def log_gpu_memory(rank):
     if rank != 0:
         return
@@ -85,7 +87,7 @@ class DiplomacyMemmapDataset(Dataset):
         
     def __getitem__(self, idx):
         if self.history is None:
-            self.history = np.memmap(self.history_path, dtype=np.int8, mode='r', shape=(self.total_samples, 3, self.num_provs, 39))
+            self.history = np.memmap(self.history_path, dtype=np.int8, mode='r', shape=(self.total_samples, 3, self.num_provs, 46))
             # NEW: Loading the Sparse Mask (1200 integers per sample)
             self.sparse_mask = np.memmap(self.mask_sparse_path, dtype=np.int32, mode='r', shape=(self.total_samples, 1200))
             self.targets = np.memmap(self.targets_path, dtype=np.int64, mode='r', shape=(self.total_samples, self.num_provs))
@@ -105,16 +107,22 @@ def _process_single_line(line):
         
     game_engine = Game()
     provinces = list(game_engine.map.locs)
-    history_buffer = np.zeros((3, worker_num_provs, 39), dtype=np.int8)
+    
+    # NEW: Create a separate history buffer for every agent
+    # Change 39 to 46 here as well
+    agent_histories = {p: np.zeros((3, worker_num_provs, 46), dtype=np.int8) for p in GLOBAL_POWERS}
     
     g_histories, g_masks, g_targets = [], [], []
     
     for phase in game_data.get('phases', []):
         game_engine.set_state(phase['state'])
-        current_state = parse_state_to_tensor(phase)
         
-        history_buffer = np.roll(history_buffer, shift=1, axis=0)
-        history_buffer[0] = current_state
+        # NEW: Generate the specific state for each power and update their unique buffer
+        for power in GLOBAL_POWERS:
+            # Ensure parse_state_to_tensor is updated to accept observing_agent
+            current_state = parse_state_to_tensor(phase, observing_agent=power)
+            agent_histories[power] = np.roll(agent_histories[power], shift=1, axis=0)
+            agent_histories[power][0] = current_state
         
         orders_dict = phase.get('orders', {})
         for power, text_orders in orders_dict.items():
@@ -146,9 +154,10 @@ def _process_single_line(line):
             sparse_mask[:num_valid] = valid_indices
             # ------------------------------
             
-            g_histories.append(history_buffer.copy())
+            g_histories.append(agent_histories[power].copy())
             g_masks.append(sparse_mask)
             g_targets.append(targets)
+            
             
     if not g_histories:
         return None
@@ -199,7 +208,7 @@ def process_and_save_to_disk(json_path, cache_dir="./dataset_cache", max_games=N
                 if max_games and games_yielded >= max_games:
                     break
 
-    num_cores = min(8, smp.cpu_count())
+    num_cores = min(24, smp.cpu_count())
     print(f"Starting standard multiprocessing pool with {num_cores} workers")
     
     total_samples = 0

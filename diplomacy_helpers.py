@@ -82,7 +82,7 @@ class KVCacheAttentionBlock(nn.Module):
         return out, new_kv_cache
 
 class DiplomacyTransformer(nn.Module):
-    def __init__(self, input_dim=39, d_model=256, nhead=8, num_layers=8, num_provinces=82, history_length=3, vocab_size=22231):
+    def __init__(self, input_dim=46, d_model=256, nhead=8, num_layers=8, num_provinces=82, history_length=3, vocab_size=22231):
         super().__init__()
         
         self.num_provinces = num_provinces
@@ -306,39 +306,43 @@ class DiplomacyTransformerEnv(ParallelEnv):
         self.order_to_idx, self.idx_to_order = build_global_vocab()
         self.vocab_size = len(self.order_to_idx)
         
-        # 2. State history buffer to feed the Transformer
-        # Shape: (History_Length, 82 Provinces, 25 Features)
-        self.state_history = np.zeros((self.history_length, self.num_provinces, 39), dtype=np.float32)
+        self.state_history = {
+            a: np.zeros((self.history_length, self.num_provinces, 46), dtype=np.float32) 
+            for a in self.possible_agents
+        }
 
         self.stalemate_counter = 0
-        self.stalemate_threshold = 3 # Terminate if no SCs change hands for 3 years
+        self.stalemate_threshold = 3 
         self.last_year_sc_owners = {}
 
-    def _update_history(self, new_state_tensor):
-        # Roll the history buffer backward (oldest state drops out)
-        self.state_history = np.roll(self.state_history, shift=1, axis=0)
+    def _update_history(self, agent, new_state_tensor):
+        # Roll the specific agent's history buffer backward
+        self.state_history[agent] = np.roll(self.state_history[agent], shift=1, axis=0)
         # Insert the newest state at index 0
-        self.state_history[0] = new_state_tensor
+        self.state_history[agent][0] = new_state_tensor
 
     def reset(self, seed=None, options=None):
         self.agents = self.possible_agents[:]
         self.game = Game()
         self.step_count = 0
         
-        # Clear history buffer with zeros
-        self.state_history = np.zeros((self.history_length, self.num_provinces, 39), dtype=np.float32)
+        # Clear ALL history buffers with zeros
+        self.state_history = {
+            a: np.zeros((self.history_length, self.num_provinces, 46), dtype=np.float32) 
+            for a in self.possible_agents
+        }
         
         self.stalemate_counter = 0
         self.last_year_sc_owners = {sc: a for a in self.agents for sc in self.game.get_centers(a)}
 
-        # Get first state and update history
-        obs_tensor = parse_state_to_tensor({'name': self.game.get_current_phase(), 'state': self.game.get_state()})
-        self._update_history(obs_tensor)
-        
-        # All agents receive the exact same global history tensor
-        observations = {a: self.state_history.copy() for a in self.agents} 
-        
-        # Generate exact global action masks for the new single head
+        # Update each agent's history with their specific one-hot encoded state
+        observations = {}
+        for a in self.agents:
+            agent_obs = parse_state_to_tensor({'name': self.game.get_current_phase(), 'state': self.game.get_state()}, observing_agent=a)
+            self._update_history(a, agent_obs)
+            # Pass the full 3D history tensor out
+            observations[a] = self.state_history[a].copy()
+            
         infos = {a: {'action_mask': get_sparse_action_mask(self.game, a, self.provinces, self.order_to_idx)} for a in self.agents}
         return observations, infos
 
@@ -378,9 +382,11 @@ class DiplomacyTransformerEnv(ParallelEnv):
         self.game.process()
         
         # --- UPDATE STATE & HISTORY ---
-        new_obs_tensor = parse_state_to_tensor({'name': self.game.get_current_phase(), 'state': self.game.get_state()})
-        self._update_history(new_obs_tensor)
-        observations = {a: self.state_history.copy() for a in self.agents}
+        observations = {}
+        for a in self.agents:
+            agent_obs = parse_state_to_tensor({'name': self.game.get_current_phase(), 'state': self.game.get_state()}, observing_agent=a)
+            self._update_history(a, agent_obs)
+            observations[a] = self.state_history[a].copy()
         
         # --- REWARDS & TERMINATION ---
         is_done = False
@@ -483,9 +489,9 @@ class DiplomacyTransformerEnv(ParallelEnv):
         
         return observations, rewards, terminations, {a: False for a in self.agents}, infos
 
-def parse_state_to_tensor(turn_data):
-    # Dimension updated to 39
-    state_tensor = np.zeros((len(GLOBAL_PROV_TO_IDX), 39), dtype=np.float32)
+def parse_state_to_tensor(turn_data, observing_agent=None):
+    # Dimension updated to 46
+    state_tensor = np.zeros((len(GLOBAL_PROV_TO_IDX), 46), dtype=np.float32)
     state_info = turn_data.get('state', {})
     
     phase_name = turn_data.get('name', 'S1901M') 
@@ -585,7 +591,14 @@ def parse_state_to_tensor(turn_data):
             if sc_upper in GLOBAL_PROV_TO_IDX:
                 p_idx = GLOBAL_PROV_TO_IDX[sc_upper]
                 state_tensor[p_idx, 9 + power_idx] = 1.0
-                
+    
+    if observing_agent is not None:
+        agent_upper = observing_agent.upper()
+        if agent_upper in GLOBAL_POWER_TO_IDX:
+            power_idx = GLOBAL_POWER_TO_IDX[agent_upper]
+            # Broadcast this identity across all provinces so the network can't miss it
+            state_tensor[:, 39 + power_idx] = 1.0
+
     return state_tensor
 
 if __name__ == "__main__":
