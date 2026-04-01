@@ -255,7 +255,7 @@ def get_global_action_mask(game, power, provinces, order_to_idx):
             
     return mask
 
-def get_sparse_action_mask(game, power, provinces, order_to_idx, max_len=1200):
+def get_sparse_action_mask(game, power, provinces, order_to_idx, max_len=2000):
     # 1. Generate the dense mask normally
     mask = np.zeros((len(provinces), len(order_to_idx)), dtype=np.bool_)
     orderable_locs = game.get_orderable_locations(power)
@@ -287,7 +287,12 @@ def get_sparse_action_mask(game, power, provinces, order_to_idx, max_len=1200):
     num_valid = len(valid_indices)
     
     if num_valid > max_len:
-        raise ValueError(f"FATAL: Exceeded max sparse mask length: {num_valid}")
+        # 1. Shuffle so we don't systematically bias against moves at the end of the vocab
+        print("Warning: Action space exceeds with "+str(num_valid)+". Randomly truncating valid actions.")
+        np.random.shuffle(valid_indices)
+        # 2. Hard truncate to the memory limit
+        valid_indices = valid_indices[:max_len]
+        num_valid = max_len
         
     sparse_mask = np.full(max_len, -1, dtype=np.int32)
     sparse_mask[:num_valid] = valid_indices

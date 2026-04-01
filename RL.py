@@ -190,8 +190,8 @@ if __name__ == "__main__":
 
     torch.set_num_threads(1)
 
-    NUM_ENVS = 64
-    NUM_STEPS = 512
+    NUM_ENVS = 28
+    NUM_STEPS = 1024
     NUM_AGENTS = 7
     HISTORY_LENGTH = 3
 
@@ -261,7 +261,7 @@ if __name__ == "__main__":
     b_values = torch.zeros((NUM_STEPS, NUM_ENVS, NUM_AGENTS), dtype=torch.float32, device=device)
     b_masks = torch.zeros((NUM_STEPS, NUM_ENVS, NUM_AGENTS), dtype=torch.bool, device=device) 
     
-    b_sparse_masks = torch.zeros((NUM_STEPS, NUM_ENVS, NUM_AGENTS, 1200), dtype=torch.int32, device=device)
+    b_sparse_masks = torch.zeros((NUM_STEPS, NUM_ENVS, NUM_AGENTS, 2000), dtype=torch.int32, device=device)
 
     num_updates = 1000
     gamma = 0.99
@@ -457,7 +457,27 @@ if __name__ == "__main__":
         flat_ret = returns.view(-1)[valid]
         flat_val = b_values.view(-1)[valid]
         
-        flat_sparse_masks = b_sparse_masks.view(-1, 1200)[valid_cpu]
+        flat_sparse_masks = b_sparse_masks.view(-1, 2000)[valid_cpu]
+
+        b_size = flat_obs.shape[0]
+        
+        # 1. Find the minimum batch size across all GPUs
+        local_b_size = torch.tensor([b_size], dtype=torch.long, device=device)
+        dist.all_reduce(local_b_size, op=dist.ReduceOp.MIN)
+        min_b_size = local_b_size.item()
+
+        # 2. Truncate all buffers to match the minimum size
+        if b_size > min_b_size:
+            # Shuffle first so we randomly drop data rather than systematically dropping the end of the rollouts
+            perm = torch.randperm(b_size, device=device)
+            flat_obs = flat_obs[perm][:min_b_size]
+            flat_act = flat_act[perm][:min_b_size]
+            flat_logprobs = flat_logprobs[perm][:min_b_size]
+            flat_adv = flat_adv[perm][:min_b_size]
+            flat_ret = flat_ret[perm][:min_b_size]
+            flat_val = flat_val[perm][:min_b_size]
+            flat_sparse_masks = flat_sparse_masks[perm.cpu()][:min_b_size]
+            b_size = min_b_size
 
         if flat_adv.shape[0] > 1:
             flat_adv = (flat_adv - flat_adv.mean()) / (flat_adv.std() + 1e-8)
