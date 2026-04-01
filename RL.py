@@ -182,6 +182,7 @@ def evaluate_and_save_game(net, device, update_num, save_dir="./eval_games"):
 
 
 if __name__ == "__main__":
+    mp.set_start_method('spawn', force=True)
     dist.init_process_group(backend="nccl")
     local_rank = int(os.environ["LOCAL_RANK"])
     global_rank = int(os.environ["RANK"])
