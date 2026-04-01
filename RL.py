@@ -612,17 +612,18 @@ if __name__ == "__main__":
                 "global_step": update * global_steps # Optional: tracks total environment steps
             }, step=update)
 
-            if update % 10 == 0:
-                ckpt_path = f"./checkpoints/diplomacy_ppo_KV_update_{update}.pth"
-                torch.save(net.module.state_dict(), ckpt_path)
-                print(f"  -> Saved checkpoint to {ckpt_path}")
-                evaluate_and_save_game(net.module, device, update)
-                
-                # Optional: Log your evaluation text file to WandB as an artifact
-                eval_log_path = f"./eval_games/eval_game_KV_update_{update}.txt"
-                if os.path.exists(eval_log_path):
-                    wandb.save(eval_log_path)
-
+            if global_rank == 0:
+                if update % 10 == 0:
+                    ckpt_path = f"./checkpoints/diplomacy_ppo_KV_update_{update}.pth"
+                    torch.save(net.module.state_dict(), ckpt_path)
+                    print(f"  -> Saved checkpoint to {ckpt_path}")
+                    
+                    # Run the memory-heavy evaluation ONLY on GPU 0
+                    evaluate_and_save_game(net.module, device, update)
+                    
+                    eval_log_path = f"./eval_games/eval_game_KV_update_{update}.txt"
+                    if os.path.exists(eval_log_path):
+                        wandb.save(eval_log_path)
         b_masks.zero_()
         b_rewards.zero_()
         
