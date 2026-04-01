@@ -190,7 +190,7 @@ if __name__ == "__main__":
 
     torch.set_num_threads(1)
 
-    NUM_ENVS = 32
+    NUM_ENVS = 64
     NUM_STEPS = 512
     NUM_AGENTS = 7
     HISTORY_LENGTH = 3
@@ -229,16 +229,25 @@ if __name__ == "__main__":
     vec_env = SubprocVecDiplomacy(num_envs=NUM_ENVS)
     net = DiplomacyTransformer(num_provinces=MAP_PROVINCES, history_length=HISTORY_LENGTH, vocab_size=VOCAB_SIZE).to(device)
     
+    # --- NEW: LOAD FROZEN BC MODEL FOR PRIOR MASKING ---
+    bc_model = DiplomacyTransformer(num_provinces=MAP_PROVINCES, history_length=HISTORY_LENGTH, vocab_size=VOCAB_SIZE).to(device)
     bc_weights_path = "diplomacy_transformer_bc.pth"
+    
     if os.path.exists(bc_weights_path):
-        # We set strict=False just in case the new Value Head causes a warning
-        # Since BC didn't train a value head, it will just initialize randomly
+        # Load weights into the PPO training model
         net.load_state_dict(torch.load(bc_weights_path, map_location=device), strict=False)
+        
+        # Load identical weights into the Prior Masking model and freeze it
+        bc_model.load_state_dict(torch.load(bc_weights_path, map_location=device), strict=False)
+        bc_model.eval()
+        for param in bc_model.parameters():
+            param.requires_grad = False
+            
         if global_rank == 0:
-            print(f"Successfully loaded pre-trained weights from {bc_weights_path}")
+            print(f"Successfully loaded pre-trained weights for PPO and Frozen BC Masking.")
     else:
         if global_rank == 0:
-            print(f"WARNING: BC weights not found at {bc_weights_path}. Starting from scratch.")
+            print(f"WARNING: BC weights not found. Prior Masking will be random!")
 
     net = DDP(net, device_ids=[local_rank])
     optimizer = optim.Adam(net.parameters(), lr=1e-5, eps=1e-5)
@@ -363,18 +372,39 @@ if __name__ == "__main__":
                     batch_indices = torch.arange(batch_size, device=device)
 
                     # 3. Decode ONLY up to the max number of units
+                    # NEW: Add a separate KV cache for the BC model
+                    bc_kv_cache = None 
+                    
                     for decode_idx in range(max_decode_steps):
                         prov_indices = padded_indices[:, decode_idx]
                         valid_step = step_mask[:, decode_idx]
                         
                         with torch.autocast(device_type='cuda', dtype=torch.bfloat16):
+                            # --- NEW: GET HUMAN PROBABILITIES ---
+                            bc_logits, bc_kv_cache = bc_model.decode_step(current_action, prov_indices, state_repr, bc_kv_cache)
+                            
+                            # Standard PPO forward pass
                             logits, kv_cache = net.module.decode_step(current_action, prov_indices, state_repr, kv_cache)
                         
-                        logits = logits.float()
-                        
-                        # Grab the legal action mask for these specific provinces
+                        # Grab the strict game engine legal action mask
                         prov_mask = active_masks[batch_indices, prov_indices, :]
-                        logits = logits.masked_fill(~prov_mask, -1e4)
+                        
+                        # --- NEW: COMBINE MASKS ---
+                        bc_probs = torch.softmax(bc_logits.float(), dim=-1)
+                        # Identify moves a human plays > 5% of the time
+                        bc_approved_mask = bc_probs > 0.05 
+                        
+                        # Logically AND the rules mask with the human mask
+                        combined_mask = prov_mask & bc_approved_mask
+                        
+                        # Fallback: If the BC model prunes literally every legal move, default back to the raw engine mask to prevent crashing
+                        fallback_mask = combined_mask.sum(dim=-1) == 0
+                        combined_mask[fallback_mask] = prov_mask[fallback_mask]
+                        # ---------------------------
+                        
+                        logits = logits.float()
+                        # Mask using the new tightly pruned action space
+                        logits = logits.masked_fill(~combined_mask, -1e4)
                         
                         dist_cat = Categorical(logits=logits)
                         current_action = dist_cat.sample()
@@ -383,7 +413,6 @@ if __name__ == "__main__":
                         # 4. Scatter the results back into the 82-length tensor ONLY if the step was valid
                         final_actions[batch_indices[valid_step], prov_indices[valid_step]] = current_action[valid_step]
                         final_logprobs[batch_indices[valid_step], prov_indices[valid_step]] = step_log_probs[valid_step]
-
                     # 5. Collapse logprobs to 1D for PPO and assign actions
                     b_values[step][b_masks[step]] = values.squeeze()
                     b_logprobs[step][b_masks[step]] = final_logprobs.sum(dim=1)
@@ -438,7 +467,7 @@ if __name__ == "__main__":
         b_size = flat_obs.shape[0]
         
         # --- GRADIENT ACCUMULATION SETUP ---
-        mb_size = 716
+        mb_size = 1024
         accum_steps = 4  # Accumulate gradients over 4 minibatches before syncing
         indices = np.arange(b_size)
 
@@ -474,17 +503,42 @@ if __name__ == "__main__":
                 
                 with my_context:
                     with torch.autocast(device_type='cuda', dtype=torch.bfloat16):
-                        logits, new_val = net(mb_obs, mb_act)
-                        logits = logits.masked_fill(~mb_masks_gpu, -1e4)
+                        # 1. Ask the network for the hidden states, NOT the massive logits
+                        decoder_out, new_val = net(mb_obs, mb_act, return_hidden=True)
+                        
+                        # 2. Find exactly which batch items/provinces actually contain units
+                        active_mask = (mb_act != NONE_IDX)
+                        batch_indices = torch.where(active_mask)[0]
+                        
+                        # 3. Pluck ONLY the active states out of the massive tensor
+                        active_hidden = decoder_out[active_mask]           # Shape: (N_active, 256)
+                        active_targets = mb_act[active_mask]               # Shape: (N_active)
+                        active_masks_gpu = mb_masks_gpu[active_mask]       # Shape: (N_active, 22231)
+                        
+                        # 4. Run the final linear projection ONLY on the active units
+                        active_logits = net.module.action_head(active_hidden)
+                        active_logits = active_logits.masked_fill(~active_masks_gpu, -1e4)
                     
-                    # ADD THESE TWO LINES TO CAST BACK TO 32-BIT
-                    logits = logits.float()
+                    # Cast back to 32-bit for stable distribution math
+                    active_logits = active_logits.float()
                     new_val = new_val.float()
                         
-                    dist_cat = Categorical(logits=logits)
-                    new_logp = dist_cat.log_prob(mb_act).sum(dim=1)
-                    entropy = dist_cat.entropy().sum(dim=1).mean()
+                    # 5. Calculate probabilities strictly for active units
+                    dist_cat = Categorical(logits=active_logits)
+                    active_logp = dist_cat.log_prob(active_targets)
+                    active_entropy = dist_cat.entropy()
+                    
+                    # 6. Scatter the isolated math back into standard batch sizes
+                    # PyTorch's scatter_add_ is fully differentiable, so gradients flow perfectly
+                    batch_size = mb_obs.size(0)
+                    new_logp = torch.zeros(batch_size, device=device)
+                    new_logp.scatter_add_(0, batch_indices, active_logp)
+                    
+                    entropy_sums = torch.zeros(batch_size, device=device)
+                    entropy_sums.scatter_add_(0, batch_indices, active_entropy)
+                    entropy = entropy_sums.mean()
 
+                    # --- STANDARD PPO MATH ---
                     logratio = new_logp - mb_logprobs
                     ratio = logratio.exp()
                     
@@ -495,9 +549,7 @@ if __name__ == "__main__":
                     v_loss = 0.5 * ((new_val.squeeze() - mb_ret) ** 2).mean()
                     loss = pg_loss - ent_coef * entropy + v_loss * v_coef
                     
-                    # Divide loss by accum_steps so the accumulated gradients average out correctly
                     loss = loss / accum_steps
-                    
                     loss.backward()
 
                 # --- ONLY STEP AND ZERO IF WE SYNCED ---
@@ -506,7 +558,7 @@ if __name__ == "__main__":
                     optimizer.step()
                     optimizer.zero_grad()
                 
-                del mb_obs, mb_act, logits, new_val, mb_masks_gpu, dist_cat
+                del mb_obs, mb_act, decoder_out, active_logits, new_val, mb_masks_gpu, dist_cat
                     
         update_time = time.time() - t_update_start
 

@@ -165,7 +165,7 @@ class DiplomacyTransformer(nn.Module):
         
         return logits, new_kv_cache
 
-    def decode_full(self, state_repr, actions):
+    def decode_full(self, state_repr, actions, return_hidden=False):
         """Teacher-forced forward pass purely on the decoder."""
         batch_size = state_repr.size(0)
         
@@ -183,15 +183,19 @@ class DiplomacyTransformer(nn.Module):
 
         decoder_out = checkpoint(decoder_wrapper, decoder_input, use_reentrant=False)
         
+        # --- NEW: OPTIONALLY RETURN HIDDEN STATES ---
+        if return_hidden:
+            return decoder_out
+            
         action_logits = self.action_head(decoder_out)
         return action_logits
 
-    def forward(self, x, actions):
+    def forward(self, x, actions, return_hidden=False):
         """Standard full forward pass for backwards compatibility."""
         batch_size = x.size(0)
         state_repr, state_value = self.encode_state(x)
         
-        action_logits = self.decode_full(state_repr, actions)
+        action_logits = self.decode_full(state_repr, actions, return_hidden=return_hidden)
         return action_logits, state_value
 
 def build_global_vocab(json_path="./datasets/standard_no_press.jsonl", cache_path="vocab.txt"):
