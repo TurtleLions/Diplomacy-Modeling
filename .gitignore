@@ -6,5 +6,6 @@ sf2_runs/
 wandb/
 .env
 old/
+data/
 eval_games/
 __pycache__/
