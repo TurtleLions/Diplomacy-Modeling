@@ -201,6 +201,7 @@ def parse_args():
     parser.add_argument("--kl_coef", type=float, default=0.05, help="KL divergence penalty coefficient")
     parser.add_argument("--update_epochs", type=int, default=2, help="Number of epochs per PPO update")
     parser.add_argument("--bc_weights", type=str, default="diplomacy_transformer_bc.pth", help="Path to pre-trained Behavioral Cloning weights")
+    parser.add_argument("--resume_weights", type=str, default=None, help="Path to RL checkpoint to resume training from")
     return parser.parse_args()
 
 def main():
@@ -252,11 +253,11 @@ def main():
     actor_net = DiplomacyTransformer(num_provinces=MAP_PROVINCES, history_length=HISTORY_LENGTH, vocab_size=VOCAB_SIZE).to(device)
     
     if os.path.exists(args.bc_weights):
-        state_dict = torch.load(args.bc_weights, map_location=device)
-        net.load_state_dict(state_dict, strict=False)
-        bc_model.load_state_dict(state_dict, strict=False)
-        actor_net.load_state_dict(state_dict, strict=False)
-        actor_bc_model.load_state_dict(state_dict, strict=False)
+        bc_state_dict = torch.load(args.bc_weights, map_location=device)
+        net.load_state_dict(bc_state_dict, strict=False)
+        bc_model.load_state_dict(bc_state_dict, strict=False)
+        actor_net.load_state_dict(bc_state_dict, strict=False)
+        actor_bc_model.load_state_dict(bc_state_dict, strict=False)
         
         # Freeze reference models
         bc_model.eval()
@@ -269,8 +270,16 @@ def main():
         if global_rank == 0: 
             print("Successfully loaded pre-trained BC weights for policy initialization.")
 
+    if args.resume_weights and os.path.exists(args.resume_weights):
+        rl_state_dict = torch.load(args.resume_weights, map_location=device)
+        net.load_state_dict(rl_state_dict, strict=False)
+        actor_net.load_state_dict(rl_state_dict, strict=False)
+        
+        if global_rank == 0:
+            print(f"Successfully resumed RL training from checkpoint: {args.resume_weights}")
+
     if global_rank == 0: 
-        print("Compiling PyTorch models (this may take a few minutes)...")
+        print("Compiling PyTorch models...")
     
     net = torch.compile(net)
     bc_model = torch.compile(bc_model)
