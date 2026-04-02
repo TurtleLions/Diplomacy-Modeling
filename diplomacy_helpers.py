@@ -205,7 +205,7 @@ def build_global_vocab(json_path="./datasets/standard_no_press.jsonl", cache_pat
         order_to_idx = {order: i for i, order in enumerate(sorted_orders)}
         return order_to_idx, {i: order for order, i in order_to_idx.items()}
 
-    print("Building global vocabulary from dataset (this may take a minute)...")
+    print("Building global vocabulary from dataset...")
     unique_orders = set(['NONE'])
     
     with open(json_path, 'r') as f:
@@ -511,9 +511,9 @@ class DiplomacyTransformerEnv(ParallelEnv):
             if current_phase.startswith('F') and self.step_count > 1:
                 sc_delta = len(current_scs) - len(prev_scs)
                 if sc_delta > 0:
-                    rewards[agent] += sc_delta * 5.0  
+                    rewards[agent] += sc_delta * 10.0  
                 elif sc_delta < 0:
-                    rewards[agent] += sc_delta * 5.0  
+                    rewards[agent] += sc_delta * 10.0  
                 
                 # Check for regional stalemates to prevent infinite rollout loops
                 if agent == self.agents[0]:
@@ -572,7 +572,7 @@ class DiplomacyTransformerEnv(ParallelEnv):
             # Combat penalty for unit dislodgement
             current_dislodged = current_state_dict.get('dislodged', {}).get(agent, [])
             if len(current_dislodged) > 0:
-                rewards[agent] -= (len(current_dislodged) * 1.0)
+                rewards[agent] -= (len(current_dislodged) * 0.2)
                 
         terminations = {a: is_done for a in self.agents}
         infos = {a: {'action_mask': get_sparse_action_mask(self.game, a, self.provinces, self.order_to_idx)} for a in self.agents}
