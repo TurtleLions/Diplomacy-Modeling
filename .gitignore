@@ -1,0 +1,10 @@
+datasets/
+venv/
+checkpoints/
+runs/
+sf2_runs/
+wandb/
+.env
+old/
+eval_games/
+__pycache__/
