@@ -1,4 +1,4 @@
-Evaluation Game - Update 50
+Evaluation Game - Update 70
 ========================================
 
 --- Phase S1901M ---
@@ -11,7 +11,7 @@ ENGLAND Orders
   F LON - ENG
   A LVP - WAL
 FRANCE Orders
-  F BRE - MAO
+  F BRE - ENG
   A MAR - SPA
   A PAR - BUR
 GERMANY Orders
@@ -38,12 +38,12 @@ AUSTRIA Orders
   A SER S A VIE - TRI
   A VIE - TRI
 ENGLAND Orders
-  F ENG C A WAL - BRE
+  F LON - ENG
   F NTH - NWY
-  A WAL - BRE VIA
+  A WAL - LON
 FRANCE Orders
+  F BRE - ENG
   A BUR - BEL
-  F MAO - POR
   A SPA H
 GERMANY Orders
   F HOL S A RUH - BEL
@@ -69,7 +69,6 @@ AUSTRIA Orders
   F TRI B
 ENGLAND Orders
   F EDI B
-  F LON B
   F LVP B
 FRANCE Orders
   A MAR B
@@ -96,37 +95,36 @@ AUSTRIA Orders
   F GRE - ION
   A SER S F TRI
   F TRI H
-  A VIE S F TRI
+  A VIE - TYR
 ENGLAND Orders
-  A BRE - PAR
   F EDI S F LON - NTH
-  F ENG S F LON - NTH
   F LON - NTH
   F NWY S F LON - NTH
+  A WAL - LON
 FRANCE Orders
-  A BUR - PAR
-  A MAR S A SPA - GAS
-  F POR - MAO
-  A SPA S F POR
+  F BRE - ENG
+  A BUR - PIC
+  A MAR - BUR
+  A SPA S A BUR - MAR
 GERMANY Orders
   A BEL - PIC
   F BER - BAL
   A DEN - SWE
-  F HOL - BEL
+  F HOL - NTH
   F KIE - DEN
-  A MUN H
+  A MUN - BUR
 ITALY Orders
   F NAP - APU
   F TUN - ION
   A TYR - TRI
-  A VEN H
+  A VEN S A TYR
 RUSSIA Orders
   A GAL S A RUM
   A MOS S F SEV
   A RUM S F SEV
   F SEV S A RUM
   F STP/NC S F NWY
-  F SWE S F STP/NC - NWY
+  F SWE - BAL
 TURKEY Orders
   A ANK - RUM VIA
   A ARM - SEV
@@ -139,103 +137,66 @@ AUSTRIA Orders
   F GRE - ION
   A SER S F TRI
   F TRI H
-  A VIE - TYR
+  A VIE S F TRI
 ENGLAND Orders
-  A BRE - PAR
   F EDI - NTH
-  F ENG S F NTH - BEL
-  F NWY - STP/NC
-  F NTH - BEL
+  A LON H
+  F NWY S F EDI - NTH
+  F NTH - SKA
 FRANCE Orders
-  A BUR - PAR
-  F MAO - BRE
+  A BUR - PIC
+  F ENG - LON
   A MAR - BUR
-  A SPA - HOL VIA
+  A SPA S A MAR - GAS
 GERMANY Orders
-  F BAL S A DEN - SWE
-  F BEL - NTH
+  A BEL - PIC
+  F BER - BAL
   A DEN - SWE
+  F HOL - NTH
   F KIE - DEN
-  A MUN S A BUR
-  A PIC - BEL
+  A MUN H
 ITALY Orders
   F APU S F TUN - ION
   F TUN - ION
-  A TYR S F TRI
-  A VEN S A TYR
+  A TYR - TRI
+  A VEN S A TYR - TRI
 RUSSIA Orders
   A GAL S A RUM
   A MOS S F SEV
-  A RUM S F SEV
+  A RUM S A GAL
   F SEV S A RUM
-  F STP/NC S A SPA - NWY
-  F SWE S F STP/NC - NWY
+  F STP/NC S A DEN - NWY
+  F SWE - NWY
 TURKEY Orders
   A ANK - RUM VIA
   A ARM - SEV
   F BLA S A ARM - SEV
   A BUL S A ANK - RUM
 
---- Phase F1902R ---
-AUSTRIA Orders
-  (No valid orders)
-ENGLAND Orders
-  (No valid orders)
-FRANCE Orders
-  (No valid orders)
-GERMANY Orders
-  F BEL R HOL
-ITALY Orders
-  (No valid orders)
-RUSSIA Orders
-  F SWE D
-TURKEY Orders
-  (No valid orders)
-
---- Phase W1902A ---
-AUSTRIA Orders
-  (No valid orders)
-ENGLAND Orders
-  F EDI B
-  F LON B
-  F LVP B
-FRANCE Orders
-  (No valid orders)
-GERMANY Orders
-  (No valid orders)
-ITALY Orders
-  (No valid orders)
-RUSSIA Orders
-  (No valid orders)
-TURKEY Orders
-  (No valid orders)
-
 --- Phase S1903M ---
 AUSTRIA Orders
   A BUD S F TRI
-  F GRE H
+  F GRE - ION
   A SER S F TRI
   F TRI H
   A VIE S F TRI
 ENGLAND Orders
-  F BEL S F EDI - NTH
-  A BRE - NWY VIA
-  F EDI - NTH
-  F ENG S F EDI - NTH
-  F NWY - STP/NC
-  F NTH - NWY
+  F EDI S F SKA - NTH
+  A LON H
+  F NWY S F SKA - NTH
+  F SKA - NTH
 FRANCE Orders
-  A BUR - PAR
-  F MAO - ENG
+  A BUR - PIC
+  F ENG - LON
   A MAR - BUR
-  A SPA - DEN VIA
+  A SPA S A BUR - GAS
 GERMANY Orders
-  F BAL - DEN
-  F DEN - SKA
-  F HOL S A PIC - BEL
-  A MUN - RUH
-  A PIC - BEL
-  A SWE S F STP/NC - NWY
+  F BAL - SWE
+  A BEL S A MUN - BUR
+  A DEN S F BAL - SWE
+  F HOL - NTH
+  F KIE - DEN
+  A MUN - BUR
 ITALY Orders
   F APU - ADR
   F ION - GRE
@@ -246,65 +207,81 @@ RUSSIA Orders
   A MOS S F SEV
   A RUM S F SEV
   F SEV S A RUM
-  F STP/NC S A SWE - NWY
+  F STP/NC S F NWY
+  F SWE - NWY
 TURKEY Orders
-  A ANK - CON
+  A ANK - RUM VIA
   A ARM - SEV
   F BLA S A ARM - SEV
   A BUL S A ANK - RUM
 
+--- Phase S1903R ---
+AUSTRIA Orders
+  (No valid orders)
+ENGLAND Orders
+  (No valid orders)
+FRANCE Orders
+  (No valid orders)
+GERMANY Orders
+  (No valid orders)
+ITALY Orders
+  (No valid orders)
+RUSSIA Orders
+  F SWE R BOT
+TURKEY Orders
+  (No valid orders)
+
 --- Phase F1903M ---
 AUSTRIA Orders
   A BUD S F TRI
-  F GRE S A RUM - BUL
+  F GRE - ION
   A SER S F TRI
   F TRI H
   A VIE S F TRI
 ENGLAND Orders
-  A BRE - PAR
   F EDI - NTH
-  F ENG S F EDI - NTH
+  A LON H
   F NWY S F EDI - NTH
-  F NTH - SKA
+  F NTH - DEN
 FRANCE Orders
-  A BUR - PAR
-  F MAO S A PAR - BRE
-  A PAR - BRE
-  A SPA S A BUR - MAR
+  F ENG - BEL
+  A MAR - BUR
+  A PIC S F ENG - BEL
+  A SPA - POR
 GERMANY Orders
-  A BEL H
-  F DEN - NTH
-  F HOL S F DEN - NTH
-  A RUH S A BEL
-  F SKA S A SWE - NWY
-  A SWE - NWY
+  A BEL - PIC
+  A BUR S A BEL - PIC
+  A DEN - SWE
+  F HOL - BEL
+  F KIE - BAL
+  F SWE - NWY
 ITALY Orders
-  F ADR S A VEN - TRI
+  F ADR S A TYR - TRI
   F ION - GRE
-  A TYR S A VEN - TRI
-  A VEN - TRI
+  A TYR - TRI
+  A VEN S A TYR - TRI
 RUSSIA Orders
+  F BOT - SWE
   A GAL S A RUM
   A MOS S F SEV
   A RUM S F SEV
   F SEV S A RUM
-  F STP/NC S A SWE - NWY
+  F STP/NC S A DEN - NWY
 TURKEY Orders
+  A ANK - RUM VIA
   A ARM - SEV
   F BLA S A ARM - SEV
-  A BUL - SEV VIA
-  A CON S A BUL
+  A BUL S A ANK - RUM
 
 --- Phase F1903R ---
 AUSTRIA Orders
   (No valid orders)
 ENGLAND Orders
-  A BRE R PIC
-  F NWY R NWG
+  (No valid orders)
 FRANCE Orders
   (No valid orders)
 GERMANY Orders
-  (No valid orders)
+  A BEL R RUH
 ITALY Orders
   (No valid orders)
 RUSSIA Orders
@@ -316,21 +293,21 @@ TURKEY Orders
 AUSTRIA Orders
   (No valid orders)
 ENGLAND Orders
-  F EDI D
-  F ENG D
-  F NTH D
-  F NWG D
-  A PIC D
+  (No valid orders)
 FRANCE Orders
-  A MAR B
+  F BRE B
+  A PAR B
 GERMANY Orders
-  A BER B
-  A KIE B
-  A MUN B
+  (No valid orders)
 ITALY Orders
   (No valid orders)
 RUSSIA Orders
-  (No valid orders)
+  F BOT D
+  A GAL D
+  A MOS D
+  A RUM D
+  F SEV D
+  F STP/NC D
 TURKEY Orders
   (No valid orders)
 
@@ -340,26 +317,26 @@ AUSTRIA Orders
   F GRE - ION
   A SER S F TRI
   F TRI H
-  A VIE S F TRI
+  A VIE S A BUD
 ENGLAND Orders
-  F NTH - DEN
-  F NWG - EDI
-  A PIC - BEL
+  F EDI - NTH
+  A LON H
+  F NWY S F EDI - NTH
+  F NTH - SKA
 FRANCE Orders
-  A BRE - PIC
-  F MAO C A SPA - NAF
-  A MAR - BUR
-  A PAR S A BRE - PIC
-  A SPA - POR VIA
+  F BEL S F NTH - HOL
+  F BRE - ENG
+  A MAR S A PAR - BUR
+  A PAR - BUR
+  A PIC S F BEL
+  A POR - SPA
 GERMANY Orders
-  A BEL S A RUH - BUR
-  A BER - SIL
-  F DEN S F HOL - NTH
-  F HOL - NTH
-  A KIE - HOL
-  A NWY - FIN
-  A RUH - BUR
-  F SKA S F HOL - NTH
+  F BAL - DEN
+  A BUR - PIC
+  A DEN - SWE
+  F HOL S A RUH - BEL
+  A RUH - BEL
+  F SWE - NWY
 ITALY Orders
   F ADR S A TYR - TRI
   F ION - GRE
@@ -370,22 +347,22 @@ RUSSIA Orders
   A MOS S F SEV
   A RUM S F SEV
   F SEV S A RUM
-  F STP/NC S F NWG - NWY
+  F STP/NC S A DEN - NWY
 TURKEY Orders
+  A ANK - RUM VIA
   A ARM - SEV
   F BLA S A ARM - SEV
-  A BUL - SEV VIA
-  A CON S A BUL
+  A BUL S A ANK - RUM
 
 --- Phase S1904R ---
 AUSTRIA Orders
   (No valid orders)
 ENGLAND Orders
-  F NTH R LON
+  (No valid orders)
 FRANCE Orders
   (No valid orders)
 GERMANY Orders
-  (No valid orders)
+  A BUR R RUH
 ITALY Orders
   (No valid orders)
 RUSSIA Orders
@@ -401,39 +378,39 @@ AUSTRIA Orders
   F TRI H
   A VIE S F TRI
 ENGLAND Orders
-  F EDI S F LON - NTH
-  F LON - NTH
+  A LON H
+  F NWY - SWE
+  F NTH - DEN
+  F SKA S F NWY - SWE
 FRANCE Orders
-  F MAO C A POR - BRE
-  A MAR S A PAR - BUR
-  A PAR S A POR - BRE
-  A PIC - BUR
-  A POR - BRE VIA
+  A BUR - BEL
+  F ENG S A BUR - BEL
+  A MAR - BUR
+  A PIC S A BUR - BEL
+  A SPA S A BUR - MAR
 GERMANY Orders
-  A BEL S A RUH - BUR
-  F DEN - NTH
-  A FIN - STP
-  A HOL - BEL
-  F NTH - LON
-  A RUH - BUR
-  A SIL - WAR
-  F SKA - NWY
+  F BAL S F SWE
+  A BEL H
+  A DEN S F SWE
+  F HOL S A BEL
+  A RUH - MUN
+  F SWE S F STP/NC - NWY
 ITALY Orders
-  F ADR S A TYR - TRI
+  F ADR S A VEN - TRI
   F ION - GRE
-  A TYR - TRI
-  A VEN S A TYR - TRI
+  A TYR - VIE
+  A VEN - TRI
 RUSSIA Orders
-  A GAL - WAR
+  A GAL S A RUM
   A MOS S F SEV
   A RUM S F SEV
   F SEV S A RUM
-  F STP/NC - NWY
+  F STP/NC S A DEN - NWY
 TURKEY Orders
+  A ANK - RUM VIA
   A ARM - SEV
   F BLA S A ARM - SEV
-  A BUL - SEV VIA
-  A CON S A BUL
+  A BUL S A ANK - RUM
 
 --- Phase F1904R ---
 AUSTRIA Orders
@@ -443,7 +420,7 @@ ENGLAND Orders
 FRANCE Orders
   (No valid orders)
 GERMANY Orders
-  F NTH R ENG
+  A BEL R RUH
 ITALY Orders
   (No valid orders)
 RUSSIA Orders
@@ -455,10 +432,11 @@ TURKEY Orders
 AUSTRIA Orders
   (No valid orders)
 ENGLAND Orders
-  F LON B
-  F LVP B
-FRANCE Orders
   (No valid orders)
+FRANCE Orders
+  F BRE B
+  F MAR B
+  A PAR B
 GERMANY Orders
   (No valid orders)
 ITALY Orders
@@ -476,40 +454,40 @@ AUSTRIA Orders
   F TRI H
   A VIE S F TRI
 ENGLAND Orders
-  F EDI - CLY
-  F LON S F NTH
+  A LON - WAL
+  F NWY S F SKA - SWE
   F NTH - DEN
+  F SKA - SWE
 FRANCE Orders
-  A BRE S A PIC
-  F MAO - ENG
-  A MAR S A PAR - BUR
-  A PAR - BUR
-  A PIC S A PAR - BUR
+  A BEL S A BUR - RUH
+  F BRE - ENG
+  A BUR - RUH
+  F ENG - IRI
+  A PIC S A BEL
+  A SPA - POR
 GERMANY Orders
-  A BEL - PIC
-  A BUR S A BEL - PIC
-  F DEN - NTH
-  F ENG - WAL
-  A FIN - STP
-  A HOL - BEL
-  A SIL - WAR
-  F SKA - NWY
+  F BAL S F SWE
+  A DEN S F SWE
+  F HOL S A RUH - BEL
+  A MUN S A RUH
+  A RUH - BEL
+  F SWE - NWY
 ITALY Orders
   F ADR S A TYR - TRI
   F ION - GRE
   A TYR - TRI
   A VEN S A TYR - TRI
 RUSSIA Orders
-  A GAL - WAR
+  A GAL S A RUM
   A MOS S F SEV
   A RUM S F SEV
   F SEV S A RUM
-  F STP/NC S A PIC - NWY
+  F STP/NC S A DEN - NWY
 TURKEY Orders
+  A ANK - RUM VIA
   A ARM - SEV
   F BLA S A ARM - SEV
-  A BUL - SEV VIA
-  A CON S A BUL
+  A BUL S A ANK - RUM
 
 --- Phase S1905R ---
 AUSTRIA Orders
@@ -519,7 +497,8 @@ ENGLAND Orders
 FRANCE Orders
   (No valid orders)
 GERMANY Orders
-  A BUR R RUH
+  A RUH R KIE
+  F SWE R BOT
 ITALY Orders
   (No valid orders)
 RUSSIA Orders
@@ -535,90 +514,47 @@ AUSTRIA Orders
   F TRI H
   A VIE S F TRI
 ENGLAND Orders
-  F CLY - LVP
-  F LON H
-  F NTH H
+  F NWY S F SWE
+  F NTH - LON
+  F SWE H
+  A WAL - LVP
 FRANCE Orders
-  A BRE - BEL VIA
-  A BUR S A BRE - BEL
-  F ENG C A BRE - BEL
-  A MAR S A BUR
-  A PIC - BEL
+  A BEL S A RUH - HOL
+  F ENG C A PIC - LON
+  F IRI - LVP
+  A PIC - LON VIA
+  A POR - SPA
+  A RUH - HOL
 GERMANY Orders
-  A BEL S A RUH - BUR
-  F DEN - NTH
-  A FIN - STP
-  A HOL S A BEL
-  F NWY S A FIN - STP
-  A RUH - BUR
-  A SIL - MUN
-  F WAL S F CLY - LVP
+  F BAL S A DEN - SWE
+  F BOT S A DEN - SWE
+  A DEN - SWE
+  F HOL - BEL
+  A KIE - RUH
+  A MUN - BUR
 ITALY Orders
   F ADR S A TYR - TRI
   F ION - GRE
   A TYR - TRI
   A VEN S A TYR - TRI
 RUSSIA Orders
-  A GAL - WAR
-  A MOS S F STP/NC
+  A GAL S A RUM
+  A MOS S F SEV
   A RUM S F SEV
   F SEV S A RUM
-  F STP/NC S F NWY
+  F STP/NC S A PIC - NWY
 TURKEY Orders
+  A ANK - RUM VIA
   A ARM - SEV
-  F BLA S A ARM - SEV
-  A BUL - SEV VIA
-  A CON S A BUL
-
---- Phase S1906M ---
-AUSTRIA Orders
-  A BUD S F TRI
-  F GRE S A RUM - BUL
-  A SER S F TRI
-  F TRI H
-  A VIE S F TRI
-ENGLAND Orders
-  F LON S F NTH
-  F LVP S F WAL
-  F NTH H
-FRANCE Orders
-  A BRE - BEL VIA
-  A BUR S A BRE - BEL
-  F ENG C A BRE - BEL
-  A MAR S A BUR
-  A PIC - BEL
-GERMANY Orders
-  A BEL S A RUH - BUR
-  F DEN - NTH
-  A FIN - STP
-  A HOL S A BEL
-  A MUN S A RUH - BUR
-  F NWY S A FIN - STP
-  A RUH - BUR
-  F WAL - LON
-ITALY Orders
-  F ADR S A TYR - TRI
-  F ION - GRE
-  A TYR - TRI
-  A VEN S A TYR - TRI
-RUSSIA Orders
-  A MOS S F STP/NC
-  A RUM S F SEV
-  F SEV S A RUM
-  F STP/NC S F NWY
-  A WAR - SIL
-TURKEY Orders
-  A ARM - SEV
-  F BLA S A ARM - SEV
-  A BUL - SEV VIA
-  A CON S A BUL
+  F BLA C A ANK - RUM
+  A BUL S A ANK - RUM
 
 ========================================
 FINAL SUPPLY CENTER COUNTS
 AUSTRIA 5
-ENGLAND 3
-FRANCE 5
-GERMANY 8
+ENGLAND 4
+FRANCE 6
+GERMANY 6
 ITALY 4
 RUSSIA 5
 TURKEY 4
