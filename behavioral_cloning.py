@@ -1,17 +1,24 @@
+"""
+Behavioral Cloning pipeline for the Diplomacy Transformer.
+Processes JSON game history into memory-mapped arrays and trains the model using DDP.
+"""
 import os
+import time
 import json
+import signal
+import argparse
+import multiprocessing as smp
+
+import psutil
 import numpy as np
 import torch
 import torch.nn as nn
 import torch.optim as optim
-import multiprocessing as smp
-import torch.multiprocessing as mp
-import psutil
 import torch.distributed as dist
+import torch.multiprocessing as mp
 from torch.nn.parallel import DistributedDataParallel as DDP
 from torch.utils.data.distributed import DistributedSampler
 from torch.utils.data import Dataset, DataLoader
-import gc
 from diplomacy import Game
 
 from diplomacy_helpers import (
@@ -21,20 +28,13 @@ from diplomacy_helpers import (
     DiplomacyTransformer
 )
 
-import signal
-import time
-
+# Constants
 GLOBAL_POWERS = ['AUSTRIA', 'ENGLAND', 'FRANCE', 'GERMANY', 'ITALY', 'RUSSIA', 'TURKEY']
+FEATURE_DIM = 46
+MAX_SPARSE_MASK_LEN = 1200
 
-def log_gpu_memory(rank):
-    if rank != 0:
-        return
-    allocated = torch.cuda.memory_allocated(rank) / (1024**3)
-    reserved = torch.cuda.memory_reserved(rank) / (1024**3)
-    print(f"[LOG] GPU 0 VRAM Allocated {allocated:.2f} GB | Reserved {reserved:.2f} GB")
-    print("-" * 40)
-
-# Global variables for background workers
+# Global variables for multiprocessing workers.
+# Initializing these globally prevents copying large dictionaries across process boundaries.
 worker_prov_to_idx = None
 worker_order_to_idx = None
 worker_num_provs = None
@@ -42,6 +42,7 @@ worker_none_idx = None
 worker_vocab_size = None
 
 def init_worker(p_idx, o_idx, n_provs, n_idx, v_size):
+    """Initializes global variables for multiprocessing pool workers."""
     signal.signal(signal.SIGINT, signal.SIG_IGN)
     global worker_prov_to_idx, worker_order_to_idx, worker_num_provs, worker_none_idx, worker_vocab_size
     worker_prov_to_idx = p_idx
@@ -50,25 +51,25 @@ def init_worker(p_idx, o_idx, n_provs, n_idx, v_size):
     worker_none_idx = n_idx
     worker_vocab_size = v_size
 
-def warm_os_cache(filepath):
-    print(f"Forcing OS page cache for {os.path.basename(filepath)}...")
-    mapped_file = np.memmap(filepath, mode='r')
-    # Touch one byte every 4096 bytes to load every page into RAM
-    _ = mapped_file[::4096].copy()
-    del mapped_file
-
-# --- RESOURCE LOGGING ---
 def log_system_resources(stage_name, rank=0):
     if rank != 0:
         return
     print(f"\n[LOG] Resource Usage - {stage_name}")
     ram_info = psutil.virtual_memory()
-    print(f"System RAM Used {ram_info.used / (1024**3):.1f} GB of {ram_info.total / (1024**3):.1f} GB ({ram_info.percent}%)")
+    print(f"System RAM Used: {ram_info.used / (1024**3):.1f} GB of {ram_info.total / (1024**3):.1f} GB ({ram_info.percent}%)")
     print("-" * 40)
 
-# --- 1. DATASET PREPARATION ---
+def log_gpu_memory(rank):
+    if rank != 0:
+        return
+    allocated = torch.cuda.memory_allocated(rank) / (1024**3)
+    reserved = torch.cuda.memory_reserved(rank) / (1024**3)
+    print(f"[LOG] GPU 0 VRAM Allocated: {allocated:.2f} GB | Reserved: {reserved:.2f} GB")
+    print("-" * 40)
+
 
 class DiplomacyMemmapDataset(Dataset):
+    """Dataset class utilizing memory-mapped files for out-of-core training."""
     def __init__(self, history_path, mask_sparse_path, targets_path, total_samples, num_provs, vocab_size):
         self.history_path = history_path
         self.mask_sparse_path = mask_sparse_path
@@ -86,10 +87,10 @@ class DiplomacyMemmapDataset(Dataset):
         return self.total_samples
         
     def __getitem__(self, idx):
+        # Lazy initialization of memmap arrays for multiprocessing compatibility
         if self.history is None:
-            self.history = np.memmap(self.history_path, dtype=np.int8, mode='r', shape=(self.total_samples, 3, self.num_provs, 46))
-            # NEW: Loading the Sparse Mask (1200 integers per sample)
-            self.sparse_mask = np.memmap(self.mask_sparse_path, dtype=np.int32, mode='r', shape=(self.total_samples, 1200))
+            self.history = np.memmap(self.history_path, dtype=np.int8, mode='r', shape=(self.total_samples, 3, self.num_provs, FEATURE_DIM))
+            self.sparse_mask = np.memmap(self.mask_sparse_path, dtype=np.int32, mode='r', shape=(self.total_samples, MAX_SPARSE_MASK_LEN))
             self.targets = np.memmap(self.targets_path, dtype=np.int64, mode='r', shape=(self.total_samples, self.num_provs))
             
         return {
@@ -99,6 +100,7 @@ class DiplomacyMemmapDataset(Dataset):
         }
 
 def _process_single_line(line):
+    """Parses a single JSON game record and extracts state, masks, and target orders."""
     global worker_prov_to_idx, worker_order_to_idx, worker_num_provs, worker_none_idx, worker_vocab_size
     game_data = json.loads(line)
     
@@ -108,18 +110,14 @@ def _process_single_line(line):
     game_engine = Game()
     provinces = list(game_engine.map.locs)
     
-    # NEW: Create a separate history buffer for every agent
-    # Change 39 to 46 here as well
-    agent_histories = {p: np.zeros((3, worker_num_provs, 46), dtype=np.int8) for p in GLOBAL_POWERS}
+    agent_histories = {p: np.zeros((3, worker_num_provs, FEATURE_DIM), dtype=np.int8) for p in GLOBAL_POWERS}
     
     g_histories, g_masks, g_targets = [], [], []
     
     for phase in game_data.get('phases', []):
         game_engine.set_state(phase['state'])
         
-        # NEW: Generate the specific state for each power and update their unique buffer
         for power in GLOBAL_POWERS:
-            # Ensure parse_state_to_tensor is updated to accept observing_agent
             current_state = parse_state_to_tensor(phase, observing_agent=power)
             agent_histories[power] = np.roll(agent_histories[power], shift=1, axis=0)
             agent_histories[power][0] = current_state
@@ -141,23 +139,20 @@ def _process_single_line(line):
                         p_idx = worker_prov_to_idx[u_loc]
                         targets[p_idx] = worker_order_to_idx[clean_order]
             
-            # --- SPARSE MASK CONVERSION ---
+            # Convert dense boolean mask to flat sparse indices
             flat_mask = mask.flatten()
             valid_indices = np.where(flat_mask)[0].astype(np.int32)
             num_valid = len(valid_indices)
             
-            # THE SAFETY TRIPWIRE
-            if num_valid > 1200:
-                raise ValueError(f"FATAL: Found {num_valid} valid moves! Exceeds the 1200 sparse mask limit.")
+            if num_valid > MAX_SPARSE_MASK_LEN:
+                raise ValueError(f"Action space constraint violated: Found {num_valid} valid moves, max is {MAX_SPARSE_MASK_LEN}.")
                 
-            sparse_mask = np.full(1200, -1, dtype=np.int32)
+            sparse_mask = np.full(MAX_SPARSE_MASK_LEN, -1, dtype=np.int32)
             sparse_mask[:num_valid] = valid_indices
-            # ------------------------------
             
             g_histories.append(agent_histories[power].copy())
             g_masks.append(sparse_mask)
             g_targets.append(targets)
-            
             
     if not g_histories:
         return None
@@ -168,14 +163,15 @@ def _process_single_line(line):
         np.stack(g_targets)
     )
 
-def process_and_save_to_disk(json_path, cache_dir="./dataset_cache", max_games=None):
+def process_and_save_to_disk(json_path, cache_dir, max_games=None):
+    """Processes raw JSON datasets and writes them to binary memmap caches."""
     os.makedirs(cache_dir, exist_ok=True)
     history_path = os.path.join(cache_dir, "history.bin")
     mask_sparse_path = os.path.join(cache_dir, "mask_sparse.bin")
     targets_path = os.path.join(cache_dir, "targets.bin")
     
     if os.path.exists(history_path) and os.path.exists(mask_sparse_path) and os.path.exists(targets_path):
-        print("Found existing binary cache skipping JSON parsing.")
+        print("Found existing binary cache. Skipping JSON parsing.")
         order_to_idx, _ = build_global_vocab()
         none_idx = order_to_idx['NONE']
         
@@ -209,7 +205,7 @@ def process_and_save_to_disk(json_path, cache_dir="./dataset_cache", max_games=N
                     break
 
     num_cores = min(24, smp.cpu_count())
-    print(f"Starting standard multiprocessing pool with {num_cores} workers")
+    print(f"Starting multiprocessing pool with {num_cores} workers.")
     
     total_samples = 0
     
@@ -226,9 +222,8 @@ def process_and_save_to_disk(json_path, cache_dir="./dataset_cache", max_games=N
             try:
                 for i, result in enumerate(pool.imap_unordered(_process_single_line, line_generator(), chunksize=5)):
                     if (i + 1) % 1000 == 0:
-                        print(f"Processed {i + 1} games")
                         ram_used = psutil.virtual_memory().used / (1024**3)
-                        print(f"  -> System RAM in use: {ram_used:.1f} GB")
+                        print(f"Processed {i + 1} games | System RAM in use: {ram_used:.1f} GB")
                         
                     if result is None:
                         continue
@@ -243,18 +238,18 @@ def process_and_save_to_disk(json_path, cache_dir="./dataset_cache", max_games=N
                     del h_arr, m_arr, t_arr, result
 
             except KeyboardInterrupt:
-                print("\nRun canceled by user. Forcibly terminating workers to prevent freezing.")
+                print("\nProcess interrupted. Terminating workers.")
                 pool.terminate()
                 pool.join()
                 raise
                     
     log_system_resources("Finished Writing Binary Cache")
-    print(f"Total training samples generated {total_samples}")
+    print(f"Total training samples generated: {total_samples}")
     return history_path, mask_sparse_path, targets_path, total_samples, num_provs, vocab_size, none_idx
 
-# --- 2. DISTRIBUTED WORKER LOOP ---
 
-def train_worker(rank, world_size, paths_and_metadata):
+def train_worker(rank, world_size, paths_and_metadata, args):
+    """DDP worker function for training the Behavioral Cloning model."""
     history_path, mask_sparse_path, targets_path, total_samples, num_provs, vocab_size, none_idx = paths_and_metadata
     
     os.environ['MASTER_ADDR'] = 'localhost'
@@ -262,22 +257,18 @@ def train_worker(rank, world_size, paths_and_metadata):
     dist.init_process_group("nccl", rank=rank, world_size=world_size)
     
     try:
+        # Core pinning to prevent thread contention
         core_start = rank * 6
         assigned_cores = list(range(core_start, core_start + 6))
         os.sched_setaffinity(0, assigned_cores)
         torch.set_num_threads(6)
-        
-        # RAM and GPU Optimized Settings
-        batch_size_per_gpu = 512
-        learning_rate = 3e-4
-        epochs = 10
         
         dataset = DiplomacyMemmapDataset(history_path, mask_sparse_path, targets_path, total_samples, num_provs, vocab_size)
         sampler = DistributedSampler(dataset, num_replicas=world_size, rank=rank)
         
         dataloader = DataLoader(
             dataset, 
-            batch_size=batch_size_per_gpu, 
+            batch_size=args.batch_size, 
             shuffle=False, 
             sampler=sampler,
             num_workers=2,
@@ -289,14 +280,14 @@ def train_worker(rank, world_size, paths_and_metadata):
         net = DiplomacyTransformer(num_provinces=num_provs, vocab_size=vocab_size).to(rank)
         net = DDP(net, device_ids=[rank], find_unused_parameters=True)
         criterion = nn.CrossEntropyLoss()
-        optimizer = optim.Adam(net.parameters(), lr=learning_rate)
+        optimizer = optim.Adam(net.parameters(), lr=args.learning_rate)
         
         if rank == 0:
             log_system_resources("Model Loaded to GPUs", rank)
             log_gpu_memory(rank)
-            print("\n--- STARTING DISTRIBUTED BEHAVIORAL CLONING ---")
+            print("\n--- Starting Distributed Behavioral Cloning ---")
         
-        for epoch in range(epochs):
+        for epoch in range(args.epochs):
             sampler.set_epoch(epoch)
             net.train()
             total_loss = 0.0
@@ -309,26 +300,21 @@ def train_worker(rank, world_size, paths_and_metadata):
                 sparse_mask = batch['sparse_mask'].to(rank, dtype=torch.long, non_blocking=True)
                 targets = batch['targets'].to(rank, non_blocking=True)
                 
-                # --- GPU SPARSE-TO-DENSE MASK RECONSTRUCTION ---
+                # Reconstruct dense action mask from sparse indices
                 batch_size = history.size(0)
                 valid_mask = sparse_mask != -1
                 
-                # Offset each row so we can flatten the entire batch indices
                 row_offsets = torch.arange(batch_size, device=rank).unsqueeze(1) * (num_provs * vocab_size)
                 global_indices = sparse_mask + row_offsets
                 valid_global_indices = global_indices[valid_mask]
                 
-                # Create the flattened batch mask and scatter the valid indices
                 batch_mask_flat = torch.zeros(batch_size * num_provs * vocab_size, dtype=torch.bool, device=rank)
                 batch_mask_flat[valid_global_indices] = True
-                
-                # Reshape to exactly what the network expects
                 mask_flat_2d = batch_mask_flat.view(-1, vocab_size) 
-                # -----------------------------------------------
                 
                 optimizer.zero_grad()
                 
-                # NATIVE 16-BIT MATRIX MATH
+                # Mixed-precision forward pass
                 with torch.autocast(device_type='cuda', dtype=torch.bfloat16):
                     logits, _ = net(history, targets)
                     
@@ -351,58 +337,53 @@ def train_worker(rank, world_size, paths_and_metadata):
                     
                 if rank == 0 and batch_idx % 20 == 0:
                     elapsed = time.time() - batch_start_time
-                    samples_processed = 20 * batch_size_per_gpu * world_size
+                    samples_processed = 20 * args.batch_size * world_size
                     throughput = samples_processed / elapsed if batch_idx > 0 else 0
                     
-                    print(f"Epoch {epoch+1} | Batch {batch_idx}/{len(dataloader)} | Loss {loss.item():.4f} | Time {elapsed:.2f}s | Speed {throughput:.0f} samples/s")
+                    print(f"Epoch {epoch+1} | Batch {batch_idx}/{len(dataloader)} | Loss: {loss.item():.4f} | Time: {elapsed:.2f}s | Speed: {throughput:.0f} samples/s")
                     batch_start_time = time.time()
                     
             if rank == 0:
                 epoch_time = time.time() - epoch_start_time
                 avg_loss = total_loss / len(dataloader)
-                print(f"\n==> Epoch {epoch+1} Complete")
-                print(f"==> Average Loss {avg_loss:.4f} | Total Epoch Time {epoch_time:.2f}s")
+                print(f"\n==> Epoch {epoch+1} Complete | Average Loss: {avg_loss:.4f} | Epoch Time: {epoch_time:.2f}s")
                 log_system_resources(f"End of Epoch {epoch+1}", rank)
                 log_gpu_memory(rank)
                 
         if rank == 0:
-            save_path = "diplomacy_transformer_bc.pth"
-            torch.save(net.module.state_dict(), save_path)
-            print(f"Model saved to {save_path}")
+            torch.save(net.module.state_dict(), args.save_path)
+            print(f"Model state dict saved to {args.save_path}")
             
     finally:
         dist.destroy_process_group()
 
-# --- 3. MAIN EXECUTION ---
 
 def main():
-    dataset_path = "./datasets/standard_no_press.jsonl"
-    ssd_cache_directory = "/data/restanislao/diplomacy/"
-    
+    parser = argparse.ArgumentParser(description="Diplomacy Behavioral Cloning Training")
+    parser.add_argument("--dataset_path", type=str, default="./datasets/standard_no_press.jsonl", help="Path to raw JSONL dataset")
+    parser.add_argument("--cache_dir", type=str, default="./dataset_cache", help="Directory for binary memmap cache")
+    parser.add_argument("--batch_size", type=int, default=512, help="Batch size per GPU")
+    parser.add_argument("--learning_rate", type=float, default=3e-4, help="Learning rate")
+    parser.add_argument("--epochs", type=int, default=10, help="Number of training epochs")
+    parser.add_argument("--save_path", type=str, default="diplomacy_transformer_bc.pth", help="Path to save the model weights")
+    args = parser.parse_args()
+
     paths_and_metadata = process_and_save_to_disk(
-        dataset_path, 
-        cache_dir=ssd_cache_directory
+        args.dataset_path, 
+        cache_dir=args.cache_dir
     )
     
-    history_path, mask_sparse_path, targets_path, total_samples, num_provs, vocab_size, none_idx = paths_and_metadata
-    
-    # We can safely load ALL THREE files directly into your 125 GB RAM!
-    print("\nPre-loading dataset into system RAM...")
-    # warm_os_cache(history_path)
-    # warm_os_cache(mask_sparse_path) 
-    # warm_os_cache(targets_path)
-    print("Caching complete. Starting workers.\n")
+    print("\nCaching complete. Starting worker processes.\n")
     
     world_size = torch.cuda.device_count()
     if world_size < 1:
-        print("Error no GPUs detected")
-        return
+        raise RuntimeError("No GPUs detected. Distributed training requires at least 1 GPU.")
         
-    print(f"Spawning {world_size} distributed workers")
+    print(f"Spawning {world_size} distributed workers...")
     
     mp.spawn(
         train_worker,
-        args=(world_size, paths_and_metadata),
+        args=(world_size, paths_and_metadata, args),
         nprocs=world_size,
         join=True
     )
