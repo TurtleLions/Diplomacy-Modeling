@@ -1,6 +1,6 @@
 """
 Behavioral Cloning pipeline for the Diplomacy Transformer.
-Processes JSON game history into memory-mapped arrays and trains the model using DDP.
+Processes JSON game history into memory-mapped arrays and trains the unit-centric model using DDP.
 """
 import os
 import time
@@ -34,7 +34,6 @@ FEATURE_DIM = 46
 MAX_SPARSE_MASK_LEN = 1200
 
 # Global variables for multiprocessing workers.
-# Initializing these globally prevents copying large dictionaries across process boundaries.
 worker_prov_to_idx = None
 worker_order_to_idx = None
 worker_num_provs = None
@@ -310,25 +309,57 @@ def train_worker(rank, world_size, paths_and_metadata, args):
                 
                 batch_mask_flat = torch.zeros(batch_size * num_provs * vocab_size, dtype=torch.bool, device=rank)
                 batch_mask_flat[valid_global_indices] = True
-                mask_flat_2d = batch_mask_flat.view(-1, vocab_size) 
+                dense_mask = batch_mask_flat.view(batch_size, num_provs, vocab_size)
+                
+                is_active_mask = (targets != none_idx)
+                num_active_per_batch = is_active_mask.sum(dim=1)
+                max_units = num_active_per_batch.max().item()
                 
                 optimizer.zero_grad()
                 
                 # Mixed-precision forward pass
                 with torch.autocast(device_type='cuda', dtype=torch.bfloat16):
-                    logits, _ = net(history, targets)
+                    # Encode State
+                    state_repr, _ = net.module.encode_state(history)
                     
-                    logits_flat = logits.view(-1, vocab_size)
-                    targets_flat = targets.view(-1)
-                    
-                    is_target_legal = mask_flat_2d.gather(1, targets_flat.unsqueeze(1)).squeeze()
-                    valid_training_mask = (targets_flat != none_idx) & is_target_legal
-                    
-                    if valid_training_mask.any():
-                        logits_masked = logits_flat.masked_fill(~mask_flat_2d, -1e4)
-                        loss = criterion(logits_masked[valid_training_mask], targets_flat[valid_training_mask])
+                    if max_units > 0:
+                        # Decode Unit-Centric Sequence
+                        logits, padding_mask = net.module.decode_full(state_repr, targets, is_active_mask)
+                        
+                        # Pack Targets and Dense Masks to align with the dynamic (B, max_units) shape
+                        padded_indices = torch.zeros((batch_size, max_units), dtype=torch.long, device=rank)
+                        for b in range(batch_size):
+                            valid_idx = torch.where(is_active_mask[b])[0]
+                            if len(valid_idx) > 0:
+                                padded_indices[b, :len(valid_idx)] = valid_idx
+                                
+                        b_idx_expand = torch.arange(batch_size, device=rank).unsqueeze(1)
+                        packed_targets = targets[b_idx_expand, padded_indices]
+                        packed_masks = dense_mask[b_idx_expand, padded_indices, :]
+                        
+                        # Flatten for Loss calculation
+                        logits_flat = logits.view(-1, vocab_size)
+                        targets_flat = packed_targets.view(-1)
+                        masks_flat = packed_masks.view(-1, vocab_size)
+                        
+                        # Verify target action is legal per engine rules (safety check)
+                        is_target_legal = packed_masks.gather(2, packed_targets.unsqueeze(2)).squeeze(2)
+                        
+                        # Ignore padded slots and illegal historical moves
+                        valid_training_mask = (~padding_mask).view(-1) & is_target_legal.view(-1)
+                        
+                        if valid_training_mask.any():
+                            # Apply dense engine mask to prevent network from choosing illegal moves
+                            logits_masked = logits_flat.masked_fill(~masks_flat, -1e4).float() 
+                            loss = criterion(logits_masked[valid_training_mask], targets_flat[valid_training_mask])
+                            if torch.isnan(loss):
+                                print(f"NaN detected at Epoch {epoch+1}, Batch {batch_idx}!")
+                                raise ValueError("Training halted due to NaN loss.")
+                        else:
+                            loss = (logits * 0).sum()
                     else:
-                        loss = (logits * 0).sum()
+                        # Edge Case: Phase has no valid orders (e.g., empty Spring Adjust)
+                        loss = (state_repr * 0).sum()
                 
                 loss.backward()
                 torch.nn.utils.clip_grad_norm_(net.parameters(), 0.5)
@@ -361,7 +392,7 @@ def train_worker(rank, world_size, paths_and_metadata, args):
 def main():
     parser = argparse.ArgumentParser(description="Diplomacy Behavioral Cloning Training")
     parser.add_argument("--dataset_path", type=str, default="./datasets/standard_no_press.jsonl", help="Path to raw JSONL dataset")
-    parser.add_argument("--cache_dir", type=str, default="./dataset_cache", help="Directory for binary memmap cache")
+    parser.add_argument("--cache_dir", type=str, default="/data/restanislao/diplomacy", help="Directory for binary memmap cache")
     parser.add_argument("--batch_size", type=int, default=512, help="Batch size per GPU")
     parser.add_argument("--learning_rate", type=float, default=3e-4, help="Learning rate")
     parser.add_argument("--epochs", type=int, default=10, help="Number of training epochs")

@@ -144,13 +144,16 @@ def evaluate_and_save_game(net, device, update_num, save_dir="./eval_games"):
                     current_action = torch.zeros(batch_size, dtype=torch.long, device=device)
                     kv_cache = None
                     batch_indices = torch.arange(batch_size, device=device)
+                    
+                    b_idx_expand = batch_indices.unsqueeze(1)
+                    active_states = state_repr[b_idx_expand, padded_indices, :]
 
                     for decode_idx in range(max_decode_steps):
                         prov_indices = padded_indices[:, decode_idx]
                         valid_step = step_mask[:, decode_idx]
                         
                         with torch.autocast(device_type='cuda', dtype=torch.bfloat16):
-                            logits, kv_cache = net.decode_step(current_action, prov_indices, state_repr, kv_cache)
+                            logits, kv_cache = net.decode_step(current_action, active_states, decode_idx, kv_cache)
                         
                         logits = logits.float()
                         prov_mask = masks_tensor[batch_indices, prov_indices, :]
@@ -249,7 +252,6 @@ def main():
     # Model Initialization
     net = DiplomacyTransformer(num_provinces=MAP_PROVINCES, history_length=HISTORY_LENGTH, vocab_size=VOCAB_SIZE).to(device)
     bc_model = DiplomacyTransformer(num_provinces=MAP_PROVINCES, history_length=HISTORY_LENGTH, vocab_size=VOCAB_SIZE).to(device)
-    actor_bc_model = DiplomacyTransformer(num_provinces=MAP_PROVINCES, history_length=HISTORY_LENGTH, vocab_size=VOCAB_SIZE).to(device) 
     actor_net = DiplomacyTransformer(num_provinces=MAP_PROVINCES, history_length=HISTORY_LENGTH, vocab_size=VOCAB_SIZE).to(device)
     
     if os.path.exists(args.bc_weights):
@@ -257,15 +259,12 @@ def main():
         net.load_state_dict(bc_state_dict, strict=False)
         bc_model.load_state_dict(bc_state_dict, strict=False)
         actor_net.load_state_dict(bc_state_dict, strict=False)
-        actor_bc_model.load_state_dict(bc_state_dict, strict=False)
         
         # Freeze reference models
         bc_model.eval()
         for param in bc_model.parameters(): param.requires_grad = False
         actor_net.eval()
         for param in actor_net.parameters(): param.requires_grad = False
-        actor_bc_model.eval()
-        for param in actor_bc_model.parameters(): param.requires_grad = False
             
         if global_rank == 0: 
             print("Successfully loaded pre-trained BC weights for policy initialization.")
@@ -283,7 +282,6 @@ def main():
     
     net = torch.compile(net)
     bc_model = torch.compile(bc_model)
-    actor_bc_model = torch.compile(actor_bc_model)
     actor_net = torch.compile(actor_net)
 
     net = DDP(net, device_ids=[local_rank])
@@ -292,7 +290,7 @@ def main():
     def create_buffer():
         """Creates a memory-pinned tensor buffer for experience collection."""
         return {
-            'obs': torch.zeros((args.num_steps, args.num_envs, NUM_AGENTS, HISTORY_LENGTH, MAP_PROVINCES, 46), dtype=torch.bool, device=device),
+            'obs': torch.zeros((args.num_steps, args.num_envs, NUM_AGENTS, HISTORY_LENGTH, MAP_PROVINCES, 46), dtype=torch.bfloat16, device=device),
             'actions': torch.zeros((args.num_steps, args.num_envs, NUM_AGENTS, MAP_PROVINCES), dtype=torch.long, device=device),
             'logprobs': torch.zeros((args.num_steps, args.num_envs, NUM_AGENTS), dtype=torch.float32, device=device),
             'rewards': torch.zeros((args.num_steps, args.num_envs, NUM_AGENTS), dtype=torch.float32, device=device),
@@ -339,17 +337,18 @@ def main():
                     
                     with torch.no_grad():
                         for i in range(args.num_envs):
-                            obs_dict, infos_dict, active_agents = next_env_results[i] if len(next_env_results[i]) == 3 else (*next_env_results[i][0:2], next_env_results[i][-2], next_env_results[i][-1])[0:3]
-                            if len(next_env_results[i]) == 6: 
-                                obs_dict, step_rewards, terms, _, infos_dict, active_agents = next_env_results[i]
+                            if len(next_env_results[i]) == 3:
+                                obs_dict, infos_dict, active_agents = next_env_results[i]
+                            else:
+                                obs_dict, step_rewards, terms, truncs, infos_dict, active_agents = next_env_results[i]
                                 for a in possible_agents:
-                                    buf['rewards'][step-1, i, agent_to_idx[a]] = step_rewards.get(a, 0.0)
+                                    buf['rewards'][step, i, agent_to_idx[a]] = step_rewards.get(a, 0.0)
                                     next_done[i, agent_to_idx[a]] = float(terms.get(a, False))
                             
                             for a in active_agents:
                                 a_idx = agent_to_idx[a]
                                 buf['masks'][step, i, a_idx] = True
-                                buf['obs'][step, i, a_idx] = torch.tensor(obs_dict[a], dtype=torch.bool, device=device)
+                                buf['obs'][step, i, a_idx] = torch.tensor(obs_dict[a], dtype=torch.bfloat16, device=device)
                                 buf['sparse_masks'][step, i, a_idx] = torch.tensor(infos_dict[a]['action_mask'], dtype=torch.long)
 
                         flat_obs = buf['obs'][step][buf['masks'][step]]
@@ -384,14 +383,22 @@ def main():
                                 current_action = torch.zeros(batch_size, dtype=torch.long, device=device)
                                 kv_cache, bc_kv_cache = None, None
                                 batch_indices = torch.arange(batch_size, device=device)
+                                
+                                b_idx_expand = batch_indices.unsqueeze(1)
+                                active_states = state_repr[b_idx_expand, padded_indices, :]
+                                
+                                # Evaluate BC states identically for KL Divergence checks
+                                with torch.autocast(device_type='cuda', dtype=torch.bfloat16):
+                                    bc_state_repr, _ = bc_model.encode_state(flat_obs.to(dtype=torch.bfloat16))
+                                bc_active_states = bc_state_repr[b_idx_expand, padded_indices, :]
 
                                 for decode_idx in range(max_decode_steps):
                                     prov_indices = padded_indices[:, decode_idx]
                                     valid_step = step_mask[:, decode_idx]
                                     
                                     with torch.autocast(device_type='cuda', dtype=torch.bfloat16):
-                                        bc_logits, bc_kv_cache = actor_bc_model.decode_step(current_action, prov_indices, state_repr, bc_kv_cache)
-                                        logits, kv_cache = actor_net.decode_step(current_action, prov_indices, state_repr, kv_cache)
+                                        bc_logits, bc_kv_cache = bc_model.decode_step(current_action, bc_active_states, decode_idx, bc_kv_cache)
+                                        logits, kv_cache = actor_net.decode_step(current_action, active_states, decode_idx, kv_cache)
                                     
                                     prov_mask = active_masks[batch_indices, prov_indices, :]
                                     bc_probs = torch.softmax(bc_logits.float(), dim=-1)
@@ -410,7 +417,7 @@ def main():
                                     final_actions[batch_indices[valid_step], prov_indices[valid_step]] = current_action[valid_step]
                                     final_logprobs[batch_indices[valid_step], prov_indices[valid_step]] = step_log_probs[valid_step]
                                     
-                                buf['values'][step][buf['masks'][step]] = values.squeeze()
+                                buf['values'][step][buf['masks'][step]] = values.squeeze(-1)
                                 buf['logprobs'][step][buf['masks'][step]] = final_logprobs.sum(dim=1)
                                 
                                 idx_counter = 0
@@ -431,6 +438,24 @@ def main():
             # Calculate GAE Advantages
             with torch.no_grad():
                 next_value = torch.zeros((args.num_envs, NUM_AGENTS), device=device)
+                obs_to_encode = []
+                indices_to_update = []
+                
+                for i in range(args.num_envs):
+                    obs_dict = next_env_results[i][0]
+                    active_agents_list = next_env_results[i][2] if len(next_env_results[i]) == 3 else next_env_results[i][5]
+                    
+                    for a in active_agents_list:
+                        obs_to_encode.append(torch.tensor(obs_dict[a], dtype=torch.bfloat16, device=device))
+                        indices_to_update.append((i, agent_to_idx[a]))
+                        
+                if obs_to_encode:
+                    obs_tensor = torch.stack(obs_to_encode)
+                    with torch.autocast(device_type='cuda', dtype=torch.bfloat16):
+                        _, next_v = actor_net.encode_state(obs_tensor)
+                    
+                    for list_idx, (env_idx, agent_idx) in enumerate(indices_to_update):
+                        next_value[env_idx, agent_idx] = next_v[list_idx].float().squeeze(-1)
                 
             lastgaelam = 0
             for t in reversed(range(args.num_steps)):
@@ -560,91 +585,57 @@ def main():
                         
                         is_active_mask = (mb_act != NONE_IDX)
                         batch_size = mb_obs.size(0)
-                        
-                        active_targets = mb_act[is_active_mask]
-                        active_masks_gpu = mb_masks_gpu[is_active_mask]
-                        batch_indices = torch.where(is_active_mask)[0]
-                        
-                        num_active_per_batch = is_active_mask.sum(dim=1)
-                        max_active = num_active_per_batch.max().item()
-
-                        active_logits = torch.zeros((0, VOCAB_SIZE), device=device, dtype=torch.bfloat16)
-                        bc_active_logits = torch.zeros((0, VOCAB_SIZE), device=device, dtype=torch.bfloat16)
+                        max_active = is_active_mask.sum(dim=1).max().item()
 
                         if max_active > 0:
-                            padded_indices = torch.zeros((batch_size, max_active), dtype=torch.long, device=device)
-                            step_mask = torch.zeros((batch_size, max_active), dtype=torch.bool, device=device)
+                            # Parallel Full-Sequence Decode
+                            active_logits_seq, padding_mask = net.module.decode_full(state_repr, mb_act, is_active_mask)
                             
-                            for b in range(batch_size):
-                                valid_idx = torch.where(is_active_mask[b])[0]
-                                count = len(valid_idx)
-                                if count > 0:
-                                    padded_indices[b, :count] = valid_idx
-                                    step_mask[b, :count] = True
-
-                            b_idx_expand = torch.arange(batch_size, device=device).unsqueeze(1)
-                            active_states = state_repr[b_idx_expand, padded_indices, :]
-                            active_actions = mb_act[b_idx_expand, padded_indices]
-                            
-                            if max_active > 1:
-                                action_emb = net.module.action_embedding(active_actions[:, :-1])
-                                start_emb = net.module.start_token_embedding.expand(batch_size, 1, -1)
-                                shifted_emb = torch.cat([start_emb, action_emb], dim=1)
-                            else:
-                                shifted_emb = net.module.start_token_embedding.expand(batch_size, 1, -1)
-                                
-                            decoder_input = shifted_emb + active_states
-                            active_seq_hidden, _ = net.module.causal_decoder_block(decoder_input, kv_cache=None)
-                            
-                            active_hidden = active_seq_hidden[step_mask] 
-                            active_logits = net.module.action_head(active_hidden)
-                            active_logits = active_logits.masked_fill(~active_masks_gpu, -1e4)
-
                             with torch.no_grad():
                                 bc_state_repr, _ = bc_model.encode_state(mb_obs)
-                                bc_active_states = bc_state_repr[b_idx_expand, padded_indices, :]
+                                bc_logits_seq, _ = bc_model.decode_full(bc_state_repr, mb_act, is_active_mask)
                                 
-                                if max_active > 1:
-                                    bc_action_emb = bc_model.action_embedding(active_actions[:, :-1])
-                                    bc_start_emb = bc_model.start_token_embedding.expand(batch_size, 1, -1)
-                                    bc_shifted_emb = torch.cat([bc_start_emb, bc_action_emb], dim=1)
-                                else:
-                                    bc_shifted_emb = bc_model.start_token_embedding.expand(batch_size, 1, -1)
+                            # Pack targets and masks to match the (B, max_active) output tensor
+                            padded_indices = torch.zeros((batch_size, max_active), dtype=torch.long, device=device)
+                            for b in range(batch_size):
+                                v_idx = torch.where(is_active_mask[b])[0]
+                                if len(v_idx) > 0:
+                                    padded_indices[b, :len(v_idx)] = v_idx
                                     
-                                bc_decoder_input = bc_shifted_emb + bc_active_states
-                                bc_seq_hidden, _ = bc_model.causal_decoder_block(bc_decoder_input, kv_cache=None)
-                                
-                                bc_active_hidden = bc_seq_hidden[step_mask]
-                                bc_active_logits = bc_model.action_head(bc_active_hidden)
-                                bc_active_logits = bc_active_logits.masked_fill(~active_masks_gpu, -1e4)
+                            b_idx_expand = torch.arange(batch_size, device=device).unsqueeze(1)
+                            packed_targets = mb_act[b_idx_expand, padded_indices]
+                            packed_masks = mb_masks_gpu[b_idx_expand, padded_indices, :]
+                            
+                            # Mask Logits and Calculate Distributions
+                            active_logits_seq = active_logits_seq.float().masked_fill(~packed_masks, -1e4)
+                            bc_logits_seq = bc_logits_seq.float().masked_fill(~packed_masks, -1e4)
+                            
+                            dist_cat = Categorical(logits=active_logits_seq)
+                            logp_seq = dist_cat.log_prob(packed_targets)
+                            entropy_seq = dist_cat.entropy()
+                            
+                            bc_dist_cat = Categorical(logits=bc_logits_seq)
+                            kl_seq = torch.distributions.kl.kl_divergence(dist_cat, bc_dist_cat)
+                            
+                            # Zero-out padding values before summation
+                            valid_mask = ~padding_mask
+                            logp_seq = logp_seq * valid_mask
+                            entropy_seq = entropy_seq * valid_mask
+                            kl_seq = kl_seq * valid_mask
+                            
+                            # Sum over the unit sequence for the agent's total turn
+                            new_logp = logp_seq.sum(dim=1)
+                            
+                            valid_counts = valid_mask.sum(dim=1).clamp(min=1)
+                            entropy = entropy_seq.sum(dim=1).mean()
+                            kl_divergence = (kl_seq.sum(dim=1) / valid_counts).mean()
+                        else:
+                            new_logp = torch.zeros(batch_size, device=device)
+                            entropy = torch.tensor(0.0, device=device)
+                            kl_divergence = torch.tensor(0.0, device=device)
 
-                    active_logits = active_logits.float()
-                    bc_active_logits = bc_active_logits.float()
                     new_val = new_val.float()
                     
-                    if max_active > 0:
-                        dist_cat = Categorical(logits=active_logits)
-                        active_logp = dist_cat.log_prob(active_targets)
-                        active_entropy = dist_cat.entropy()
-                        
-                        bc_dist_cat = Categorical(logits=bc_active_logits)
-                        kl_div_active = torch.distributions.kl.kl_divergence(dist_cat, bc_dist_cat)
-                    else:
-                        active_logp = torch.zeros(0, device=device)
-                        active_entropy = torch.zeros(0, device=device)
-                        kl_div_active = torch.zeros(0, device=device)
-                    
-                    new_logp = torch.zeros(batch_size, device=device)
-                    new_logp.scatter_add_(0, batch_indices, active_logp)
-                    
-                    entropy_sums = torch.zeros(batch_size, device=device)
-                    entropy_sums.scatter_add_(0, batch_indices, active_entropy)
-                    entropy = entropy_sums.mean()
-
-                    kl_sums = torch.zeros(batch_size, device=device)
-                    kl_sums.scatter_add_(0, batch_indices, kl_div_active)
-                    kl_divergence = kl_sums.mean()
-
                     logratio = new_logp - mb_logprobs
                     ratio = logratio.exp()
                     pg_loss1 = -mb_adv * ratio
@@ -664,7 +655,7 @@ def main():
                 
                 del mb_obs, mb_act, mb_masks_gpu, new_val
                 if max_active > 0:
-                    del active_seq_hidden, bc_seq_hidden, active_logits, bc_active_logits, dist_cat, bc_dist_cat
+                    del active_logits_seq, bc_logits_seq, dist_cat, bc_dist_cat
 
         update_time = time.time() - t_update_start
         buffer_idx = 1 - buffer_idx

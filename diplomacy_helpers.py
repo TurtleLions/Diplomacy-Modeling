@@ -64,7 +64,7 @@ class KVCacheAttentionBlock(nn.Module):
             nn.Linear(dim_feedforward, d_model)
         )
 
-    def forward(self, x, kv_cache=None):
+    def forward(self, x, kv_cache=None, padding_mask=None):
         batch_size, seq_len, _ = x.size()
         
         x_norm = self.norm1(x)
@@ -80,8 +80,24 @@ class KVCacheAttentionBlock(nn.Module):
         
         new_kv_cache = (k, v)
 
-        is_causal = (seq_len > 1)
-        attn_out = torch.nn.functional.scaled_dot_product_attention(q, k, v, is_causal=is_causal)
+        # Build custom attention mask to handle causal + unit padding constraints
+        if padding_mask is not None or seq_len > 1:
+            causal_mask = torch.tril(torch.ones((seq_len, k.size(2)), dtype=torch.bool, device=x.device))
+            causal_mask = causal_mask.unsqueeze(0).unsqueeze(1) # (1, 1, seq_len, total_seq_len)
+            
+            if padding_mask is not None:
+                valid_keys = (~padding_mask).unsqueeze(1).unsqueeze(2) # (batch, 1, 1, total_seq_len)
+                
+                is_query_padded = padding_mask.unsqueeze(1).unsqueeze(-1) # (batch, 1, seq_len, 1)
+                
+                attn_mask = causal_mask & (valid_keys | is_query_padded)
+            else:
+                attn_mask = causal_mask
+                
+            attn_out = torch.nn.functional.scaled_dot_product_attention(q, k, v, attn_mask=attn_mask)
+        else:
+            # Single step decoding without padding
+            attn_out = torch.nn.functional.scaled_dot_product_attention(q, k, v, is_causal=False)
         
         attn_out = attn_out.transpose(1, 2).reshape(batch_size, seq_len, self.d_model)
         
@@ -93,8 +109,8 @@ class KVCacheAttentionBlock(nn.Module):
 class DiplomacyTransformer(nn.Module):
     """
     End-to-end policy and value network for the game of Diplomacy.
-    Utilizes an encoder to process historical board states and a causal decoder
-    to autoregressively generate simultaneous orders per province.
+    Utilizes an encoder to process historical board states and a unit-centric 
+    causal decoder to autoregressively generate simultaneous orders.
     """
     def __init__(self, input_dim=FEATURE_DIM, d_model=256, nhead=8, num_layers=8, num_provinces=82, history_length=3, vocab_size=22231):
         super().__init__()
@@ -103,7 +119,7 @@ class DiplomacyTransformer(nn.Module):
         self.history_length = history_length
         self.d_model = d_model
         
-        # State Encoder
+        # State Encoder (Full Board Context)
         self.feature_projection = nn.Linear(input_dim, d_model)
         self.province_embedding = nn.Embedding(num_provinces, d_model)
         self.time_embedding = nn.Embedding(history_length, d_model)
@@ -113,7 +129,7 @@ class DiplomacyTransformer(nn.Module):
         
         self.value_head = nn.Linear(d_model * num_provinces, 1)
 
-        # Autoregressive Action Decoder
+        # Autoregressive Action Decoder (Unit-Centric)
         self.action_embedding = nn.Embedding(vocab_size, d_model)
         self.start_token_embedding = nn.Parameter(torch.randn(1, 1, d_model))
         self.causal_decoder_block = KVCacheAttentionBlock(d_model=d_model, nhead=nhead)
@@ -148,53 +164,90 @@ class DiplomacyTransformer(nn.Module):
         
         return current_state_repr, state_value
 
-    def decode_step(self, prev_action, prov_indices, state_repr, kv_cache=None):
-        """Executes a single step of autoregressive decoding for a specific province."""
-        batch_size = state_repr.size(0)
+    def decode_step(self, prev_action, active_state_repr, step_idx, kv_cache=None):
+        """
+        Executes a single step of autoregressive decoding for a specific active unit.
+        active_state_repr: (batch_size, max_active_units, d_model) pre-gathered tensor.
+        """
+        batch_size = active_state_repr.size(0)
         
         if kv_cache is None:
             action_emb = self.start_token_embedding.expand(batch_size, -1, -1).squeeze(1)
         else:
             action_emb = self.action_embedding(prev_action)
             
-        batch_indices = torch.arange(batch_size, device=state_repr.device)
-        prov_state = state_repr[batch_indices, prov_indices, :]
+        # Extract the state for the specific unit in the dynamic sequence
+        unit_state = active_state_repr[:, step_idx, :]
         
-        decoder_input = (action_emb + prov_state).unsqueeze(1)
+        decoder_input = (action_emb + unit_state).unsqueeze(1)
         
         decoder_out, new_kv_cache = self.causal_decoder_block(decoder_input, kv_cache)
         logits = self.action_head(decoder_out.squeeze(1))
         
         return logits, new_kv_cache
 
-    def decode_full(self, state_repr, actions, return_hidden=False):
-        """Teacher-forced forward pass utilized during Behavioral Cloning."""
+    def decode_full(self, state_repr, actions, active_mask, return_hidden=False):
+        """
+        Unit-centric Teacher-forced forward pass utilized during Behavioral Cloning.
+        Compresses the 82-province tensor down to only active units before decoding.
+        """
         batch_size = state_repr.size(0)
+        max_units = active_mask.sum(dim=1).max().item()
         
-        action_emb = self.action_embedding(actions[:, :-1])
+        if max_units == 0:
+            dummy_out = torch.zeros((batch_size, 0, self.action_head.out_features), device=state_repr.device)
+            dummy_mask = torch.zeros((batch_size, 0), dtype=torch.bool, device=state_repr.device)
+            return dummy_out, dummy_mask
+
+        active_states = []
+        active_acts = []
+        
+        for b in range(batch_size):
+            valid_indices = torch.where(active_mask[b])[0]
+            count = len(valid_indices)
+            
+            b_states = state_repr[b, valid_indices, :]
+            b_acts = actions[b, valid_indices]
+            
+            if count < max_units:
+                pad_states = torch.zeros((max_units - count, self.d_model), device=state_repr.device)
+                pad_acts = torch.zeros((max_units - count,), dtype=torch.long, device=actions.device)
+                b_states = torch.cat([b_states, pad_states], dim=0)
+                b_acts = torch.cat([b_acts, pad_acts], dim=0)
+                
+            active_states.append(b_states)
+            active_acts.append(b_acts)
+            
+        active_states = torch.stack(active_states) # (B, max_units, D)
+        active_acts = torch.stack(active_acts)     # (B, max_units)
+        
+        seq_lengths = active_mask.sum(dim=1, keepdim=True)
+        idx = torch.arange(max_units, device=state_repr.device).unsqueeze(0)
+        padding_mask = idx >= seq_lengths 
+        
+        action_emb = self.action_embedding(active_acts[:, :-1])
         start_emb = self.start_token_embedding.expand(batch_size, 1, -1)
         shifted_emb = torch.cat([start_emb, action_emb], dim=1)
         
-        decoder_input = shifted_emb + state_repr
-        def decoder_wrapper(inp):
-            out, _ = self.causal_decoder_block(inp, kv_cache=None)
+        decoder_input = shifted_emb + active_states
+        
+        def decoder_wrapper(inp, p_mask):
+            out, _ = self.causal_decoder_block(inp, kv_cache=None, padding_mask=p_mask)
             return out
 
-        decoder_out = checkpoint(decoder_wrapper, decoder_input, use_reentrant=False)
+        decoder_out = checkpoint(decoder_wrapper, decoder_input, padding_mask, use_reentrant=False)
         
         if return_hidden:
             return decoder_out
             
         action_logits = self.action_head(decoder_out)
-        return action_logits
+        return action_logits, padding_mask
 
-    def forward(self, x, actions, return_hidden=False):
-        """Standard full forward pass combining state encoding and teacher-forced decoding."""
-        batch_size = x.size(0)
+    def forward(self, x, actions, active_mask, return_hidden=False):
+        """Standard full forward pass combining state encoding and unit-centric decoding."""
         state_repr, state_value = self.encode_state(x)
-        
-        action_logits = self.decode_full(state_repr, actions, return_hidden=return_hidden)
-        return action_logits, state_value
+        action_logits, padding_mask = self.decode_full(state_repr, actions, active_mask, return_hidden=return_hidden)
+        return action_logits, state_value, padding_mask
 
 
 def build_global_vocab(json_path="./datasets/standard_no_press.jsonl", cache_path="vocab.txt"):
@@ -580,80 +633,3 @@ class DiplomacyTransformerEnv(ParallelEnv):
         self.agents = [a for a in self.agents if not terminations[a] and (len(self.game.get_centers(a)) > 0 or len(self.game.get_state()['units'].get(a, [])) > 0)]
         
         return observations, rewards, terminations, {a: False for a in self.agents}, infos
-
-
-if __name__ == "__main__":
-    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    print(f"Executing dry-run test loop on device: {device}")
-    
-    env = DiplomacyTransformerEnv(history_length=3)
-    vocab_size = env.vocab_size
-    
-    net = DiplomacyTransformer(num_provinces=env.num_provinces, vocab_size=vocab_size).to(device)
-    optimizer = optim.Adam(net.parameters(), lr=3e-4)
-    
-    num_updates = 1000
-    num_steps = 150
-    
-    for update in range(num_updates):
-        obs, infos = env.reset()
-        active_agents = env.agents
-        
-        batch_obs, batch_actions, batch_logprobs, batch_rewards = [], [], [], []
-        
-        net.eval()
-        for step in range(num_steps):
-            if not active_agents:
-                break
-                
-            actions_to_send = {}
-            for agent in active_agents:
-                agent_obs = torch.tensor(obs[agent], device=device).unsqueeze(0)
-                batch_size = agent_obs.size(0) 
-                
-                sparse_mask = torch.tensor(infos[agent]['action_mask'], device=device)
-                dense_mask = torch.zeros((env.num_provinces, vocab_size), dtype=torch.bool, device=device)
-                valid_indices = sparse_mask[sparse_mask != -1]
-                
-                if len(valid_indices) > 0:
-                    prov_indices = valid_indices // vocab_size
-                    act_indices = valid_indices % vocab_size
-                    dense_mask[prov_indices, act_indices] = True
-                
-                with torch.no_grad():
-                    state_repr, value = net.encode_state(agent_obs)
-                    
-                    actions = []
-                    logprobs = []
-                    
-                    current_action = torch.zeros(batch_size, dtype=torch.long, device=device)
-                    kv_cache = None
-                    
-                    for prov_idx in range(net.num_provinces):
-                        logits, kv_cache = net.decode_step(current_action, prov_idx, state_repr, kv_cache)
-                        
-                        prov_mask = dense_mask[prov_idx, :].unsqueeze(0) 
-                        logits = logits.masked_fill(~prov_mask, -1e9)
-                        
-                        dist = Categorical(logits=logits)
-                        current_action = dist.sample()
-                        
-                        actions.append(current_action)
-                        logprobs.append(dist.log_prob(current_action))
-
-                    final_actions = torch.stack(actions, dim=1)
-                    final_logprobs = torch.stack(logprobs, dim=1).sum(dim=1) 
-                    
-                actions_to_send[agent] = final_actions.squeeze(0).cpu().numpy()
-                
-                batch_obs.append(agent_obs)
-                batch_actions.append(final_actions) 
-                batch_logprobs.append(final_logprobs) 
-                
-            obs, rewards, terms, truncs, infos = env.step(actions_to_send)
-            active_agents = env.agents
-            
-            for agent in actions_to_send.keys():
-                batch_rewards.append(rewards.get(agent, 0.0))
-                
-        print(f"Test Execution | Update {update} | Steps: {len(batch_rewards)} | Avg Reward: {np.mean(batch_rewards):.4f}")
