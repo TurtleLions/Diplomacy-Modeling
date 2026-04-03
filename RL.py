@@ -252,17 +252,21 @@ def main():
     # Model Initialization
     net = DiplomacyTransformer(num_provinces=MAP_PROVINCES, history_length=HISTORY_LENGTH, vocab_size=VOCAB_SIZE).to(device)
     bc_model = DiplomacyTransformer(num_provinces=MAP_PROVINCES, history_length=HISTORY_LENGTH, vocab_size=VOCAB_SIZE).to(device)
+    actor_bc_model = DiplomacyTransformer(num_provinces=MAP_PROVINCES, history_length=HISTORY_LENGTH, vocab_size=VOCAB_SIZE).to(device)
     actor_net = DiplomacyTransformer(num_provinces=MAP_PROVINCES, history_length=HISTORY_LENGTH, vocab_size=VOCAB_SIZE).to(device)
     
     if os.path.exists(args.bc_weights):
         bc_state_dict = torch.load(args.bc_weights, map_location=device)
         net.load_state_dict(bc_state_dict, strict=False)
         bc_model.load_state_dict(bc_state_dict, strict=False)
+        actor_bc_model.load_state_dict(bc_state_dict, strict=False)
         actor_net.load_state_dict(bc_state_dict, strict=False)
         
         # Freeze reference models
         bc_model.eval()
         for param in bc_model.parameters(): param.requires_grad = False
+        actor_bc_model.eval()
+        for param in actor_bc_model.parameters(): param.requires_grad = False
         actor_net.eval()
         for param in actor_net.parameters(): param.requires_grad = False
             
@@ -280,9 +284,10 @@ def main():
     if global_rank == 0: 
         print("Compiling PyTorch models...")
     
-    net = torch.compile(net)
-    bc_model = torch.compile(bc_model)
-    actor_net = torch.compile(actor_net)
+    # net = torch.compile(net, dynamic=True)
+    # bc_model = torch.compile(bc_model, dynamic=True)
+    # actor_bc_model = torch.compile(actor_bc_model, dynamic=True)
+    # actor_net = torch.compile(actor_net, dynamic=True)
 
     net = DDP(net, device_ids=[local_rank])
     optimizer = optim.Adam(net.parameters(), lr=args.lr, eps=1e-5)
@@ -389,7 +394,7 @@ def main():
                                 
                                 # Evaluate BC states identically for KL Divergence checks
                                 with torch.autocast(device_type='cuda', dtype=torch.bfloat16):
-                                    bc_state_repr, _ = bc_model.encode_state(flat_obs.to(dtype=torch.bfloat16))
+                                    bc_state_repr, _ = actor_bc_model.encode_state(flat_obs.to(dtype=torch.bfloat16))
                                 bc_active_states = bc_state_repr[b_idx_expand, padded_indices, :]
 
                                 for decode_idx in range(max_decode_steps):
@@ -397,7 +402,7 @@ def main():
                                     valid_step = step_mask[:, decode_idx]
                                     
                                     with torch.autocast(device_type='cuda', dtype=torch.bfloat16):
-                                        bc_logits, bc_kv_cache = bc_model.decode_step(current_action, bc_active_states, decode_idx, bc_kv_cache)
+                                        bc_logits, bc_kv_cache = actor_bc_model.decode_step(current_action, bc_active_states, decode_idx, bc_kv_cache)
                                         logits, kv_cache = actor_net.decode_step(current_action, active_states, decode_idx, kv_cache)
                                     
                                     prov_mask = active_masks[batch_indices, prov_indices, :]
@@ -552,15 +557,21 @@ def main():
         t_update_start = time.time()
         net.train()
         
-        mb_size = 1024
-        accum_steps = 4 
+        mb_size = 768
+        accum_steps = 6
         indices = np.arange(b_size)
         optimizer.zero_grad() 
+
+        target_kl = 0.02
+        global_avg_kl = 0.0
 
         for epoch in range(args.update_epochs):
             np.random.shuffle(indices)
             start_indices = list(range(0, b_size, mb_size))
             
+            epoch_kl_sum = 0.0
+            epoch_kl_steps = 0
+
             for step_idx, start in enumerate(start_indices):
                 end = start + mb_size
                 mb_idx = indices[start:end]
@@ -634,6 +645,9 @@ def main():
                             entropy = torch.tensor(0.0, device=device)
                             kl_divergence = torch.tensor(0.0, device=device)
 
+                    epoch_kl_sum += kl_divergence.item()
+                    epoch_kl_steps += 1
+
                     new_val = new_val.float()
                     
                     logratio = new_logp - mb_logprobs
@@ -656,6 +670,25 @@ def main():
                 del mb_obs, mb_act, mb_masks_gpu, new_val
                 if max_active > 0:
                     del active_logits_seq, bc_logits_seq, dist_cat, bc_dist_cat
+
+            local_epoch_kl = epoch_kl_sum / max(1, epoch_kl_steps)
+            epoch_kl_tensor = torch.tensor([local_epoch_kl], device=device)
+            dist.all_reduce(epoch_kl_tensor, op=dist.ReduceOp.SUM)
+            global_epoch_kl = epoch_kl_tensor.item() / dist.get_world_size()
+            
+            global_avg_kl = global_epoch_kl
+            
+            if global_epoch_kl > target_kl * 1.5:
+                if global_rank == 0:
+                    print(f"Early stopping triggered at epoch {epoch+1} due to high KL: {global_epoch_kl:.4f}")
+                break
+
+        if global_avg_kl > target_kl * 1.2:
+            args.kl_coef *= 1.5
+        elif global_avg_kl < target_kl * 0.8:
+            args.kl_coef /= 1.5
+            
+        args.kl_coef = max(0.0001, min(5.0, args.kl_coef))
 
         update_time = time.time() - t_update_start
         buffer_idx = 1 - buffer_idx
@@ -681,8 +714,8 @@ def main():
                 "Loss/Policy_Loss": loss.item(),
                 "Loss/Value_Loss": v_loss.item(),
                 "Loss/Entropy": entropy.item(),
-                "Loss/KL_Div": kl_divergence.item(),
-                "global_step": update * global_steps 
+                "Loss/KL_Div": global_avg_kl,
+                "global_step": update * global_steps,
             }, step=update)
 
             if update % 10 == 0:
