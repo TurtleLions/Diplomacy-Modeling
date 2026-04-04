@@ -94,6 +94,19 @@ class SubprocVecDiplomacy:
         for p in self.ps: 
             p.join()
 
+def apply_top_k_mask(logits, k=3):
+    """Masks all logits outside the top K highest values."""
+    # If the number of legal moves is already <= K, do nothing
+    if logits.size(-1) <= k:
+        return logits
+        
+    # Find the value of the Kth largest logit for each item in the batch
+    top_k_values, _ = torch.topk(logits, k, dim=-1)
+    kth_largest = top_k_values[..., -1:]
+    
+    # Mask out anything smaller than the Kth largest value
+    return logits.masked_fill(logits < kth_largest, -1e4)
+
 def evaluate_and_save_game(net, device, update_num, save_dir="./eval_games"):
     """Runs a deterministic evaluation game and logs the full transcript."""
     os.makedirs(save_dir, exist_ok=True)
@@ -284,10 +297,10 @@ def main():
     if global_rank == 0: 
         print("Compiling PyTorch models...")
     
-    # net = torch.compile(net, dynamic=True)
-    # bc_model = torch.compile(bc_model, dynamic=True)
-    # actor_bc_model = torch.compile(actor_bc_model, dynamic=True)
-    # actor_net = torch.compile(actor_net, dynamic=True)
+    net = torch.compile(net, dynamic=True)
+    bc_model = torch.compile(bc_model, dynamic=True)
+    actor_bc_model = torch.compile(actor_bc_model, dynamic=True)
+    actor_net = torch.compile(actor_net, dynamic=True)
 
     net = DDP(net, device_ids=[local_rank])
     optimizer = optim.Adam(net.parameters(), lr=args.lr, eps=1e-5)
@@ -297,7 +310,7 @@ def main():
         return {
             'obs': torch.zeros((args.num_steps, args.num_envs, NUM_AGENTS, HISTORY_LENGTH, MAP_PROVINCES, 46), dtype=torch.bfloat16, device=device),
             'actions': torch.zeros((args.num_steps, args.num_envs, NUM_AGENTS, MAP_PROVINCES), dtype=torch.long, device=device),
-            'logprobs': torch.zeros((args.num_steps, args.num_envs, NUM_AGENTS), dtype=torch.float32, device=device),
+            'logprobs': torch.zeros((args.num_steps, args.num_envs, NUM_AGENTS, MAP_PROVINCES), dtype=torch.float32, device=device),
             'rewards': torch.zeros((args.num_steps, args.num_envs, NUM_AGENTS), dtype=torch.float32, device=device),
             'dones': torch.zeros((args.num_steps, args.num_envs, NUM_AGENTS), dtype=torch.float32, device=device),
             'values': torch.zeros((args.num_steps, args.num_envs, NUM_AGENTS), dtype=torch.float32, device=device),
@@ -415,6 +428,7 @@ def main():
                                     combined_mask[fallback_mask] = prov_mask[fallback_mask]
                                     
                                     logits = logits.float().masked_fill(~combined_mask, -1e4)
+                                    logits = apply_top_k_mask(logits, k=3)
                                     dist_cat = Categorical(logits=logits)
                                     current_action = dist_cat.sample()
                                     step_log_probs = dist_cat.log_prob(current_action)
@@ -423,7 +437,7 @@ def main():
                                     final_logprobs[batch_indices[valid_step], prov_indices[valid_step]] = step_log_probs[valid_step]
                                     
                                 buf['values'][step][buf['masks'][step]] = values.squeeze(-1)
-                                buf['logprobs'][step][buf['masks'][step]] = final_logprobs.sum(dim=1)
+                                buf['logprobs'][step][buf['masks'][step]] = final_logprobs
                                 
                                 idx_counter = 0
                                 for i in range(args.num_envs):
@@ -489,7 +503,7 @@ def main():
         timestamp = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
         run_name = f"ppo_run_{timestamp}"
         
-        base_dir = f"./data/{run_name}"
+        base_dir = f"/data/restanislao/model_runs/{run_name}"
         ckpt_dir = os.path.join(base_dir, "checkpoints")
         eval_dir = os.path.join(base_dir, "eval_games")
         
@@ -527,7 +541,7 @@ def main():
         valid_cpu = valid.cpu()
         flat_obs = buf['obs'].view(-1, HISTORY_LENGTH, MAP_PROVINCES, 46)[valid]
         flat_act = buf['actions'].view(-1, MAP_PROVINCES)[valid]
-        flat_logprobs = buf['logprobs'].view(-1)[valid]
+        flat_logprobs = buf['logprobs'].view(-1, MAP_PROVINCES)[valid]
         flat_adv = buf['advantages'].view(-1)[valid]
         flat_ret = buf['returns'].view(-1)[valid]
         flat_val = buf['values'].view(-1)[valid]
@@ -552,7 +566,23 @@ def main():
             b_size = min_b_size
 
         if flat_adv.shape[0] > 1:
-            flat_adv = (flat_adv - flat_adv.mean()) / (flat_adv.std() + 1e-8)
+            local_sum = flat_adv.sum()
+            local_sq_sum = (flat_adv ** 2).sum()
+            local_count = torch.tensor(flat_adv.shape[0], dtype=torch.float32, device=device)
+
+            # Stack and sync across all GPUs
+            stats = torch.stack([local_sum, local_sq_sum, local_count])
+            dist.all_reduce(stats, op=dist.ReduceOp.SUM)
+
+            global_sum, global_sq_sum, global_n = stats[0], stats[1], stats[2]
+
+            # Calculate global statistics
+            global_mean = global_sum / global_n
+            global_var = (global_sq_sum / global_n) - (global_mean ** 2)
+            global_std = torch.sqrt(torch.clamp(global_var, min=1e-8))
+
+            # Normalize using global statistics
+            flat_adv = (flat_adv - global_mean) / (global_std + 1e-8)
 
         t_update_start = time.time()
         net.train()
@@ -566,7 +596,14 @@ def main():
         global_avg_kl = 0.0
 
         for epoch in range(args.update_epochs):
-            np.random.shuffle(indices)
+            perm = torch.randperm(b_size, device=device)
+            epoch_obs = flat_obs[perm]
+            epoch_act = flat_act[perm]
+            epoch_logprobs = flat_logprobs[perm]
+            epoch_adv = flat_adv[perm]
+            epoch_ret = flat_ret[perm]
+            epoch_sparse = flat_sparse_masks[perm]
+
             start_indices = list(range(0, b_size, mb_size))
             
             epoch_kl_sum = 0.0
@@ -574,15 +611,14 @@ def main():
 
             for step_idx, start in enumerate(start_indices):
                 end = start + mb_size
-                mb_idx = indices[start:end]
                 
-                mb_obs = flat_obs[mb_idx].to(dtype=torch.bfloat16).contiguous()
-                mb_act = flat_act[mb_idx].contiguous()
-                mb_logprobs = flat_logprobs[mb_idx]
-                mb_adv = flat_adv[mb_idx]
-                mb_ret = flat_ret[mb_idx]
+                mb_obs = epoch_obs[start:end].to(dtype=torch.bfloat16)
+                mb_act = epoch_act[start:end]
+                mb_logprobs = epoch_logprobs[start:end]
+                mb_adv = epoch_adv[start:end]
+                mb_ret = epoch_ret[start:end]
                 
-                mb_sparse_gpu = flat_sparse_masks[mb_idx].to(device)
+                mb_sparse_gpu = epoch_sparse[start:end].to(device)
                 mb_masks_gpu = rebuild_dense_mask(mb_sparse_gpu, MAP_PROVINCES, VOCAB_SIZE, device)
 
                 is_last_batch = (step_idx + 1) == len(start_indices)
@@ -595,53 +631,65 @@ def main():
                         state_repr, new_val = net.module.encode_state(mb_obs)
                         
                         is_active_mask = (mb_act != NONE_IDX)
-                        batch_size = mb_obs.size(0)
+                        batch_size_mb = mb_obs.size(0)
                         max_active = is_active_mask.sum(dim=1).max().item()
 
                         if max_active > 0:
                             # Parallel Full-Sequence Decode
                             active_logits_seq, padding_mask = net.module.decode_full(state_repr, mb_act, is_active_mask)
                             
-                            with torch.no_grad():
-                                bc_state_repr, _ = bc_model.encode_state(mb_obs)
-                                bc_logits_seq, _ = bc_model.decode_full(bc_state_repr, mb_act, is_active_mask)
-                                
-                            # Pack targets and masks to match the (B, max_active) output tensor
-                            padded_indices = torch.zeros((batch_size, max_active), dtype=torch.long, device=device)
-                            for b in range(batch_size):
+                            # Pack targets and masks
+                            padded_indices = torch.zeros((batch_size_mb, max_active), dtype=torch.long, device=device)
+                            for b in range(batch_size_mb):
                                 v_idx = torch.where(is_active_mask[b])[0]
                                 if len(v_idx) > 0:
                                     padded_indices[b, :len(v_idx)] = v_idx
                                     
-                            b_idx_expand = torch.arange(batch_size, device=device).unsqueeze(1)
+                            b_idx_expand = torch.arange(batch_size_mb, device=device).unsqueeze(1)
                             packed_targets = mb_act[b_idx_expand, padded_indices]
                             packed_masks = mb_masks_gpu[b_idx_expand, padded_indices, :]
                             
                             # Mask Logits and Calculate Distributions
                             active_logits_seq = active_logits_seq.float().masked_fill(~packed_masks, -1e4)
-                            bc_logits_seq = bc_logits_seq.float().masked_fill(~packed_masks, -1e4)
                             
                             dist_cat = Categorical(logits=active_logits_seq)
                             logp_seq = dist_cat.log_prob(packed_targets)
                             entropy_seq = dist_cat.entropy()
                             
-                            bc_dist_cat = Categorical(logits=bc_logits_seq)
-                            kl_seq = torch.distributions.kl.kl_divergence(dist_cat, bc_dist_cat)
+                            # Pack the old logprobs to match the active units
+                            packed_old_logprobs = mb_logprobs[b_idx_expand, padded_indices]
                             
-                            # Zero-out padding values before summation
+                            # Calculate ratio PER UNIT
+                            logratio_seq = logp_seq - packed_old_logprobs
+                            ratio_seq = torch.exp(logratio_seq)
+                            
+                            # Zero out padded units for all sequence metrics
                             valid_mask = ~padding_mask
-                            logp_seq = logp_seq * valid_mask
+                            ratio_seq = ratio_seq * valid_mask
+                            
+                            # Safely calculate unit counts for averaging
+                            unit_counts = valid_mask.sum(dim=1).clamp(min=1)
+
                             entropy_seq = entropy_seq * valid_mask
-                            kl_seq = kl_seq * valid_mask
+                            entropy = (entropy_seq.sum(dim=1) / unit_counts).mean()
                             
-                            # Sum over the unit sequence for the agent's total turn
-                            new_logp = logp_seq.sum(dim=1)
+                            # Expand the agent-level advantage to all its units
+                            mb_adv_seq = mb_adv.unsqueeze(1).expand(-1, max_active)
                             
-                            valid_counts = valid_mask.sum(dim=1).clamp(min=1)
-                            entropy = entropy_seq.sum(dim=1).mean()
-                            kl_divergence = (kl_seq.sum(dim=1) / valid_counts).mean()
+                            # Calculate surrogate losses per unit
+                            pg_loss1 = -mb_adv_seq * ratio_seq
+                            pg_loss2 = -mb_adv_seq * torch.clamp(ratio_seq, 1 - args.clip_coef, 1 + args.clip_coef)
+                            
+                            # Take max, sum over active units, and average by unit count
+                            unit_loss = (torch.max(pg_loss1, pg_loss2) * valid_mask).sum(dim=1) / unit_counts
+                            pg_loss = unit_loss.mean()
+                            
+                            with torch.no_grad():
+                                kl_div_seq = 0.5 * (packed_old_logprobs - logp_seq).pow(2)
+                                kl_div_seq = kl_div_seq * valid_mask
+                                kl_divergence = (kl_div_seq.sum(dim=1) / unit_counts).mean()
                         else:
-                            new_logp = torch.zeros(batch_size, device=device)
+                            pg_loss = torch.tensor(0.0, device=device)
                             entropy = torch.tensor(0.0, device=device)
                             kl_divergence = torch.tensor(0.0, device=device)
 
@@ -650,13 +698,10 @@ def main():
 
                     new_val = new_val.float()
                     
-                    logratio = new_logp - mb_logprobs
-                    ratio = logratio.exp()
-                    pg_loss1 = -mb_adv * ratio
-                    pg_loss2 = -mb_adv * torch.clamp(ratio, 1 - args.clip_coef, 1 + args.clip_coef)
-                    pg_loss = torch.max(pg_loss1, pg_loss2).mean()
-                    
+                    # Calculate Value loss
                     v_loss = 0.5 * ((new_val.squeeze() - mb_ret) ** 2).mean()
+                    
+                    # Combine into final loss (pg_loss is already calculated per-unit above!)
                     loss = pg_loss - args.ent_coef * entropy + v_loss * args.v_coef + args.kl_coef * kl_divergence
                     
                     loss = loss / accum_steps
@@ -669,7 +714,7 @@ def main():
                 
                 del mb_obs, mb_act, mb_masks_gpu, new_val
                 if max_active > 0:
-                    del active_logits_seq, bc_logits_seq, dist_cat, bc_dist_cat
+                    del active_logits_seq, dist_cat
 
             local_epoch_kl = epoch_kl_sum / max(1, epoch_kl_steps)
             epoch_kl_tensor = torch.tensor([local_epoch_kl], device=device)
@@ -718,7 +763,7 @@ def main():
                 "global_step": update * global_steps,
             }, step=update)
 
-            if update % 10 == 0:
+            if update % 1 == 0:
                 # Save checkpoint to the unique run folder
                 ckpt_path = os.path.join(ckpt_dir, f"diplomacy_APPO_update_{update}.pth")
                 torch.save(net.module.state_dict(), ckpt_path)

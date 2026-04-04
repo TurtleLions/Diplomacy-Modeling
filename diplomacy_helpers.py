@@ -124,7 +124,7 @@ class DiplomacyTransformer(nn.Module):
         self.province_embedding = nn.Embedding(num_provinces, d_model)
         self.time_embedding = nn.Embedding(history_length, d_model)
         
-        encoder_layer = nn.TransformerEncoderLayer(d_model=d_model, nhead=nhead, batch_first=True)
+        encoder_layer = nn.TransformerEncoderLayer(d_model=d_model, nhead=nhead, batch_first=True, dropout=0.0)
         self.transformer = nn.TransformerEncoder(encoder_layer, num_layers=num_layers)
         
         self.value_head = nn.Linear(d_model * num_provinces, 1)
@@ -499,6 +499,8 @@ class DiplomacyTransformerEnv(ParallelEnv):
         self.stalemate_counter = 0
         self.last_year_sc_owners = {sc: a for a in self.agents for sc in self.game.get_centers(a)}
 
+        self.year_start_sc_counts = {a: len(self.game.get_centers(a)) for a in self.agents}
+
         observations = {}
         for a in self.agents:
             agent_obs = parse_state_to_tensor({'name': self.game.get_current_phase(), 'state': self.game.get_state()}, observing_agent=a)
@@ -561,12 +563,16 @@ class DiplomacyTransformerEnv(ParallelEnv):
             rewards[agent] -= 0.02
             
             # Sub-goal: Supply Center acquisition
-            if current_phase.startswith('F') and self.step_count > 1:
-                sc_delta = len(current_scs) - len(prev_scs)
-                if sc_delta > 0:
+            if current_phase.startswith('S') and current_phase.endswith('M') and self.step_count > 1:
+                current_sc_count = len(current_scs)
+                prev_sc_count = self.year_start_sc_counts.get(agent, 0)
+                sc_delta = current_sc_count - prev_sc_count
+                
+                if sc_delta != 0:
                     rewards[agent] += sc_delta * 10.0  
-                elif sc_delta < 0:
-                    rewards[agent] += sc_delta * 10.0  
+                
+                # Update tracker for the new year
+                self.year_start_sc_counts[agent] = current_sc_count
                 
                 # Check for regional stalemates to prevent infinite rollout loops
                 if agent == self.agents[0]:
