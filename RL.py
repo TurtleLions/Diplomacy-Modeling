@@ -95,17 +95,19 @@ class SubprocVecDiplomacy:
             p.join()
 
 def apply_top_k_mask(logits, k=3):
-    """Masks all logits outside the top K highest values."""
-    # If the number of legal moves is already <= K, do nothing
+    """Strictly masks all but the exact top K highest values."""
     if logits.size(-1) <= k:
         return logits
         
-    # Find the value of the Kth largest logit for each item in the batch
-    top_k_values, _ = torch.topk(logits, k, dim=-1)
-    kth_largest = top_k_values[..., -1:]
+    # Get the exact K indices
+    _, top_k_indices = torch.topk(logits, k, dim=-1)
     
-    # Mask out anything smaller than the Kth largest value
-    return logits.masked_fill(logits < kth_largest, -1e4)
+    # Build a strict mask for only those K indices
+    strict_mask = torch.zeros_like(logits, dtype=torch.bool)
+    strict_mask.scatter_(-1, top_k_indices, True)
+    
+    # Mask out everything else
+    return logits.masked_fill(~strict_mask, -1e4)
 
 def evaluate_and_save_game(net, device, update_num, save_dir="./eval_games"):
     """Runs a deterministic evaluation game and logs the full transcript."""
@@ -212,7 +214,7 @@ def parse_args():
     parser.add_argument("--gamma", type=float, default=0.99, help="Discount factor")
     parser.add_argument("--gae_lambda", type=float, default=0.95, help="GAE lambda parameter")
     parser.add_argument("--clip_coef", type=float, default=0.2, help="PPO policy clipping coefficient")
-    parser.add_argument("--ent_coef", type=float, default=0.0, help="Entropy coefficient")
+    parser.add_argument("--ent_coef", type=float, default=0.001, help="Entropy coefficient")
     parser.add_argument("--v_coef", type=float, default=0.1, help="Value function loss coefficient")
     parser.add_argument("--kl_coef", type=float, default=0.05, help="KL divergence penalty coefficient")
     parser.add_argument("--update_epochs", type=int, default=2, help="Number of epochs per PPO update")
@@ -316,6 +318,8 @@ def main():
             'values': torch.zeros((args.num_steps, args.num_envs, NUM_AGENTS), dtype=torch.float32, device=device),
             'masks': torch.zeros((args.num_steps, args.num_envs, NUM_AGENTS), dtype=torch.bool, device=device),
             'sparse_masks': torch.zeros((args.num_steps, args.num_envs, NUM_AGENTS, 2000), dtype=torch.int32, device=device),
+            'top_k_indices': torch.zeros((args.num_steps, args.num_envs, NUM_AGENTS, MAP_PROVINCES, 3), dtype=torch.long, device=device),
+            'top_k_values': torch.zeros((args.num_steps, args.num_envs, NUM_AGENTS, MAP_PROVINCES, 3), dtype=torch.float32, device=device),
             'advantages': torch.zeros((args.num_steps, args.num_envs, NUM_AGENTS), dtype=torch.float32, device=device),
             'returns': torch.zeros((args.num_steps, args.num_envs, NUM_AGENTS), dtype=torch.float32, device=device)
         }
@@ -387,6 +391,8 @@ def main():
                                 batch_size = flat_obs.size(0)
                                 final_actions = torch.full((batch_size, MAP_PROVINCES), NONE_IDX, dtype=torch.long, device=device)
                                 final_logprobs = torch.zeros((batch_size, MAP_PROVINCES), dtype=torch.float32, device=device)
+                                final_top_k = torch.zeros((batch_size, MAP_PROVINCES, 3), dtype=torch.long, device=device)
+                                final_top_k_vals = torch.zeros((batch_size, MAP_PROVINCES, 3), dtype=torch.float32, device=device)
                                 
                                 padded_indices = torch.zeros((batch_size, max_decode_steps), dtype=torch.long, device=device)
                                 step_mask = torch.zeros((batch_size, max_decode_steps), dtype=torch.bool, device=device)
@@ -432,9 +438,13 @@ def main():
                                     dist_cat = Categorical(logits=logits)
                                     current_action = dist_cat.sample()
                                     step_log_probs = dist_cat.log_prob(current_action)
+
+                                    top_k_vals, top_k_idx = torch.topk(logits, 3, dim=-1)
                                     
                                     final_actions[batch_indices[valid_step], prov_indices[valid_step]] = current_action[valid_step]
                                     final_logprobs[batch_indices[valid_step], prov_indices[valid_step]] = step_log_probs[valid_step]
+                                    final_top_k[batch_indices[valid_step], prov_indices[valid_step]] = top_k_idx[valid_step]
+                                    final_top_k_vals[batch_indices[valid_step], prov_indices[valid_step]] = top_k_vals[valid_step]
                                     
                                 buf['values'][step][buf['masks'][step]] = values.squeeze(-1)
                                 buf['logprobs'][step][buf['masks'][step]] = final_logprobs
@@ -445,6 +455,8 @@ def main():
                                         if buf['masks'][step, i, agent_to_idx[a]]:
                                             act_array = final_actions[idx_counter]
                                             buf['actions'][step, i, agent_to_idx[a]] = act_array
+                                            buf['top_k_indices'][step, i, agent_to_idx[a]] = final_top_k[idx_counter]
+                                            buf['top_k_values'][step, i, agent_to_idx[a]] = final_top_k_vals[idx_counter]
                                             actions_to_send[i][a] = act_array.cpu().numpy()
                                             idx_counter += 1
                                             
@@ -546,6 +558,8 @@ def main():
         flat_ret = buf['returns'].view(-1)[valid]
         flat_val = buf['values'].view(-1)[valid]
         flat_sparse_masks = buf['sparse_masks'].view(-1, 2000)[valid]
+        flat_top_k = buf['top_k_indices'].view(-1, MAP_PROVINCES, 3)[valid]
+        flat_top_k_vals = buf['top_k_values'].view(-1, MAP_PROVINCES, 3)[valid]
 
         b_size = flat_obs.shape[0]
         
@@ -603,6 +617,8 @@ def main():
             epoch_adv = flat_adv[perm]
             epoch_ret = flat_ret[perm]
             epoch_sparse = flat_sparse_masks[perm]
+            epoch_top_k = flat_top_k[perm]
+            epoch_top_k_vals = flat_top_k_vals[perm]
 
             start_indices = list(range(0, b_size, mb_size))
             
@@ -617,6 +633,8 @@ def main():
                 mb_logprobs = epoch_logprobs[start:end]
                 mb_adv = epoch_adv[start:end]
                 mb_ret = epoch_ret[start:end]
+                mb_top_k = epoch_top_k[start:end]
+                mb_top_k_vals = epoch_top_k_vals[start:end]
                 
                 mb_sparse_gpu = epoch_sparse[start:end].to(device)
                 mb_masks_gpu = rebuild_dense_mask(mb_sparse_gpu, MAP_PROVINCES, VOCAB_SIZE, device)
@@ -626,11 +644,14 @@ def main():
 
                 my_context = net.no_sync() if not sync_this_step else contextlib.nullcontext()
                 
+                debug_print = (update == 1 and epoch == 0 and step_idx == 0 and global_rank == 0)
+
                 with my_context:
                     with torch.autocast(device_type='cuda', dtype=torch.bfloat16):
                         state_repr, new_val = net.module.encode_state(mb_obs)
                         
-                        is_active_mask = (mb_act != NONE_IDX)
+                        is_active_mask = ~mb_masks_gpu[:, :, NONE_IDX]
+                        
                         batch_size_mb = mb_obs.size(0)
                         max_active = is_active_mask.sum(dim=1).max().item()
 
@@ -649,10 +670,32 @@ def main():
                             packed_targets = mb_act[b_idx_expand, padded_indices]
                             packed_masks = mb_masks_gpu[b_idx_expand, padded_indices, :]
                             
-                            # Mask Logits and Calculate Distributions
                             active_logits_seq = active_logits_seq.float().masked_fill(~packed_masks, -1e4)
                             
+                            _, dynamic_top_k = torch.topk(active_logits_seq, 3, dim=-1)
+                            
+                            final_mask = torch.zeros_like(active_logits_seq, dtype=torch.bool)
+                            final_mask.scatter_(2, dynamic_top_k, True)
+                            
+                            seq_indices = torch.arange(max_active, device=device).unsqueeze(0)
+                            b_idx_expand_full = torch.arange(batch_size_mb, device=device).unsqueeze(1)
+                            final_mask[b_idx_expand_full, seq_indices, packed_targets] = True
+                            
+                            final_mask = final_mask & packed_masks
+                            
+                            final_mask[b_idx_expand_full, seq_indices, packed_targets] = True
+                            
+                            active_logits_seq = active_logits_seq.masked_fill(~final_mask, -1e4)
+                            if debug_print:
+                                print("\n--- DEBUG: MASK RECONSTRUCTION ---")
+                                b_idx, u_idx = 0, 0 # First batch, first unit
+                                target_action = packed_targets[b_idx, u_idx].item()
+                                is_action_masked = final_mask[b_idx, u_idx, target_action].item()
+                                print(f"Target Action Index: {target_action}")
+                                print(f"Is Target Masked VALID (True)? {is_action_masked}")
+                                print(f"Total Valid Actions in Mask: {final_mask[b_idx, u_idx].sum().item()}")
                             dist_cat = Categorical(logits=active_logits_seq)
+
                             logp_seq = dist_cat.log_prob(packed_targets)
                             entropy_seq = dist_cat.entropy()
                             
@@ -661,6 +704,15 @@ def main():
                             
                             # Calculate ratio PER UNIT
                             logratio_seq = logp_seq - packed_old_logprobs
+                            if debug_print:
+                                # Grab the first sequence in the batch
+                                print("\n--- DEBUG: LOGPROB ALIGNMENT ---")
+                                print(f"Target Actions:    {packed_targets[0][:5]}")
+                                print(f"Old Logprobs:      {packed_old_logprobs[0][:5]}")
+                                print(f"New Logprobs:      {logp_seq[0][:5]}")
+                                diff = (packed_old_logprobs - logp_seq).abs()
+                                print(f"Max Diff in Batch: {diff.max().item():.4f}")
+                                print(f"Mean Diff:         {diff.mean().item():.4f}")
                             ratio_seq = torch.exp(logratio_seq)
                             
                             # Zero out padded units for all sequence metrics
@@ -671,6 +723,12 @@ def main():
                             unit_counts = valid_mask.sum(dim=1).clamp(min=1)
 
                             entropy_seq = entropy_seq * valid_mask
+                            if debug_print:
+                                print("\n--- DEBUG: PROBABILITY DISTRIBUTION ---")
+                                # Convert logits to probabilities to see where the mass is
+                                probs = torch.softmax(active_logits_seq[0, 0], dim=-1)
+                                print(f"Top 5 Probs: {torch.topk(probs, 5).values}")
+                                print(f"Target Prob: {probs[packed_targets[0, 0]]}")
                             entropy = (entropy_seq.sum(dim=1) / unit_counts).mean()
                             
                             # Expand the agent-level advantage to all its units

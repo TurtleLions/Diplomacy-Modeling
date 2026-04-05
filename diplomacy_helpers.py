@@ -220,6 +220,13 @@ class DiplomacyTransformer(nn.Module):
             
         active_states = torch.stack(active_states) # (B, max_units, D)
         active_acts = torch.stack(active_acts)     # (B, max_units)
+
+        if active_states.size(0) > 0 and not hasattr(self, '_debug_printed'):
+            print("\n--- DEBUG: DECODE_FULL SEQUENCE ---")
+            print(f"Max Units in Sequence: {max_units}")
+            print(f"Active Mask Sums:      {active_mask.sum(dim=1)[:5]}")
+            print(f"Packed Actions:        {active_acts[0][:5]}")
+            self._debug_printed = True # Ensure it only prints once
         
         seq_lengths = active_mask.sum(dim=1, keepdim=True)
         idx = torch.arange(max_units, device=state_repr.device).unsqueeze(0)
@@ -638,4 +645,16 @@ class DiplomacyTransformerEnv(ParallelEnv):
         
         self.agents = [a for a in self.agents if not terminations[a] and (len(self.game.get_centers(a)) > 0 or len(self.game.get_state()['units'].get(a, [])) > 0)]
         
-        return observations, rewards, terminations, {a: False for a in self.agents}, infos
+        terminations = {a: False for a in self.agents}
+        truncations = {a: False for a in self.agents}
+
+        for agent in self.agents:
+            current_scs = self.game.get_centers(agent)
+            # True terminal states
+            if len(current_scs) >= 18 or (len(current_scs) == 0 and len(current_state_dict.get('units', {}).get(agent, [])) == 0):
+                terminations[agent] = True
+            # Artificial time limit
+            elif is_done: 
+                truncations[agent] = True
+
+        return observations, rewards, terminations, truncations, infos
