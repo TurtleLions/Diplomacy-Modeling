@@ -107,7 +107,7 @@ def apply_top_k_mask(logits, k=3):
     strict_mask.scatter_(-1, top_k_indices, True)
     
     # Mask out everything else
-    return logits.masked_fill(~strict_mask, -1e4)
+    return logits.masked_fill(~strict_mask, -1e9)
 
 def evaluate_and_save_game(net, device, update_num, save_dir="./eval_games"):
     """Runs a deterministic evaluation game and logs the full transcript."""
@@ -172,7 +172,7 @@ def evaluate_and_save_game(net, device, update_num, save_dir="./eval_games"):
                         
                         logits = logits.float()
                         prov_mask = masks_tensor[batch_indices, prov_indices, :]
-                        logits = logits.masked_fill(~prov_mask, -1e4)
+                        logits = logits.masked_fill(~prov_mask, -1e9)
                         
                         # Deterministic sampling for evaluation
                         current_action = torch.argmax(logits, dim=-1)
@@ -433,7 +433,7 @@ def main():
                                     fallback_mask = combined_mask.sum(dim=-1) == 0
                                     combined_mask[fallback_mask] = prov_mask[fallback_mask]
                                     
-                                    logits = logits.float().masked_fill(~combined_mask, -1e4)
+                                    logits = logits.float().masked_fill(~combined_mask, -1e9)
                                     logits = apply_top_k_mask(logits, k=3)
                                     dist_cat = Categorical(logits=logits)
                                     current_action = dist_cat.sample()
@@ -669,13 +669,13 @@ def main():
                             b_idx_expand = torch.arange(batch_size_mb, device=device).unsqueeze(1)
                             packed_targets = mb_act[b_idx_expand, padded_indices]
                             packed_masks = mb_masks_gpu[b_idx_expand, padded_indices, :]
+                                                        
+                            packed_top_k = mb_top_k[b_idx_expand, padded_indices, :]
                             
-                            active_logits_seq = active_logits_seq.float().masked_fill(~packed_masks, -1e4)
-                            
-                            _, dynamic_top_k = torch.topk(active_logits_seq, 3, dim=-1)
+                            active_logits_seq = active_logits_seq.float().masked_fill(~packed_masks, -1e9)
                             
                             final_mask = torch.zeros_like(active_logits_seq, dtype=torch.bool)
-                            final_mask.scatter_(2, dynamic_top_k, True)
+                            final_mask.scatter_(2, packed_top_k, True)
                             
                             seq_indices = torch.arange(max_active, device=device).unsqueeze(0)
                             b_idx_expand_full = torch.arange(batch_size_mb, device=device).unsqueeze(1)
@@ -685,7 +685,7 @@ def main():
                             
                             final_mask[b_idx_expand_full, seq_indices, packed_targets] = True
                             
-                            active_logits_seq = active_logits_seq.masked_fill(~final_mask, -1e4)
+                            active_logits_seq = active_logits_seq.masked_fill(~final_mask, -1e9)
                             if debug_print:
                                 print("\n--- DEBUG: MASK RECONSTRUCTION ---")
                                 b_idx, u_idx = 0, 0 # First batch, first unit
