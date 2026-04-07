@@ -540,7 +540,7 @@ class DiplomacyTransformerEnv(ParallelEnv):
         for agent, action_indices in actions.items():
             text_orders = []
             for i, order_idx in enumerate(action_indices):
-                order_str = self.idx_to_order[order_idx]
+                order_str = self.idx_to_order[int(order_idx)]
                 if order_str != 'NONE':
                     text_orders.append(order_str)
             self.game.set_orders(agent, text_orders)
@@ -561,100 +561,83 @@ class DiplomacyTransformerEnv(ParallelEnv):
         current_phase = self.game.get_current_phase()
         all_map_scs = self.game.map.scs
         
+        if current_phase.startswith('S') and current_phase.endswith('M') and self.step_count > 1:
+            current_sc_owners_map = {sc: a for a in self.possible_agents for sc in self.game.get_centers(a)}
+            if current_sc_owners_map == self.last_year_sc_owners:
+                self.stalemate_counter += 1
+            else:
+                self.stalemate_counter = 0
+                self.last_year_sc_owners = current_sc_owners_map.copy()
+            
+            if self.stalemate_counter >= self.stalemate_threshold:
+                is_done = True
+
+        if not is_done:
+            for a in self.agents:
+                if len(self.game.get_centers(a)) >= 18:
+                    is_done = True
+                    break
+
         for agent in self.agents:
             current_scs = self.game.get_centers(agent)
-            prev_scs = [sc for sc, owner in prev_sc_owners.items() if owner == agent]
+            current_sc_count = len(current_scs)
             agent_units = current_state_dict['units'].get(agent, [])
+            prev_agent_units = prev_units.get(agent, [])
             
-            # Action deduction to penalize non-activity
-            rewards[agent] -= 0.02
+            rewards[agent] -= 0.05
             
-            # Sub-goal: Supply Center acquisition
+            # Supply Center Deltas
             if current_phase.startswith('S') and current_phase.endswith('M') and self.step_count > 1:
-                current_sc_count = len(current_scs)
                 prev_sc_count = self.year_start_sc_counts.get(agent, 0)
                 sc_delta = current_sc_count - prev_sc_count
                 
                 if sc_delta != 0:
                     rewards[agent] += sc_delta * 10.0  
-                
-                # Update tracker for the new year
+                    
                 self.year_start_sc_counts[agent] = current_sc_count
-                
-                # Check for regional stalemates to prevent infinite rollout loops
-                if agent == self.agents[0]:
-                    current_sc_owners = {sc: a for a in self.possible_agents for sc in self.game.get_centers(a)}
                     
-                    if current_sc_owners == self.last_year_sc_owners:
-                        self.stalemate_counter += 1
-                    else:
-                        self.stalemate_counter = 0
-                        self.last_year_sc_owners = current_sc_owners.copy()
+            # Tactical Advancement
+            if prev_phase_type == 'M':
+                curr_locs = {u.replace('*', '').upper().split()[1].split('/')[0] for u in agent_units if len(u.split()) >= 2}
+                prev_locs = {u.replace('*', '').upper().split()[1].split('/')[0] for u in prev_agent_units if len(u.split()) >= 2}
+                
+                advanced_locs = curr_locs - prev_locs
+                for loc in advanced_locs:
+                    rewards[agent] += 0.1
+
+                    if loc in all_map_scs and loc not in current_scs:
+                        rewards[agent] += 1.0 
                         
-                    if self.stalemate_counter >= self.stalemate_threshold:
-                        is_done = True
-                    
-            # Sub-goal: Strategic frontline occupation
-            if prev_phase_type == 'M':
-                for unit_str in agent_units:
-                    clean_str = unit_str.replace('*', '').upper()
-                    parts = clean_str.split()
-                    if len(parts) >= 2:
-                        u_loc = parts[1].split('/')[0]
-                        if u_loc in all_map_scs and u_loc not in current_scs:
-                            rewards[agent] += 0.25 
-                            
-            # Sub-goal: Coordinated tactical support
-            if prev_phase_type == 'M':
-                support_count = 0
-                for order_idx in actions[agent]:
-                    order_str = self.idx_to_order[int(order_idx)]
-                    
-                    if ' S ' in order_str:
-                        parts = order_str.split(' S ')
-                        if len(parts) > 1:
-                            supported_part = parts[1]
-                            supp_parts = supported_part.split()
-                            
-                            if len(supp_parts) >= 2:
-                                target_loc = supp_parts[1].split('/')[0]
-                                
-                                if '-' in supported_part:
-                                    if global_orders.get(target_loc) == supported_part:
-                                        support_count += 1
-                                        
-                if support_count > 0:
-                    rewards[agent] += (support_count * 0.1)
-                    
-            # Terminal states (Victory, Annihilation, Stalemates)
-            if len(current_scs) >= 18:
-                rewards[agent] += 100.0
-                is_done = True
-            elif len(current_scs) == 0 and len(agent_units) == 0:
-                rewards[agent] -= 100.0
-            elif is_done:
-                rewards[agent] += (len(current_scs) * 2.5)
-                
-            # Combat penalty for unit dislodgement
+            # Dislodgement Penalty
             current_dislodged = current_state_dict.get('dislodged', {}).get(agent, [])
             if len(current_dislodged) > 0:
-                rewards[agent] -= (len(current_dislodged) * 0.2)
+                rewards[agent] -= (len(current_dislodged) * 0.5)
                 
-        terminations = {a: is_done for a in self.agents}
-        infos = {a: {'action_mask': get_sparse_action_mask(self.game, a, self.provinces, self.order_to_idx)} for a in self.agents}
-        
-        self.agents = [a for a in self.agents if not terminations[a] and (len(self.game.get_centers(a)) > 0 or len(self.game.get_state()['units'].get(a, [])) > 0)]
-        
+            # Terminal States & Truncation Multipliers
+            if current_sc_count >= 18:
+                rewards[agent] += 100.0
+            elif current_sc_count == 0 and len(agent_units) == 0:
+                rewards[agent] -= 50.0 
+            elif is_done:
+                base_truncation = current_sc_count * 3.0
+                if self.stalemate_counter >= self.stalemate_threshold:
+                    base_truncation -= 20.0 
+                rewards[agent] += base_truncation
+
         terminations = {a: False for a in self.agents}
         truncations = {a: False for a in self.agents}
 
         for agent in self.agents:
             current_scs = self.game.get_centers(agent)
-            # True terminal states
-            if len(current_scs) >= 18 or (len(current_scs) == 0 and len(current_state_dict.get('units', {}).get(agent, [])) == 0):
+            agent_units = current_state_dict.get('units', {}).get(agent, [])
+            
+            if len(current_scs) >= 18 or (len(current_scs) == 0 and len(agent_units) == 0):
                 terminations[agent] = True
-            # Artificial time limit
             elif is_done: 
                 truncations[agent] = True
+
+        infos = {a: {'action_mask': get_sparse_action_mask(self.game, a, self.provinces, self.order_to_idx)} for a in self.agents}
+        
+        self.agents = [a for a in self.agents if not terminations[a] and not truncations[a]]
 
         return observations, rewards, terminations, truncations, infos

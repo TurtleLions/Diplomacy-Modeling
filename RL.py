@@ -51,11 +51,20 @@ def worker(remote, parent_remote):
             cmd, data = remote.recv()
             if cmd == 'step': 
                 obs, rewards, terms, truncs, infos = env.step(data)
-                if len(terms) == 0 or all(terms.values()) or len(env.agents) == 0:
+                
+                env_is_done = len(terms) == 0 or all(terms.values()) or all(truncs.values()) or len(env.agents) == 0
+                
+                if env_is_done:
+                    terminal_obs = obs
+                    
                     obs, infos = env.reset()
+                    
+                    infos['__terminal_observation'] = terminal_obs
+
                 remote.send((obs, rewards, terms, truncs, infos, env.agents))
             elif cmd == 'reset': 
                 remote.send((*env.reset(), env.agents))
+                
             elif cmd == 'close':
                 remote.close()
                 break
@@ -78,15 +87,33 @@ class SubprocVecDiplomacy:
         for remote in self.work_remotes: 
             remote.close()
 
+    def _gather_results(self):
+        """Safely polls ready pipes to prevent OS buffer lockups."""
+        results = [None] * self.num_envs
+        
+        # Keep a dictionary mapping each active remote to its original index
+        remotes_left = {remote: i for i, remote in enumerate(self.remotes)}
+        
+        while remotes_left:
+            # mp.connection.wait() blocks until at least one pipe has data ready
+            ready_remotes = mp.connection.wait(remotes_left.keys())
+            
+            for remote in ready_remotes:
+                idx = remotes_left[remote]
+                results[idx] = remote.recv() # Clear the buffer instantly
+                del remotes_left[remote]     # Remove from the polling pool
+                
+        return results
+
     def reset(self):
         for remote in self.remotes: 
             remote.send(('reset', None))
-        return [remote.recv() for remote in self.remotes]
+        return self._gather_results()
 
     def step(self, actions_list):
         for remote, action_dict in zip(self.remotes, actions_list): 
             remote.send(('step', action_dict))
-        return [remote.recv() for remote in self.remotes]
+        return self._gather_results()
         
     def close(self):
         for remote in self.remotes: 
@@ -296,13 +323,13 @@ def main():
         if global_rank == 0:
             print(f"Successfully resumed RL training from checkpoint: {args.resume_weights}")
 
-    if global_rank == 0: 
-        print("Compiling PyTorch models...")
+    # if global_rank == 0: 
+    #     print("Compiling PyTorch models...")
     
-    net = torch.compile(net, dynamic=True)
-    bc_model = torch.compile(bc_model, dynamic=True)
-    actor_bc_model = torch.compile(actor_bc_model, dynamic=True)
-    actor_net = torch.compile(actor_net, dynamic=True)
+    # net = torch.compile(net, dynamic=True)
+    # bc_model = torch.compile(bc_model, dynamic=True)
+    # actor_bc_model = torch.compile(actor_bc_model, dynamic=True)
+    # actor_net = torch.compile(actor_net, dynamic=True)
 
     net = DDP(net, device_ids=[local_rank])
     optimizer = optim.Adam(net.parameters(), lr=args.lr, eps=1e-5)
@@ -334,10 +361,11 @@ def main():
     thread_stats = {"env_time": 0.0, "gpu_fwd_time": 0.0}
     agent_to_idx = {a: i for i, a in enumerate(possible_agents)}
 
+    inference_stream = torch.cuda.Stream(device=device)
+
     def rollout_worker():
         """Background thread responsible for filling the experience buffer asynchronously."""
         torch.cuda.set_device(device) 
-        inference_stream = torch.cuda.Stream(device=device)
         buffer_idx = 0
         next_env_results = vec_env.reset()
         next_done = torch.zeros((args.num_envs, NUM_AGENTS), device=device)
@@ -425,21 +453,24 @@ def main():
                                         logits, kv_cache = actor_net.decode_step(current_action, active_states, decode_idx, kv_cache)
                                     
                                     prov_mask = active_masks[batch_indices, prov_indices, :]
+
+                                    pure_logits = logits.float().masked_fill(~prov_mask, -1e9)
+                                    true_dist = Categorical(logits=pure_logits)
+
                                     bc_probs = torch.softmax(bc_logits.float(), dim=-1)
-                                    
-                                    # Fallback masking strategy
                                     bc_approved_mask = bc_probs > 0.05 
                                     combined_mask = prov_mask & bc_approved_mask
                                     fallback_mask = combined_mask.sum(dim=-1) == 0
                                     combined_mask[fallback_mask] = prov_mask[fallback_mask]
-                                    
-                                    logits = logits.float().masked_fill(~combined_mask, -1e9)
-                                    logits = apply_top_k_mask(logits, k=3)
-                                    dist_cat = Categorical(logits=logits)
-                                    current_action = dist_cat.sample()
-                                    step_log_probs = dist_cat.log_prob(current_action)
 
-                                    top_k_vals, top_k_idx = torch.topk(logits, 3, dim=-1)
+                                    sample_logits = pure_logits.masked_fill(~combined_mask, -1e9)
+                                    sample_logits = apply_top_k_mask(sample_logits, k=3)
+                                    sample_dist = Categorical(logits=sample_logits)
+
+                                    current_action = sample_dist.sample()
+                                    step_log_probs = true_dist.log_prob(current_action)
+
+                                    top_k_vals, top_k_idx = torch.topk(logits.float(), 3, dim=-1)
                                     
                                     final_actions[batch_indices[valid_step], prov_indices[valid_step]] = current_action[valid_step]
                                     final_logprobs[batch_indices[valid_step], prov_indices[valid_step]] = step_log_probs[valid_step]
@@ -473,12 +504,19 @@ def main():
                 indices_to_update = []
                 
                 for i in range(args.num_envs):
-                    obs_dict = next_env_results[i][0]
-                    active_agents_list = next_env_results[i][2] if len(next_env_results[i]) == 3 else next_env_results[i][5]
+                    infos_dict = next_env_results[i][4]
+                    
+                    if '__terminal_observation' in infos_dict:
+                        obs_dict = infos_dict['__terminal_observation']
+                        active_agents_list = [a for a in possible_agents if a in obs_dict]
+                    else:
+                        obs_dict = next_env_results[i][0]
+                        active_agents_list = next_env_results[i][5]
                     
                     for a in active_agents_list:
-                        obs_to_encode.append(torch.tensor(obs_dict[a], dtype=torch.bfloat16, device=device))
-                        indices_to_update.append((i, agent_to_idx[a]))
+                        if a in obs_dict:
+                            obs_to_encode.append(torch.tensor(obs_dict[a], dtype=torch.bfloat16, device=device))
+                            indices_to_update.append((i, agent_to_idx[a]))
                         
                 if obs_to_encode:
                     obs_tensor = torch.stack(obs_to_encode)
@@ -522,11 +560,12 @@ def main():
         os.makedirs(ckpt_dir, exist_ok=True)
         os.makedirs(eval_dir, exist_ok=True)
 
-        writer = SummaryWriter(log_dir=f"./runs/{run_name}")
+        writer = SummaryWriter(log_dir=f"/data/restanislao/tb_runs/{run_name}")
         wandb.init(
             project="diplomacy-ppo",
             name=run_name,
-            config=vars(args)
+            config=vars(args),
+            dir="/data/restanislao/wandb"
         )
 
     buffer_idx = 0
@@ -548,6 +587,7 @@ def main():
 
         # Signal background thread to begin filling the alternate buffer
         update_complete_event.set()
+        inference_stream.wait_stream(torch.cuda.current_stream())
         
         valid = buf['masks'].view(-1)
         valid_cpu = valid.cpu()
@@ -583,19 +623,20 @@ def main():
             local_sum = flat_adv.sum()
             local_sq_sum = (flat_adv ** 2).sum()
             local_count = torch.tensor(flat_adv.shape[0], dtype=torch.float32, device=device)
+        else:
+            local_sum = torch.tensor(0.0, device=device)
+            local_sq_sum = torch.tensor(0.0, device=device)
+            local_count = torch.tensor(0.0, device=device)
+        # Stack and sync across all GPUs
+        stats = torch.stack([local_sum, local_sq_sum, local_count])
+        dist.all_reduce(stats, op=dist.ReduceOp.SUM)
 
-            # Stack and sync across all GPUs
-            stats = torch.stack([local_sum, local_sq_sum, local_count])
-            dist.all_reduce(stats, op=dist.ReduceOp.SUM)
+        global_sum, global_sq_sum, global_n = stats[0], stats[1], stats[2]
 
-            global_sum, global_sq_sum, global_n = stats[0], stats[1], stats[2]
-
-            # Calculate global statistics
+        if global_n > 1:
             global_mean = global_sum / global_n
             global_var = (global_sq_sum / global_n) - (global_mean ** 2)
             global_std = torch.sqrt(torch.clamp(global_var, min=1e-8))
-
-            # Normalize using global statistics
             flat_adv = (flat_adv - global_mean) / (global_std + 1e-8)
 
         t_update_start = time.time()
@@ -669,35 +710,22 @@ def main():
                             b_idx_expand = torch.arange(batch_size_mb, device=device).unsqueeze(1)
                             packed_targets = mb_act[b_idx_expand, padded_indices]
                             packed_masks = mb_masks_gpu[b_idx_expand, padded_indices, :]
-                                                        
-                            packed_top_k = mb_top_k[b_idx_expand, padded_indices, :]
                             
+                            # Apply only the environment's legal action mask to maintain proper probability distributions
                             active_logits_seq = active_logits_seq.float().masked_fill(~packed_masks, -1e9)
                             
-                            final_mask = torch.zeros_like(active_logits_seq, dtype=torch.bool)
-                            final_mask.scatter_(2, packed_top_k, True)
-                            
-                            seq_indices = torch.arange(max_active, device=device).unsqueeze(0)
-                            b_idx_expand_full = torch.arange(batch_size_mb, device=device).unsqueeze(1)
-                            final_mask[b_idx_expand_full, seq_indices, packed_targets] = True
-                            
-                            final_mask = final_mask & packed_masks
-                            
-                            final_mask[b_idx_expand_full, seq_indices, packed_targets] = True
-                            
-                            active_logits_seq = active_logits_seq.masked_fill(~final_mask, -1e9)
-                            if debug_print:
-                                print("\n--- DEBUG: MASK RECONSTRUCTION ---")
-                                b_idx, u_idx = 0, 0 # First batch, first unit
-                                target_action = packed_targets[b_idx, u_idx].item()
-                                is_action_masked = final_mask[b_idx, u_idx, target_action].item()
-                                print(f"Target Action Index: {target_action}")
-                                print(f"Is Target Masked VALID (True)? {is_action_masked}")
-                                print(f"Total Valid Actions in Mask: {final_mask[b_idx, u_idx].sum().item()}")
                             dist_cat = Categorical(logits=active_logits_seq)
 
                             logp_seq = dist_cat.log_prob(packed_targets)
                             entropy_seq = dist_cat.entropy()
+                            if debug_print:
+                                print("\n--- DEBUG: MASK RECONSTRUCTION ---")
+                                b_idx, u_idx = 0, 0 # First batch, first unit
+                                target_action = packed_targets[b_idx, u_idx].item()
+                                is_action_masked = packed_masks[b_idx, u_idx, target_action].item()
+                                print(f"Target Action Index: {target_action}")
+                                print(f"Is Target Masked VALID (True)? {is_action_masked}")
+                                print(f"Total Valid Actions in Mask: {packed_masks[b_idx, u_idx].sum().item()}")
                             
                             # Pack the old logprobs to match the active units
                             packed_old_logprobs = mb_logprobs[b_idx_expand, padded_indices]
@@ -759,10 +787,14 @@ def main():
                     # Calculate Value loss
                     v_loss = 0.5 * ((new_val.squeeze() - mb_ret) ** 2).mean()
                     
-                    # Combine into final loss (pg_loss is already calculated per-unit above!)
+                    # Combine into final loss
                     loss = pg_loss - args.ent_coef * entropy + v_loss * args.v_coef + args.kl_coef * kl_divergence
                     
-                    loss = loss / accum_steps
+                    current_block_start = (step_idx // accum_steps) * accum_steps
+                    current_block_end = min(current_block_start + accum_steps, len(start_indices))
+                    actual_accum_steps = current_block_end - current_block_start
+                    
+                    loss = loss / actual_accum_steps
                     loss.backward()
 
                 if sync_this_step:
@@ -800,7 +832,11 @@ def main():
             total_time = time.time() - start_time
             global_steps = args.num_envs * args.num_steps * NUM_AGENTS * dist.get_world_size()
             sps = int(global_steps / total_time)  
-            avg_reward = buf['rewards'].sum() / (args.num_envs * NUM_AGENTS)
+            total_agent_episodes = buf['dones'].sum().item()
+            if total_agent_episodes > 0:
+                avg_reward = buf['rewards'].sum().item() / total_agent_episodes
+            else:
+                avg_reward = buf['rewards'].sum().item() / (args.num_envs * NUM_AGENTS)
             
             print(f"Update {update}/{args.num_updates} | SPS: {sps} | Avg Reward: {avg_reward:.2f} | Loss: {loss.item():.4f}")
             print(f"  CPU Time: {env_step_time:.2f}s | GPU Fwd: {gpu_forward_time:.2f}s | Bwd: {update_time:.2f}s")
