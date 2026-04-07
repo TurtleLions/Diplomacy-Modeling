@@ -112,12 +112,13 @@ class DiplomacyTransformer(nn.Module):
     Utilizes an encoder to process historical board states and a unit-centric 
     causal decoder to autoregressively generate simultaneous orders.
     """
-    def __init__(self, input_dim=FEATURE_DIM, d_model=256, nhead=8, num_layers=8, num_provinces=82, history_length=3, vocab_size=22231):
+    def __init__(self, input_dim=FEATURE_DIM, d_model=256, nhead=8, num_layers=8, num_provinces=82, history_length=3, vocab_size=22231, none_idx=0):
         super().__init__()
         
         self.num_provinces = num_provinces
         self.history_length = history_length
         self.d_model = d_model
+        self.none_idx = int(none_idx)
         
         # State Encoder (Full Board Context)
         self.feature_projection = nn.Linear(input_dim, d_model)
@@ -211,7 +212,7 @@ class DiplomacyTransformer(nn.Module):
             
             if count < max_units:
                 pad_states = torch.zeros((max_units - count, self.d_model), device=state_repr.device)
-                pad_acts = torch.zeros((max_units - count,), dtype=torch.long, device=actions.device)
+                pad_acts = torch.full((max_units - count,), self.none_idx, dtype=torch.long, device=actions.device)
                 b_states = torch.cat([b_states, pad_states], dim=0)
                 b_acts = torch.cat([b_acts, pad_acts], dim=0)
                 
@@ -335,10 +336,7 @@ def get_sparse_action_mask(game, power, provinces, order_to_idx, max_len=MAX_SPA
     num_valid = len(valid_indices)
     
     if num_valid > max_len:
-        print(f"Warning: Action space exceeds sparse limit ({num_valid}). Randomly truncating valid actions.")
-        np.random.shuffle(valid_indices)
-        valid_indices = valid_indices[:max_len]
-        num_valid = max_len
+        raise ValueError(f"CRITICAL: Action space exceeds sparse limit ({num_valid} > {max_len}). Increase MAX_SPARSE_MASK_LEN.")
         
     sparse_mask = np.full(max_len, -1, dtype=np.int32)
     sparse_mask[:num_valid] = valid_indices
@@ -519,7 +517,6 @@ class DiplomacyTransformerEnv(ParallelEnv):
         self.step_count += 1
         
         prev_sc_counts = {a: len(self.game.get_centers(a)) for a in self.possible_agents}
-
         self.game.clear_orders()
 
         prev_state_dict = self.game.get_state()
@@ -528,12 +525,39 @@ class DiplomacyTransformerEnv(ParallelEnv):
                         
         rewards = {a: 0.0 for a in self.agents}
         
+        legality_metrics = {a: {'proposed': 0, 'illegal_dropped': 0} for a in self.agents}
+        
         for agent, action_indices in actions.items():
             text_orders = []
+            
+            # Ask the engine what is strictly legal right now
+            orderable_locs = self.game.get_orderable_locations(agent)
+            all_possible = self.game.get_all_possible_orders()
+            
             for i, order_idx in enumerate(action_indices):
                 order_str = self.idx_to_order[int(order_idx)]
                 if order_str != 'NONE':
-                    text_orders.append(order_str)
+                    legality_metrics[agent]['proposed'] += 1
+                    
+                    prov_upper = self.provinces[i].upper()
+                    is_legal = False
+                    
+                    # Check if the province is orderable at all
+                    if prov_upper in orderable_locs:
+                        # Clean the engine's possible orders to match our vocab format
+                        legal_orders_for_prov = [
+                            o.replace('*', '').upper() for o in all_possible.get(prov_upper, [])
+                        ]
+                        
+                        # Verify the network's exact string is in the engine's legal list
+                        if order_str in legal_orders_for_prov:
+                            is_legal = True
+                            
+                    if is_legal:
+                        text_orders.append(order_str)
+                    else:
+                        legality_metrics[agent]['illegal_dropped'] += 1
+                        
             self.game.set_orders(agent, text_orders)
 
         self.game.process()
@@ -581,18 +605,6 @@ class DiplomacyTransformerEnv(ParallelEnv):
             sc_delta = current_sc_count - prev_sc_counts.get(agent, 0)
             if sc_delta != 0:
                 rewards[agent] += sc_delta * 10.0
-                    
-            # Tactical Advancement
-            if prev_phase_type == 'M':
-                curr_locs = {u.replace('*', '').upper().split()[1].split('/')[0] for u in agent_units if len(u.split()) >= 2}
-                prev_locs = {u.replace('*', '').upper().split()[1].split('/')[0] for u in prev_agent_units if len(u.split()) >= 2}
-                
-                advanced_locs = curr_locs - prev_locs
-                for loc in advanced_locs:
-                    rewards[agent] += 0.1
-
-                    if loc in all_map_scs and loc not in current_scs:
-                        rewards[agent] += 1.0 
                         
             # Dislodgement Penalty
             current_dislodged = current_state_dict.get('dislodged', {}).get(agent, [])
@@ -622,7 +634,7 @@ class DiplomacyTransformerEnv(ParallelEnv):
             elif is_done: 
                 truncations[agent] = True
 
-        infos = {a: {'action_mask': get_sparse_action_mask(self.game, a, self.provinces, self.order_to_idx)} for a in self.agents}
+        infos = {a: {'action_mask': get_sparse_action_mask(self.game, a, self.provinces, self.order_to_idx), 'legality_metrics': legality_metrics[a]} for a in self.agents}
         
         self.agents = [a for a in self.agents if not terminations[a] and not truncations[a]]
 

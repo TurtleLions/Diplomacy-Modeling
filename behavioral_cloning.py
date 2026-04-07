@@ -276,7 +276,7 @@ def train_worker(rank, world_size, paths_and_metadata, args):
             persistent_workers=True
         )
         
-        net = DiplomacyTransformer(num_provinces=num_provs, vocab_size=vocab_size).to(rank)
+        net = DiplomacyTransformer(num_provinces=num_provs, vocab_size=vocab_size, none_idx=none_idx).to(rank)
         net = DDP(net, device_ids=[rank], find_unused_parameters=True)
         criterion = nn.CrossEntropyLoss()
         optimizer = optim.Adam(net.parameters(), lr=args.learning_rate)
