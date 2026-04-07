@@ -20,7 +20,7 @@ from diplomacy import Game
 
 # --- GLOBAL CONSTANTS ---
 FEATURE_DIM = 46
-MAX_SPARSE_MASK_LEN = 2000
+MAX_SPARSE_MASK_LEN = 4000
 
 _DUMMY_GAME = Game()
 GLOBAL_PROVINCES = [prov.upper() for prov in list(_DUMMY_GAME.map.locs)]
@@ -257,7 +257,7 @@ class DiplomacyTransformer(nn.Module):
         return action_logits, state_value, padding_mask
 
 
-def build_global_vocab(json_path="./datasets/standard_no_press.jsonl", cache_path="vocab.txt"):
+def build_global_vocab(json_path="/data/restanislao/datasets/standard_no_press.jsonl", cache_path="vocab.txt"):
     """Scans the dataset to build or load the global vocabulary of all legal historical orders."""
     if os.path.exists(cache_path):
         with open(cache_path, 'r') as f:
@@ -282,7 +282,7 @@ def build_global_vocab(json_path="./datasets/standard_no_press.jsonl", cache_pat
                         continue
                         
                     for order_str in orders:
-                        clean_order = order_str.replace('*', '')
+                        clean_order = order_str.replace('*', '').upper()
                         unique_orders.add(clean_order)
                         
     sorted_orders = sorted(list(unique_orders))
@@ -298,12 +298,15 @@ def get_global_action_mask(game, power, provinces, order_to_idx):
     """Generates a dense boolean mask for all legal actions available to a given power."""
     mask = np.zeros((len(provinces), len(order_to_idx)), dtype=np.bool_)
     orderable_locs = game.get_orderable_locations(power)
+    all_possible = game.get_all_possible_orders()
     
     for i, prov in enumerate(provinces):
-        if prov in orderable_locs:
-            for order in game.get_all_possible_orders().get(prov, []):
-                if order in order_to_idx:
-                    mask[i, order_to_idx[order]] = True
+        prov_upper = prov.upper()
+        if prov_upper in orderable_locs:
+            for order in all_possible.get(prov_upper, []):
+                clean_order = order.replace('*', '').upper()
+                if clean_order in order_to_idx:
+                    mask[i, order_to_idx[clean_order]] = True
         
         if not mask[i].any():
             mask[i, order_to_idx['NONE']] = True
@@ -314,16 +317,12 @@ def get_sparse_action_mask(game, power, provinces, order_to_idx, max_len=MAX_SPA
     """Generates a memory-efficient sparse mask of legal actions for distributed training."""
     mask = np.zeros((len(provinces), len(order_to_idx)), dtype=np.bool_)
     orderable_locs = game.get_orderable_locations(power)
-    
-    base_loc_to_orders = {}
-    for loc in orderable_locs:
-        base_prov = loc.split('/')[0].upper()
-        base_loc_to_orders[base_prov] = game.get_all_possible_orders().get(loc, [])
+    all_possible = game.get_all_possible_orders()
     
     for i, prov in enumerate(provinces):
         prov_upper = prov.upper()
-        if prov_upper in base_loc_to_orders:
-            for order in base_loc_to_orders[prov_upper]:
+        if prov_upper in orderable_locs:
+            for order in all_possible.get(prov_upper, []):
                 clean_order = order.replace('*', '').upper()
                 if clean_order in order_to_idx:
                     mask[i, order_to_idx[clean_order]] = True
@@ -412,11 +411,10 @@ def parse_state_to_tensor(turn_data, observing_agent=None):
                 loc_full = parts[1]
                 
                 loc_parts = loc_full.split('/')
-                u_loc = loc_parts[0]
                 coast = loc_parts[1] if len(loc_parts) > 1 else None
 
-                if u_loc in GLOBAL_PROV_TO_IDX:
-                    p_idx = GLOBAL_PROV_TO_IDX[u_loc]
+                if loc_full in GLOBAL_PROV_TO_IDX:
+                    p_idx = GLOBAL_PROV_TO_IDX[loc_full]
                     state_tensor[p_idx, power_idx] = 1.0
                     if u_type == 'A': state_tensor[p_idx, 7] = 1.0
                     elif u_type == 'F': state_tensor[p_idx, 8] = 1.0
@@ -433,9 +431,10 @@ def parse_state_to_tensor(turn_data, observing_agent=None):
             clean_str = unit_str.replace('*', '').upper()
             parts = clean_str.split()
             if len(parts) >= 2:
-                u_loc = parts[1].split('/')[0]
-                if u_loc in GLOBAL_PROV_TO_IDX:
-                    p_idx = GLOBAL_PROV_TO_IDX[u_loc]
+                loc_full = parts[1]
+                
+                if loc_full in GLOBAL_PROV_TO_IDX:
+                    p_idx = GLOBAL_PROV_TO_IDX[loc_full]
                     u_type = parts[0]
                     state_tensor[p_idx, power_idx] = 1.0
                     if u_type == 'A': state_tensor[p_idx, 7] = 1.0
@@ -526,15 +525,6 @@ class DiplomacyTransformerEnv(ParallelEnv):
         prev_state_dict = self.game.get_state()
         prev_units = {a: prev_state_dict['units'].get(a, []) for a in self.agents}
         prev_phase_type = self.game.get_current_phase()[-1]
-        
-        global_orders = {}
-        if prev_phase_type == 'M':
-            for a, action_indices in actions.items():
-                for order_idx in action_indices:
-                    o_str = self.idx_to_order[int(order_idx)]
-                    if o_str != 'NONE':
-                        u_loc = o_str.split()[1].split('/')[0]
-                        global_orders[u_loc] = o_str
                         
         rewards = {a: 0.0 for a in self.agents}
         

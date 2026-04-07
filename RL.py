@@ -293,20 +293,16 @@ def main():
     
     # Model Initialization
     net = DiplomacyTransformer(num_provinces=MAP_PROVINCES, history_length=HISTORY_LENGTH, vocab_size=VOCAB_SIZE).to(device)
-    bc_model = DiplomacyTransformer(num_provinces=MAP_PROVINCES, history_length=HISTORY_LENGTH, vocab_size=VOCAB_SIZE).to(device)
     actor_bc_model = DiplomacyTransformer(num_provinces=MAP_PROVINCES, history_length=HISTORY_LENGTH, vocab_size=VOCAB_SIZE).to(device)
     actor_net = DiplomacyTransformer(num_provinces=MAP_PROVINCES, history_length=HISTORY_LENGTH, vocab_size=VOCAB_SIZE).to(device)
     
     if os.path.exists(args.bc_weights):
         bc_state_dict = torch.load(args.bc_weights, map_location=device)
         net.load_state_dict(bc_state_dict, strict=False)
-        bc_model.load_state_dict(bc_state_dict, strict=False)
         actor_bc_model.load_state_dict(bc_state_dict, strict=False)
         actor_net.load_state_dict(bc_state_dict, strict=False)
         
         # Freeze reference models
-        bc_model.eval()
-        for param in bc_model.parameters(): param.requires_grad = False
         actor_bc_model.eval()
         for param in actor_bc_model.parameters(): param.requires_grad = False
         actor_net.eval()
@@ -344,7 +340,7 @@ def main():
             'dones': torch.zeros((args.num_steps, args.num_envs, NUM_AGENTS), dtype=torch.float32, device=device),
             'values': torch.zeros((args.num_steps, args.num_envs, NUM_AGENTS), dtype=torch.float32, device=device),
             'masks': torch.zeros((args.num_steps, args.num_envs, NUM_AGENTS), dtype=torch.bool, device=device),
-            'sparse_masks': torch.zeros((args.num_steps, args.num_envs, NUM_AGENTS, 2000), dtype=torch.int32, device=device),
+            'sparse_masks': torch.zeros((args.num_steps, args.num_envs, NUM_AGENTS, 4000), dtype=torch.int32, device=device),
             'top_k_indices': torch.zeros((args.num_steps, args.num_envs, NUM_AGENTS, MAP_PROVINCES, 3), dtype=torch.long, device=device),
             'top_k_values': torch.zeros((args.num_steps, args.num_envs, NUM_AGENTS, MAP_PROVINCES, 3), dtype=torch.float32, device=device),
             'advantages': torch.zeros((args.num_steps, args.num_envs, NUM_AGENTS), dtype=torch.float32, device=device),
@@ -399,7 +395,7 @@ def main():
                                 a_idx = agent_to_idx[a]
                                 buf['masks'][step, i, a_idx] = True
                                 buf['obs'][step, i, a_idx] = torch.tensor(obs_dict[a], dtype=torch.bfloat16, device=device)
-                                buf['sparse_masks'][step, i, a_idx] = torch.tensor(infos_dict[a]['action_mask'], dtype=torch.long)
+                                buf['sparse_masks'][step, i, a_idx] = torch.tensor(infos_dict[a]['action_mask'], dtype=torch.int32)
 
                         flat_obs = buf['obs'][step][buf['masks'][step]]
                         if flat_obs.shape[0] > 0:
@@ -468,6 +464,8 @@ def main():
                                     sample_dist = Categorical(logits=sample_logits)
 
                                     current_action = sample_dist.sample()
+                                    current_action = current_action.clone() 
+                                    current_action[~valid_step] = NONE_IDX
                                     step_log_probs = true_dist.log_prob(current_action)
 
                                     top_k_vals, top_k_idx = torch.topk(logits.float(), 3, dim=-1)
@@ -590,14 +588,13 @@ def main():
         inference_stream.wait_stream(torch.cuda.current_stream())
         
         valid = buf['masks'].view(-1)
-        valid_cpu = valid.cpu()
         flat_obs = buf['obs'].view(-1, HISTORY_LENGTH, MAP_PROVINCES, 46)[valid]
         flat_act = buf['actions'].view(-1, MAP_PROVINCES)[valid]
         flat_logprobs = buf['logprobs'].view(-1, MAP_PROVINCES)[valid]
         flat_adv = buf['advantages'].view(-1)[valid]
         flat_ret = buf['returns'].view(-1)[valid]
         flat_val = buf['values'].view(-1)[valid]
-        flat_sparse_masks = buf['sparse_masks'].view(-1, 2000)[valid]
+        flat_sparse_masks = buf['sparse_masks'].view(-1, 4000)[valid]
         flat_top_k = buf['top_k_indices'].view(-1, MAP_PROVINCES, 3)[valid]
         flat_top_k_vals = buf['top_k_values'].view(-1, MAP_PROVINCES, 3)[valid]
 
@@ -617,6 +614,8 @@ def main():
             flat_ret = flat_ret[perm][:min_b_size]
             flat_val = flat_val[perm][:min_b_size]
             flat_sparse_masks = flat_sparse_masks[perm][:min_b_size]
+            flat_top_k = flat_top_k[perm][:min_b_size]
+            flat_top_k_vals = flat_top_k_vals[perm][:min_b_size]
             b_size = min_b_size
 
         if flat_adv.shape[0] > 1:
@@ -644,7 +643,6 @@ def main():
         
         mb_size = 768
         accum_steps = 6
-        indices = np.arange(b_size)
         optimizer.zero_grad() 
 
         target_kl = 0.02
@@ -657,6 +655,7 @@ def main():
             epoch_logprobs = flat_logprobs[perm]
             epoch_adv = flat_adv[perm]
             epoch_ret = flat_ret[perm]
+            epoch_val = flat_val[perm]
             epoch_sparse = flat_sparse_masks[perm]
             epoch_top_k = flat_top_k[perm]
             epoch_top_k_vals = flat_top_k_vals[perm]
@@ -674,6 +673,7 @@ def main():
                 mb_logprobs = epoch_logprobs[start:end]
                 mb_adv = epoch_adv[start:end]
                 mb_ret = epoch_ret[start:end]
+                mb_val = epoch_val[start:end]
                 mb_top_k = epoch_top_k[start:end]
                 mb_top_k_vals = epoch_top_k_vals[start:end]
                 
@@ -742,19 +742,19 @@ def main():
                             
                             # Zero out padded units for all sequence metrics
                             valid_mask = ~padding_mask
-                            masked_new_logprobs = logp_seq * valid_mask
-                            masked_old_logprobs = packed_old_logprobs * valid_mask
-                            joint_new_logprob = masked_new_logprobs.sum(dim=1)
-                            joint_old_logprob = masked_old_logprobs.sum(dim=1)
-                            joint_ratio = torch.exp(joint_new_logprob - joint_old_logprob)
+                            unit_new_logprobs = logp_seq * valid_mask
+                            unit_old_logprobs = packed_old_logprobs * valid_mask
+                            unit_ratios = torch.exp(unit_new_logprobs - unit_old_logprobs)
 
-                            pg_loss1 = -mb_adv * joint_ratio
-                            pg_loss2 = -mb_adv * torch.clamp(joint_ratio, 1 - args.clip_coef, 1 + args.clip_coef)
+                            adv_expanded = mb_adv.unsqueeze(1).expand_as(unit_ratios)
 
-                            pg_loss = torch.max(pg_loss1, pg_loss2).mean()
+                            pg_loss1 = -adv_expanded * unit_ratios
+                            pg_loss2 = -adv_expanded * torch.clamp(unit_ratios, 1 - args.clip_coef, 1 + args.clip_coef)
+                            unit_pg_loss = torch.max(pg_loss1, pg_loss2) * valid_mask
 
-                            unit_counts = valid_mask.sum(dim=1).clamp(min=1)
-                            entropy = ((entropy_seq * valid_mask).sum(dim=1) / unit_counts).mean()
+                            total_valid_units = valid_mask.sum().clamp(min=1)
+                            pg_loss = unit_pg_loss.sum() / total_valid_units
+                            entropy = (entropy_seq * valid_mask).sum() / total_valid_units
 
                             if debug_print:
                                 print("\n--- DEBUG: PROBABILITY DISTRIBUTION ---")
@@ -765,7 +765,8 @@ def main():
                         
                             
                             with torch.no_grad():
-                                kl_divergence = 0.5 * (joint_old_logprob - joint_new_logprob).pow(2).mean()
+                                unit_kl = 0.5 * (unit_old_logprobs - unit_new_logprobs).pow(2) * valid_mask
+                                kl_divergence = unit_kl.sum() / total_valid_units
                         else:
                             pg_loss = torch.tensor(0.0, device=device)
                             entropy = torch.tensor(0.0, device=device)
@@ -777,7 +778,10 @@ def main():
                     new_val = new_val.float()
                     
                     # Calculate Value loss
-                    v_loss = 0.5 * ((new_val.squeeze() - mb_ret) ** 2).mean()
+                    v_clipped = mb_val + torch.clamp(new_val.squeeze() - mb_val, -args.clip_coef, args.clip_coef)
+                    v_loss_unclipped = (new_val.squeeze() - mb_ret) ** 2
+                    v_loss_clipped = (v_clipped - mb_ret) ** 2
+                    v_loss = 0.5 * torch.max(v_loss_unclipped, v_loss_clipped).mean()
                     
                     # Combine into final loss
                     loss = pg_loss - args.ent_coef * entropy + v_loss * args.v_coef + args.kl_coef * kl_divergence

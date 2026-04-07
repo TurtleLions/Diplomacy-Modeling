@@ -133,9 +133,9 @@ def _process_single_line(line):
                 clean_order = order_str.replace('*', '').upper()
                 parts = clean_order.split()
                 if len(parts) >= 2:
-                    u_loc = parts[1].split('/')[0]
-                    if u_loc in worker_prov_to_idx and clean_order in worker_order_to_idx:
-                        p_idx = worker_prov_to_idx[u_loc]
+                    loc_full = parts[1]
+                    if loc_full in worker_prov_to_idx and clean_order in worker_order_to_idx:
+                        p_idx = worker_prov_to_idx[loc_full]
                         targets[p_idx] = worker_order_to_idx[clean_order]
             
             # Convert dense boolean mask to flat sparse indices
@@ -203,7 +203,7 @@ def process_and_save_to_disk(json_path, cache_dir, max_games=None):
                 if max_games and games_yielded >= max_games:
                     break
 
-    num_cores = min(24, smp.cpu_count())
+    num_cores = min(21, smp.cpu_count())
     print(f"Starting multiprocessing pool with {num_cores} workers.")
     
     total_samples = 0
@@ -391,7 +391,7 @@ def train_worker(rank, world_size, paths_and_metadata, args):
 
 def main():
     parser = argparse.ArgumentParser(description="Diplomacy Behavioral Cloning Training")
-    parser.add_argument("--dataset_path", type=str, default="./datasets/standard_no_press.jsonl", help="Path to raw JSONL dataset")
+    parser.add_argument("--dataset_path", type=str, default="/data/restanislao/datasets/standard_no_press.jsonl", help="Path to raw JSONL dataset")
     parser.add_argument("--cache_dir", type=str, default="/data/restanislao/diplomacy", help="Directory for binary memmap cache")
     parser.add_argument("--batch_size", type=int, default=512, help="Batch size per GPU")
     parser.add_argument("--learning_rate", type=float, default=3e-4, help="Learning rate")
