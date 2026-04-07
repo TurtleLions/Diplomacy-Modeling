@@ -730,8 +730,6 @@ def main():
                             # Pack the old logprobs to match the active units
                             packed_old_logprobs = mb_logprobs[b_idx_expand, padded_indices]
                             
-                            # Calculate ratio PER UNIT
-                            logratio_seq = logp_seq - packed_old_logprobs
                             if debug_print:
                                 # Grab the first sequence in the batch
                                 print("\n--- DEBUG: LOGPROB ALIGNMENT ---")
@@ -741,39 +739,33 @@ def main():
                                 diff = (packed_old_logprobs - logp_seq).abs()
                                 print(f"Max Diff in Batch: {diff.max().item():.4f}")
                                 print(f"Mean Diff:         {diff.mean().item():.4f}")
-                            ratio_seq = torch.exp(logratio_seq)
                             
                             # Zero out padded units for all sequence metrics
                             valid_mask = ~padding_mask
-                            ratio_seq = ratio_seq * valid_mask
-                            
-                            # Safely calculate unit counts for averaging
-                            unit_counts = valid_mask.sum(dim=1).clamp(min=1)
+                            masked_new_logprobs = logp_seq * valid_mask
+                            masked_old_logprobs = packed_old_logprobs * valid_mask
+                            joint_new_logprob = masked_new_logprobs.sum(dim=1)
+                            joint_old_logprob = masked_old_logprobs.sum(dim=1)
+                            joint_ratio = torch.exp(joint_new_logprob - joint_old_logprob)
 
-                            entropy_seq = entropy_seq * valid_mask
+                            pg_loss1 = -mb_adv * joint_ratio
+                            pg_loss2 = -mb_adv * torch.clamp(joint_ratio, 1 - args.clip_coef, 1 + args.clip_coef)
+
+                            pg_loss = torch.max(pg_loss1, pg_loss2).mean()
+
+                            unit_counts = valid_mask.sum(dim=1).clamp(min=1)
+                            entropy = ((entropy_seq * valid_mask).sum(dim=1) / unit_counts).mean()
+
                             if debug_print:
                                 print("\n--- DEBUG: PROBABILITY DISTRIBUTION ---")
                                 # Convert logits to probabilities to see where the mass is
                                 probs = torch.softmax(active_logits_seq[0, 0], dim=-1)
                                 print(f"Top 5 Probs: {torch.topk(probs, 5).values}")
                                 print(f"Target Prob: {probs[packed_targets[0, 0]]}")
-                            entropy = (entropy_seq.sum(dim=1) / unit_counts).mean()
-                            
-                            # Expand the agent-level advantage to all its units
-                            mb_adv_seq = mb_adv.unsqueeze(1).expand(-1, max_active)
-                            
-                            # Calculate surrogate losses per unit
-                            pg_loss1 = -mb_adv_seq * ratio_seq
-                            pg_loss2 = -mb_adv_seq * torch.clamp(ratio_seq, 1 - args.clip_coef, 1 + args.clip_coef)
-                            
-                            # Take max, sum over active units, and average by unit count
-                            unit_loss = (torch.max(pg_loss1, pg_loss2) * valid_mask).sum(dim=1) / unit_counts
-                            pg_loss = unit_loss.mean()
+                        
                             
                             with torch.no_grad():
-                                kl_div_seq = 0.5 * (packed_old_logprobs - logp_seq).pow(2)
-                                kl_div_seq = kl_div_seq * valid_mask
-                                kl_divergence = (kl_div_seq.sum(dim=1) / unit_counts).mean()
+                                kl_divergence = 0.5 * (joint_old_logprob - joint_new_logprob).pow(2).mean()
                         else:
                             pg_loss = torch.tensor(0.0, device=device)
                             entropy = torch.tensor(0.0, device=device)
@@ -832,24 +824,24 @@ def main():
             total_time = time.time() - start_time
             global_steps = args.num_envs * args.num_steps * NUM_AGENTS * dist.get_world_size()
             sps = int(global_steps / total_time)  
-            total_agent_episodes = buf['dones'].sum().item()
-            if total_agent_episodes > 0:
-                avg_reward = buf['rewards'].sum().item() / total_agent_episodes
+            total_country_episodes = buf['dones'].sum().item()
+            if total_country_episodes > 0:
+                avg_country_return = buf['rewards'].sum().item() / total_country_episodes
             else:
-                avg_reward = buf['rewards'].sum().item() / (args.num_envs * NUM_AGENTS)
+                avg_country_return = buf['rewards'].sum().item() / (args.num_envs * NUM_AGENTS)
             
-            print(f"Update {update}/{args.num_updates} | SPS: {sps} | Avg Reward: {avg_reward:.2f} | Loss: {loss.item():.4f}")
+            print(f"Update {update}/{args.num_updates} | SPS: {sps} | Avg Country Return: {avg_country_return:.2f} | Loss: {loss.item():.4f}")
             print(f"  CPU Time: {env_step_time:.2f}s | GPU Fwd: {gpu_forward_time:.2f}s | Bwd: {update_time:.2f}s")
             
             writer.add_scalar("Perf/SPS", sps, update)
-            writer.add_scalar("Reward/Avg_Reward", avg_reward, update)
+            writer.add_scalar("Reward/Avg_Country_Return", avg_country_return, update)
             writer.add_scalar("Loss/Policy_Loss", loss.item(), update)
             writer.add_scalar("Loss/Value_Loss", v_loss.item(), update)
             writer.add_scalar("Loss/Entropy", entropy.item(), update)
 
             wandb.log({
                 "Perf/SPS": sps,
-                "Reward/Avg_Reward": avg_reward,
+                "Reward/Avg_Country_Return": avg_country_return,
                 "Loss/Policy_Loss": loss.item(),
                 "Loss/Value_Loss": v_loss.item(),
                 "Loss/Entropy": entropy.item(),

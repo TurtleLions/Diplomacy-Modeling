@@ -506,7 +506,6 @@ class DiplomacyTransformerEnv(ParallelEnv):
         self.stalemate_counter = 0
         self.last_year_sc_owners = {sc: a for a in self.agents for sc in self.game.get_centers(a)}
 
-        self.year_start_sc_counts = {a: len(self.game.get_centers(a)) for a in self.agents}
 
         observations = {}
         for a in self.agents:
@@ -519,12 +518,14 @@ class DiplomacyTransformerEnv(ParallelEnv):
 
     def step(self, actions):
         self.step_count += 1
-        self.game.clear_orders()
         
-        prev_sc_owners = {sc: a for a in self.possible_agents for sc in self.game.get_centers(a)}
+        prev_sc_counts = {a: len(self.game.get_centers(a)) for a in self.possible_agents}
+
+        self.game.clear_orders()
+
         prev_state_dict = self.game.get_state()
         prev_units = {a: prev_state_dict['units'].get(a, []) for a in self.agents}
-        prev_phase_type = self.game.get_current_phase()[-1] 
+        prev_phase_type = self.game.get_current_phase()[-1]
         
         global_orders = {}
         if prev_phase_type == 'M':
@@ -587,14 +588,9 @@ class DiplomacyTransformerEnv(ParallelEnv):
             rewards[agent] -= 0.05
             
             # Supply Center Deltas
-            if current_phase.startswith('S') and current_phase.endswith('M') and self.step_count > 1:
-                prev_sc_count = self.year_start_sc_counts.get(agent, 0)
-                sc_delta = current_sc_count - prev_sc_count
-                
-                if sc_delta != 0:
-                    rewards[agent] += sc_delta * 10.0  
-                    
-                self.year_start_sc_counts[agent] = current_sc_count
+            sc_delta = current_sc_count - prev_sc_counts.get(agent, 0)
+            if sc_delta != 0:
+                rewards[agent] += sc_delta * 10.0
                     
             # Tactical Advancement
             if prev_phase_type == 'M':
