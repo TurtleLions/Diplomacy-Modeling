@@ -151,11 +151,13 @@ class DiplomacyTransformer(nn.Module):
         x_emb = x_proj + self.province_embedding(p_idx) + self.time_embedding(t_idx)
         
         seq_input = x_emb.reshape(batch_size, self.history_length * self.num_provinces, self.d_model)
-        transformer_out = checkpoint(
-            self.transformer, 
-            seq_input, 
-            use_reentrant=False
-        )
+        # transformer_out = checkpoint(
+        #     self.transformer, 
+        #     seq_input, 
+        #     use_reentrant=False
+        # )
+
+        transformer_out = self.transformer(seq_input)
         
         out_reshaped = transformer_out.reshape(batch_size, self.history_length, self.num_provinces, self.d_model)
         current_state_repr = out_reshaped[:, 0, :, :] 
@@ -243,7 +245,10 @@ class DiplomacyTransformer(nn.Module):
             out, _ = self.causal_decoder_block(inp, kv_cache=None, padding_mask=p_mask)
             return out
 
-        decoder_out = checkpoint(decoder_wrapper, decoder_input, padding_mask, use_reentrant=False)
+        # decoder_out = checkpoint(decoder_wrapper, decoder_input, padding_mask, use_reentrant=False)
+
+        out, _ = self.causal_decoder_block(decoder_input, kv_cache=None, padding_mask=padding_mask)
+        decoder_out = out
         
         if return_hidden:
             return decoder_out

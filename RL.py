@@ -10,6 +10,7 @@ import argparse
 import threading
 import contextlib
 import multiprocessing as mp
+import random
 
 import numpy as np
 import torch
@@ -158,120 +159,112 @@ class SubprocVecDiplomacy:
         for p in self.ps: 
             p.join()
 
-def apply_top_k_mask(logits, k=3):
-    """Strictly masks all but the exact top K highest values."""
-    if logits.size(-1) <= k:
-        return logits
-        
-    # Get the exact K indices
-    _, top_k_indices = torch.topk(logits, k, dim=-1)
-    
-    # Build a strict mask for only those K indices
-    strict_mask = torch.zeros_like(logits, dtype=torch.bool)
-    strict_mask.scatter_(-1, top_k_indices, True)
-    
-    # Mask out everything else
-    return logits.masked_fill(~strict_mask, -1e9)
-
-def evaluate_and_save_game(net, device, update_num, save_dir="./eval_games"):
-    """Runs a deterministic evaluation game and logs the full transcript."""
+def evaluate_against_baseline(live_net, baseline_net, device, update_num, live_power, game_index, save_dir="./eval_games"):
+    """Runs a single evaluation game for a specific assigned power."""
     os.makedirs(save_dir, exist_ok=True)
     env = DiplomacyTransformerEnv(history_length=3)
     obs, infos = env.reset()
     
-    log_path = os.path.join(save_dir, f"eval_game_update_{update_num}.txt")
+    # Unique file name for all 70 games
+    log_path = os.path.join(save_dir, f"eval_update_{update_num}_{live_power}_game_{game_index}.txt")
     
+    # Helper function to process inference for a specific subset of agents
+    def get_actions(net, agents, net_device):
+        if not agents:
+            return {}
+        
+        obs_tensor = torch.stack([torch.tensor(obs[a]) for a in agents]).to(device=net_device, dtype=torch.bfloat16)
+        sparse_masks_tensor = torch.stack([torch.tensor(infos[a]['action_mask'], dtype=torch.long) for a in agents]).to(net_device)
+        NONE_IDX = env.order_to_idx['NONE']
+        
+        is_active_mask, packed_masks, padded_indices, max_decode_steps = rebuild_packed_masks(
+            sparse_masks_tensor, env.num_provinces, env.vocab_size, NONE_IDX, net_device
+        )
+        
+        with torch.no_grad():
+            autocast_device = 'cuda' if net_device.type == 'cuda' else 'cpu'
+            with torch.autocast(device_type=autocast_device, dtype=torch.bfloat16):
+                state_repr, _ = net.encode_state(obs_tensor)
+            
+            batch_size = obs_tensor.size(0)
+            final_actions = torch.full((batch_size, env.num_provinces), NONE_IDX, dtype=torch.long, device=net_device)
+            
+            if max_decode_steps > 0:
+                step_mask = torch.arange(max_decode_steps, device=net_device).unsqueeze(0) < is_active_mask.sum(dim=1, keepdim=True)
+                current_action = torch.zeros(batch_size, dtype=torch.long, device=net_device)
+                kv_cache = None
+                batch_indices = torch.arange(batch_size, device=net_device)
+                
+                b_idx_expand = batch_indices.unsqueeze(1)
+                active_states = state_repr[b_idx_expand, padded_indices, :]
+
+                for decode_idx in range(max_decode_steps):
+                    prov_indices = padded_indices[:, decode_idx]
+                    valid_step = step_mask[:, decode_idx]
+                    
+                    with torch.autocast(device_type=autocast_device, dtype=torch.bfloat16):
+                        logits, kv_cache = net.decode_step(current_action, active_states, decode_idx, kv_cache)
+                    
+                    prov_mask = packed_masks[:, decode_idx, :]
+                    logits = logits.float().masked_fill(~prov_mask, -1e9)
+                    
+                    current_action = torch.argmax(logits, dim=-1)
+                    final_actions[batch_indices[valid_step], prov_indices[valid_step]] = current_action[valid_step]
+                    
+        return {a: final_actions[i].cpu().numpy() for i, a in enumerate(agents)}
+
     with open(log_path, "w") as f:
-        f.write(f"Evaluation Game - Update {update_num}\n")
+        f.write(f"Evaluation Game - Update {update_num} | Game {game_index}/10\n")
+        f.write(f"Live Network Power: {live_power} | Baseline Power: ALL OTHERS\n")
         f.write("=" * 40 + "\n")
         
         step_count = 0
-        eval_proposed = 0
-        eval_dropped = 0
         while len(env.agents) > 0 and step_count < 150:
             phase_name = env.game.get_current_phase()
             f.write(f"\n--- Phase {phase_name} ---\n")
             active_agents = env.agents
             
-            obs_tensor = torch.stack([torch.tensor(obs[a]) for a in active_agents]).to(device=device, dtype=torch.bfloat16)
+            live_agents = [a for a in active_agents if a == live_power]
+            baseline_agents = [a for a in active_agents if a != live_power]
             
-            sparse_masks_tensor = torch.stack([torch.tensor(infos[a]['action_mask'], dtype=torch.long) for a in active_agents]).to(device)
-            NONE_IDX = env.order_to_idx['NONE']
+            baseline_device = next(baseline_net.parameters()).device
             
-            is_active_mask, packed_masks, padded_indices, max_decode_steps = rebuild_packed_masks(
-                sparse_masks_tensor, env.num_provinces, env.vocab_size, NONE_IDX, device
-            )
+            live_actions = get_actions(live_net, live_agents, device)
+            baseline_actions = get_actions(baseline_net, baseline_agents, baseline_device)
             
-            with torch.no_grad():
-                with torch.autocast(device_type='cuda', dtype=torch.bfloat16):
-                    state_repr, _ = net.encode_state(obs_tensor)
-                
-                batch_size = obs_tensor.size(0)
-                final_actions = torch.full((batch_size, env.num_provinces), NONE_IDX, dtype=torch.long, device=device)
-                
-                if max_decode_steps > 0:
-                    # Fully vectorized step mask
-                    step_mask = torch.arange(max_decode_steps, device=device).unsqueeze(0) < is_active_mask.sum(dim=1, keepdim=True)
-
-                    current_action = torch.zeros(batch_size, dtype=torch.long, device=device)
-                    kv_cache = None
-                    batch_indices = torch.arange(batch_size, device=device)
-                    
-                    b_idx_expand = batch_indices.unsqueeze(1)
-                    active_states = state_repr[b_idx_expand, padded_indices, :]
-
-                    for decode_idx in range(max_decode_steps):
-                        prov_indices = padded_indices[:, decode_idx]
-                        valid_step = step_mask[:, decode_idx]
-                        
-                        with torch.autocast(device_type='cuda', dtype=torch.bfloat16):
-                            logits, kv_cache = net.decode_step(current_action, active_states, decode_idx, kv_cache)
-                        
-                        prov_mask = packed_masks[:, decode_idx, :]
-                        logits = logits.float().masked_fill(~prov_mask, -1e9)
-                        
-                        current_action = torch.argmax(logits, dim=-1)
-                        final_actions[batch_indices[valid_step], prov_indices[valid_step]] = current_action[valid_step]
-                
-            action_dict = {a: final_actions[i].cpu().numpy() for i, a in enumerate(active_agents)}
+            action_dict = {**live_actions, **baseline_actions}
             
-            for idx, agent in enumerate(active_agents):
-                f.write(f"{agent} Orders\n")
-                agent_actions = final_actions[idx]
+            for agent in active_agents:
+                f.write(f"{agent} ({'LIVE' if agent == live_power else 'BASELINE'}) Orders\n")
                 orders_issued = False
-                
-                for prov_idx, order_idx in enumerate(agent_actions):
+                for prov_idx, order_idx in enumerate(action_dict[agent]):
                     order_str = env.idx_to_order[order_idx.item()]
                     if order_str != 'NONE':
                         f.write(f"  {order_str}\n")
                         orders_issued = True
-                        
                 if not orders_issued:
                     f.write("  (No valid orders)\n")
-                        
+                    
             obs, rewards, terms, truncs, infos = env.step(action_dict)
-            for agent, agent_info in infos.items():
-                if 'legality_metrics' in agent_info:
-                    eval_proposed += agent_info['legality_metrics']['proposed']
-                    eval_dropped += agent_info['legality_metrics']['illegal_dropped']
             step_count += 1
             
         f.write("\n" + "=" * 40 + "\n")
         f.write("FINAL SUPPLY CENTER COUNTS\n")
+        
+        live_scs = 0
         for agent in env.possible_agents:
             scs = env.game.get_centers(agent)
-            f.write(f"{agent}: {len(scs)}\n")
+            count = len(scs)
+            if agent == live_power:
+                live_scs = count
+            f.write(f"{agent} ({'LIVE' if agent == live_power else 'BASELINE'}): {count}\n")
             
-        eval_illegal_rate = (eval_dropped / max(1, eval_proposed)) * 100.0 if eval_proposed > 0 else 0.0
-        f.write("\nEVALUATION LEGALITY AUDIT\n")
-        f.write(f"Proposed: {eval_proposed} | Legal: {eval_proposed - eval_dropped} | Dropped: {eval_dropped} ({eval_illegal_rate:.1f}% illegal)\n")
-            
-    print(f"  -> Saved evaluation game log to {log_path}")
+    return live_scs
 
 def parse_args():
     parser = argparse.ArgumentParser(description="PPO Training for Diplomacy")
     parser.add_argument("--num_envs", type=int, default=28, help="Number of parallel environments per GPU")
-    parser.add_argument("--num_steps", type=int, default=1024, help="Number of steps per rollout")
+    parser.add_argument("--num_steps", type=int, default=512, help="Number of steps per rollout")
     parser.add_argument("--num_updates", type=int, default=1000, help="Total number of PPO updates")
     parser.add_argument("--lr", type=float, default=1e-5, help="Learning rate")
     parser.add_argument("--gamma", type=float, default=0.99, help="Discount factor")
@@ -280,7 +273,7 @@ def parse_args():
     parser.add_argument("--ent_coef", type=float, default=0.001, help="Entropy coefficient")
     parser.add_argument("--v_coef", type=float, default=0.1, help="Value function loss coefficient")
     parser.add_argument("--kl_coef", type=float, default=0.05, help="KL divergence penalty coefficient")
-    parser.add_argument("--update_epochs", type=int, default=2, help="Number of epochs per PPO update")
+    parser.add_argument("--update_epochs", type=int, default=1, help="Number of epochs per PPO update")
     parser.add_argument("--bc_weights", type=str, default="diplomacy_transformer_bc.pth", help="Path to pre-trained Behavioral Cloning weights")
     parser.add_argument("--resume_weights", type=str, default=None, help="Path to RL checkpoint to resume training from")
     return parser.parse_args()
@@ -329,18 +322,14 @@ def main():
     
     # Model Initialization
     net = DiplomacyTransformer(num_provinces=MAP_PROVINCES, history_length=HISTORY_LENGTH, vocab_size=VOCAB_SIZE, none_idx=NONE_IDX).to(device)
-    actor_bc_model = DiplomacyTransformer(num_provinces=MAP_PROVINCES, history_length=HISTORY_LENGTH, vocab_size=VOCAB_SIZE, none_idx=NONE_IDX).to(device)
     actor_net = DiplomacyTransformer(num_provinces=MAP_PROVINCES, history_length=HISTORY_LENGTH, vocab_size=VOCAB_SIZE, none_idx=NONE_IDX).to(device)
     
     if os.path.exists(args.bc_weights):
         bc_state_dict = torch.load(args.bc_weights, map_location=device)
         net.load_state_dict(bc_state_dict, strict=False)
-        actor_bc_model.load_state_dict(bc_state_dict, strict=False)
         actor_net.load_state_dict(bc_state_dict, strict=False)
         
         # Freeze reference models
-        actor_bc_model.eval()
-        for param in actor_bc_model.parameters(): param.requires_grad = False
         actor_net.eval()
         for param in actor_net.parameters(): param.requires_grad = False
             
@@ -359,8 +348,6 @@ def main():
     #     print("Compiling PyTorch models...")
     
     # net = torch.compile(net, dynamic=True)
-    # bc_model = torch.compile(bc_model, dynamic=True)
-    # actor_bc_model = torch.compile(actor_bc_model, dynamic=True)
     # actor_net = torch.compile(actor_net, dynamic=True)
 
     net = DDP(net, device_ids=[local_rank])
@@ -377,8 +364,6 @@ def main():
             'values': torch.zeros((args.num_steps, args.num_envs, NUM_AGENTS), dtype=torch.float32, device=device),
             'masks': torch.zeros((args.num_steps, args.num_envs, NUM_AGENTS), dtype=torch.bool, device=device),
             'sparse_masks': torch.zeros((args.num_steps, args.num_envs, NUM_AGENTS, 4000), dtype=torch.int32, device=device),
-            'top_k_indices': torch.zeros((args.num_steps, args.num_envs, NUM_AGENTS, MAP_PROVINCES, 3), dtype=torch.long, device=device),
-            'top_k_values': torch.zeros((args.num_steps, args.num_envs, NUM_AGENTS, MAP_PROVINCES, 3), dtype=torch.float32, device=device),
             'advantages': torch.zeros((args.num_steps, args.num_envs, NUM_AGENTS), dtype=torch.float32, device=device),
             'returns': torch.zeros((args.num_steps, args.num_envs, NUM_AGENTS), dtype=torch.float32, device=device)
         }
@@ -463,22 +448,17 @@ def main():
                                 step_mask = torch.arange(max_decode_steps, device=device).unsqueeze(0) < is_active_mask.sum(dim=1, keepdim=True)
 
                                 current_action = torch.zeros(batch_size, dtype=torch.long, device=device)
-                                kv_cache, bc_kv_cache = None, None
+                                kv_cache = None
                                 batch_indices = torch.arange(batch_size, device=device)
                                 
                                 b_idx_expand = batch_indices.unsqueeze(1)
                                 active_states = state_repr[b_idx_expand, padded_indices, :]
-                                
-                                with torch.autocast(device_type='cuda', dtype=torch.bfloat16):
-                                    bc_state_repr, _ = actor_bc_model.encode_state(flat_obs.to(dtype=torch.bfloat16))
-                                bc_active_states = bc_state_repr[b_idx_expand, padded_indices, :]
 
                                 for decode_idx in range(max_decode_steps):
                                     prov_indices = padded_indices[:, decode_idx]
                                     valid_step = step_mask[:, decode_idx]
                                     
                                     with torch.autocast(device_type='cuda', dtype=torch.bfloat16):
-                                        bc_logits, bc_kv_cache = actor_bc_model.decode_step(current_action, bc_active_states, decode_idx, bc_kv_cache)
                                         logits, kv_cache = actor_net.decode_step(current_action, active_states, decode_idx, kv_cache)
                                     
                                     prov_mask = packed_masks[:, decode_idx, :]
@@ -486,29 +466,14 @@ def main():
                                     pure_logits = logits.float().masked_fill(~prov_mask, -1e9)
                                     true_dist = Categorical(logits=pure_logits)
                                     
-                                    pure_bc_logits = bc_logits.float().masked_fill(~prov_mask, -1e9)
-                                    bc_probs = torch.softmax(pure_bc_logits, dim=-1)
-                                    bc_approved_mask = bc_probs > 0.05 
-                                    
-                                    combined_mask = prov_mask & bc_approved_mask
-                                    fallback_mask = combined_mask.sum(dim=-1) == 0
-                                    combined_mask[fallback_mask] = prov_mask[fallback_mask]
-
-                                    sample_logits = pure_logits.masked_fill(~combined_mask, -1e9)
-                                    sample_logits = apply_top_k_mask(sample_logits, k=3)
-                                    sample_dist = Categorical(logits=sample_logits)
-
-                                    current_action = sample_dist.sample()
+                                    current_action = true_dist.sample()
                                     current_action = current_action.clone() 
                                     current_action[~valid_step] = NONE_IDX
+                                    
                                     step_log_probs = true_dist.log_prob(current_action)
-
-                                    top_k_vals, top_k_idx = torch.topk(logits.float(), 3, dim=-1)
                                     
                                     final_actions[batch_indices[valid_step], prov_indices[valid_step]] = current_action[valid_step]
                                     final_logprobs[batch_indices[valid_step], prov_indices[valid_step]] = step_log_probs[valid_step]
-                                    final_top_k[batch_indices[valid_step], prov_indices[valid_step]] = top_k_idx[valid_step]
-                                    final_top_k_vals[batch_indices[valid_step], prov_indices[valid_step]] = top_k_vals[valid_step]
                                     
                                 buf['values'][step][buf['masks'][step]] = values.squeeze(-1)
                                 buf['logprobs'][step][buf['masks'][step]] = final_logprobs
@@ -519,8 +484,6 @@ def main():
                                         if buf['masks'][step, i, agent_to_idx[a]]:
                                             act_array = final_actions[idx_counter]
                                             buf['actions'][step, i, agent_to_idx[a]] = act_array
-                                            buf['top_k_indices'][step, i, agent_to_idx[a]] = final_top_k[idx_counter]
-                                            buf['top_k_values'][step, i, agent_to_idx[a]] = final_top_k_vals[idx_counter]
                                             actions_to_send[i][a] = act_array.cpu().numpy()
                                             idx_counter += 1
                                             
@@ -636,8 +599,6 @@ def main():
         flat_ret = buf['returns'].view(-1)[valid]
         flat_val = buf['values'].view(-1)[valid]
         flat_sparse_masks = buf['sparse_masks'].view(-1, 4000)[valid]
-        flat_top_k = buf['top_k_indices'].view(-1, MAP_PROVINCES, 3)[valid]
-        flat_top_k_vals = buf['top_k_values'].view(-1, MAP_PROVINCES, 3)[valid]
 
         b_size = flat_obs.shape[0]
         
@@ -655,8 +616,6 @@ def main():
             flat_ret = flat_ret[perm][:min_b_size]
             flat_val = flat_val[perm][:min_b_size]
             flat_sparse_masks = flat_sparse_masks[perm][:min_b_size]
-            flat_top_k = flat_top_k[perm][:min_b_size]
-            flat_top_k_vals = flat_top_k_vals[perm][:min_b_size]
             b_size = min_b_size
 
         if flat_adv.shape[0] > 1:
@@ -682,8 +641,8 @@ def main():
         t_update_start = time.time()
         net.train()
         
-        mb_size = 768
-        accum_steps = 6
+        mb_size = 1024
+        accum_steps = 4
         optimizer.zero_grad() 
 
         target_kl = 0.02
@@ -698,8 +657,6 @@ def main():
             epoch_ret = flat_ret[perm]
             epoch_val = flat_val[perm]
             epoch_sparse = flat_sparse_masks[perm]
-            epoch_top_k = flat_top_k[perm]
-            epoch_top_k_vals = flat_top_k_vals[perm]
 
             start_indices = list(range(0, b_size, mb_size))
             
@@ -715,8 +672,6 @@ def main():
                 mb_adv = epoch_adv[start:end]
                 mb_ret = epoch_ret[start:end]
                 mb_val = epoch_val[start:end]
-                mb_top_k = epoch_top_k[start:end]
-                mb_top_k_vals = epoch_top_k_vals[start:end]
                 
                 mb_sparse_gpu = epoch_sparse[start:end].to(device)
                 
@@ -793,10 +748,8 @@ def main():
                                 print(f"Top 5 Probs: {torch.topk(probs, 5).values}")
                                 print(f"Target Prob: {probs[packed_targets[0, 0]]}")
                         
-                            
-                            with torch.no_grad():
-                                unit_kl = 0.5 * (unit_old_logprobs - unit_new_logprobs).pow(2) * valid_mask
-                                kl_divergence = unit_kl.sum() / total_valid_units
+                            unit_kl = 0.5 * (unit_old_logprobs - unit_new_logprobs).pow(2) * valid_mask
+                            kl_divergence = unit_kl.sum() / total_valid_units
                         else:
                             pg_loss = torch.tensor(0.0, device=device)
                             entropy = torch.tensor(0.0, device=device)
@@ -844,10 +797,10 @@ def main():
                     print(f"Early stopping triggered at epoch {epoch+1} due to high KL: {global_epoch_kl:.4f}")
                 break
 
-        if global_avg_kl > target_kl * 1.2:
-            args.kl_coef *= 1.5
-        elif global_avg_kl < target_kl * 0.8:
-            args.kl_coef /= 1.5
+        # if global_avg_kl > target_kl * 1.2:
+        #     args.kl_coef *= 1.5
+        # elif global_avg_kl < target_kl * 0.8:
+        #     args.kl_coef /= 1.5
             
         args.kl_coef = max(0.0001, min(5.0, args.kl_coef))
 
@@ -889,23 +842,59 @@ def main():
                 "global_step": update * global_steps,
             }, step=update)
 
-            if update % 1 == 0:
-                # Save checkpoint to the unique run folder
+            if update % 10 == 0:
                 ckpt_path = os.path.join(ckpt_dir, f"diplomacy_APPO_update_{update}.pth")
                 torch.save(net.module.state_dict(), ckpt_path)
                 print(f"  -> Saved checkpoint to {ckpt_path}")
                 
-                evaluate_and_save_game(net.module, device, update, save_dir=eval_dir)
+                torch.cuda.empty_cache()
                 
-                eval_log_path = os.path.join(eval_dir, f"eval_game_update_{update}.txt")
-                if os.path.exists(eval_log_path):
-                    eval_artifact = wandb.Artifact(
-                        name=f"eval_transcript_update_{update}",
-                        type="evaluation_log",
-                        description=f"Full transcript of evaluation game at update {update}"
-                    )
-                    eval_artifact.add_file(eval_log_path)
-                    wandb.log_artifact(eval_artifact)
+                baseline_net = DiplomacyTransformer(num_provinces=MAP_PROVINCES, history_length=HISTORY_LENGTH, vocab_size=VOCAB_SIZE, none_idx=NONE_IDX)
+                if os.path.exists(args.bc_weights):
+                    baseline_net.load_state_dict(torch.load(args.bc_weights, map_location='cpu'), strict=False)
+                baseline_net.eval()
+                
+                try:
+                    baseline_net = baseline_net.to(device)
+                except RuntimeError:
+                    print("  -> VRAM too low. Running baseline inference on CPU.")
+                    baseline_net = baseline_net.to('cpu')
+                    
+                print(f"  -> Initiating 70-game evaluation suite (10 games per power)...")
+                
+                total_scs = 0
+                power_sc_totals = {p: 0 for p in possible_agents}
+                
+                # The 70-Game Loop
+                for power in possible_agents:
+                    for i in range(10):
+                        scs = evaluate_against_baseline(net.module, baseline_net, device, update, power, i, save_dir=eval_dir)
+                        total_scs += scs
+                        power_sc_totals[power] += scs
+                        
+                # Log Aggregates to WandB
+                avg_overall = total_scs / 70.0
+                wandb.log({"Eval/Overall_Avg_SCs": avg_overall}, step=update)
+                print(f"  -> Evaluation Complete. Overall Average SCs: {avg_overall:.2f}")
+                
+                for power in possible_agents:
+                    avg_power = power_sc_totals[power] / 10.0
+                    wandb.log({f"Eval/{power}_Avg_SCs": avg_power}, step=update)
+                    
+                del baseline_net
+                torch.cuda.empty_cache()
+                
+                # Upload only the first game of each power to avoid artifact bloat
+                for power in possible_agents:
+                    eval_log_path = os.path.join(eval_dir, f"eval_update_{update}_{power}_game_0.txt")
+                    if os.path.exists(eval_log_path):
+                        eval_artifact = wandb.Artifact(
+                            name=f"eval_transcript_update_{update}_{power}",
+                            type="evaluation_log",
+                            description=f"Sample evaluation for {power} at update {update}"
+                        )
+                        eval_artifact.add_file(eval_log_path)
+                        wandb.log_artifact(eval_artifact)
         
     vec_env.close()
     if global_rank == 0:
