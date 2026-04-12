@@ -133,7 +133,11 @@ class DiplomacyTransformer(nn.Module):
         # Autoregressive Action Decoder (Unit-Centric)
         self.action_embedding = nn.Embedding(vocab_size, d_model)
         self.start_token_embedding = nn.Parameter(torch.randn(1, 1, d_model))
-        self.causal_decoder_block = KVCacheAttentionBlock(d_model=d_model, nhead=nhead)
+        num_decoder_layers = 4
+        self.decoder_layers = nn.ModuleList([
+            KVCacheAttentionBlock(d_model=d_model, nhead=nhead) 
+            for _ in range(num_decoder_layers)
+        ])
         self.action_head = nn.Linear(d_model, vocab_size)
 
         p_idx = torch.arange(num_provinces).unsqueeze(0).unsqueeze(0).expand(1, history_length, -1).clone()
@@ -175,18 +179,20 @@ class DiplomacyTransformer(nn.Module):
         batch_size = active_state_repr.size(0)
         
         if kv_cache is None:
+            kv_cache = [None] * len(self.decoder_layers)
             action_emb = self.start_token_embedding.expand(batch_size, -1, -1).squeeze(1)
         else:
             action_emb = self.action_embedding(prev_action)
             
-        # Extract the state for the specific unit in the dynamic sequence
         unit_state = active_state_repr[:, step_idx, :]
-        
         decoder_input = (action_emb + unit_state).unsqueeze(1)
         
-        decoder_out, new_kv_cache = self.causal_decoder_block(decoder_input, kv_cache)
-        logits = self.action_head(decoder_out.squeeze(1))
-        
+        new_kv_cache = []
+        for i, layer in enumerate(self.decoder_layers):
+            decoder_input, layer_cache = layer(decoder_input, kv_cache[i])
+            new_kv_cache.append(layer_cache)
+            
+        logits = self.action_head(decoder_input.squeeze(1))
         return logits, new_kv_cache
 
     def decode_full(self, state_repr, actions, active_mask, return_hidden=False):
@@ -247,8 +253,10 @@ class DiplomacyTransformer(nn.Module):
 
         # decoder_out = checkpoint(decoder_wrapper, decoder_input, padding_mask, use_reentrant=False)
 
-        out, _ = self.causal_decoder_block(decoder_input, kv_cache=None, padding_mask=padding_mask)
-        decoder_out = out
+        x = decoder_input
+        for layer in self.decoder_layers:
+            x, _ = layer(x, kv_cache=None, padding_mask=padding_mask)
+        decoder_out = x
         
         if return_hidden:
             return decoder_out
@@ -414,6 +422,7 @@ def parse_state_to_tensor(turn_data, observing_agent=None):
                 loc_full = parts[1]
                 
                 loc_parts = loc_full.split('/')
+                loc_base = loc_parts[0] 
                 coast = loc_parts[1] if len(loc_parts) > 1 else None
 
                 if loc_full in GLOBAL_PROV_TO_IDX:
@@ -425,6 +434,12 @@ def parse_state_to_tensor(turn_data, observing_agent=None):
                     if coast == 'NC': state_tensor[p_idx, 16] = 1.0
                     elif coast == 'SC': state_tensor[p_idx, 17] = 1.0
                     elif coast == 'EC': state_tensor[p_idx, 18] = 1.0
+
+                if loc_base != loc_full and loc_base in GLOBAL_PROV_TO_IDX:
+                    base_idx = GLOBAL_PROV_TO_IDX[loc_base]
+                    state_tensor[base_idx, power_idx] = 1.0
+                    if u_type == 'A': state_tensor[base_idx, 7] = 1.0
+                    elif u_type == 'F': state_tensor[base_idx, 8] = 1.0
 
     for power, unit_list in dislodged.items():
         power_upper = power.upper()
@@ -530,7 +545,7 @@ class DiplomacyTransformerEnv(ParallelEnv):
                         
         rewards = {a: 0.0 for a in self.agents}
         
-        legality_metrics = {a: {'proposed': 0, 'illegal_dropped': 0} for a in self.agents}
+        legality_metrics = {a: {'proposed': 0, 'illegal_dropped': 0, 'illegal_prov_indices': []} for a in self.agents}
         
         for agent, action_indices in actions.items():
             text_orders = []
@@ -562,6 +577,7 @@ class DiplomacyTransformerEnv(ParallelEnv):
                         text_orders.append(order_str)
                     else:
                         legality_metrics[agent]['illegal_dropped'] += 1
+                        legality_metrics[agent]['illegal_prov_indices'].append(i)
                         
             self.game.set_orders(agent, text_orders)
 
@@ -604,28 +620,50 @@ class DiplomacyTransformerEnv(ParallelEnv):
             agent_units = current_state_dict['units'].get(agent, [])
             prev_agent_units = prev_units.get(agent, [])
             
-            rewards[agent] -= 0.05
+            # rewards[agent] -= 0.05
             
             # Supply Center Deltas
             sc_delta = current_sc_count - prev_sc_counts.get(agent, 0)
             if sc_delta != 0:
                 rewards[agent] += sc_delta * 10.0
                         
+            occupied_unowned_scs = 0
+            for unit_str in agent_units:
+                prov_base = unit_str.split()[1].split('/')[0] 
+                if prov_base in all_map_scs and prov_base not in current_scs:
+                    occupied_unowned_scs += 1
+            rewards[agent] += (occupied_unowned_scs * 1.0)
+                
             # Dislodgement Penalty
             current_dislodged = current_state_dict.get('dislodged', {}).get(agent, [])
             if len(current_dislodged) > 0:
                 rewards[agent] -= (len(current_dislodged) * 0.5)
                 
-            # Terminal States & Truncation Multipliers
-            if current_sc_count >= 18:
-                rewards[agent] += 100.0
-            elif current_sc_count == 0 and len(agent_units) == 0:
-                rewards[agent] -= 50.0 
-            elif is_done:
-                base_truncation = current_sc_count * 3.0
-                if self.stalemate_counter >= self.stalemate_threshold:
-                    base_truncation -= 20.0 
-                rewards[agent] += base_truncation
+        # Terminal States & Truncation Multipliers
+        if is_done:
+            solo_winner = None
+            for agent in self.agents:
+                if len(self.game.get_centers(agent)) >= 18:
+                    solo_winner = agent
+                    break
+            
+            if solo_winner:
+                rewards[solo_winner] += 150.0
+            else:
+                # Sum of Squares Draw Scoring
+                total_sq_scs = sum(len(self.game.get_centers(a)) ** 2 for a in self.agents)
+                if total_sq_scs > 0:
+                    for agent in self.agents:
+                        agent_scs = len(self.game.get_centers(agent))
+                        if agent_scs > 0:
+                            sos_share = ((agent_scs ** 2) / total_sq_scs) * 100.0
+                            rewards[agent] += sos_share
+
+        for agent in self.agents:
+            current_scs = self.game.get_centers(agent)
+            agent_units = current_state_dict.get('units', {}).get(agent, [])
+            if len(current_scs) == 0 and len(agent_units) == 0:
+                rewards[agent] -= 50.0
 
         terminations = {a: False for a in self.agents}
         truncations = {a: False for a in self.agents}

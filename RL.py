@@ -273,7 +273,7 @@ def parse_args():
     parser.add_argument("--ent_coef", type=float, default=0.001, help="Entropy coefficient")
     parser.add_argument("--v_coef", type=float, default=0.1, help="Value function loss coefficient")
     parser.add_argument("--kl_coef", type=float, default=0.05, help="KL divergence penalty coefficient")
-    parser.add_argument("--update_epochs", type=int, default=1, help="Number of epochs per PPO update")
+    parser.add_argument("--update_epochs", type=int, default=2, help="Number of epochs per PPO update")
     parser.add_argument("--bc_weights", type=str, default="diplomacy_transformer_bc.pth", help="Path to pre-trained Behavioral Cloning weights")
     parser.add_argument("--resume_weights", type=str, default=None, help="Path to RL checkpoint to resume training from")
     return parser.parse_args()
@@ -327,8 +327,9 @@ def main():
     if os.path.exists(args.bc_weights):
         bc_state_dict = torch.load(args.bc_weights, map_location=device)
         net.load_state_dict(bc_state_dict, strict=False)
-        actor_net.load_state_dict(bc_state_dict, strict=False)
         
+        actor_net.load_state_dict(net.state_dict())
+
         # Freeze reference models
         actor_net.eval()
         for param in actor_net.parameters(): param.requires_grad = False
@@ -336,22 +337,33 @@ def main():
         if global_rank == 0: 
             print("Successfully loaded pre-trained BC weights for policy initialization.")
 
+    loaded_opt_state = None
+    start_update = 1
+
     if args.resume_weights and os.path.exists(args.resume_weights):
-        rl_state_dict = torch.load(args.resume_weights, map_location=device)
-        net.load_state_dict(rl_state_dict, strict=False)
-        actor_net.load_state_dict(rl_state_dict, strict=False)
+        checkpoint = torch.load(args.resume_weights, map_location=device)
         
+        if 'model_state_dict' in checkpoint:
+            net.load_state_dict(checkpoint['model_state_dict'], strict=False)
+            actor_net.load_state_dict(checkpoint['model_state_dict'], strict=False)
+            loaded_opt_state = checkpoint['optimizer_state_dict']
+            
+            start_update = checkpoint.get('update', 0) + 1 
+        else:
+            net.load_state_dict(checkpoint, strict=False)
+            actor_net.load_state_dict(checkpoint, strict=False)
+            
         if global_rank == 0:
             print(f"Successfully resumed RL training from checkpoint: {args.resume_weights}")
 
-    # if global_rank == 0: 
-    #     print("Compiling PyTorch models...")
-    
-    # net = torch.compile(net, dynamic=True)
-    # actor_net = torch.compile(actor_net, dynamic=True)
-
     net = DDP(net, device_ids=[local_rank])
+    
     optimizer = optim.Adam(net.parameters(), lr=args.lr, eps=1e-5)
+    
+    if loaded_opt_state is not None:
+        optimizer.load_state_dict(loaded_opt_state)
+        if global_rank == 0:
+            print("Successfully restored Optimizer momentum and variance states.")
 
     def create_buffer():
         """Creates a memory-pinned tensor buffer for experience collection."""
@@ -365,7 +377,8 @@ def main():
             'masks': torch.zeros((args.num_steps, args.num_envs, NUM_AGENTS), dtype=torch.bool, device=device),
             'sparse_masks': torch.zeros((args.num_steps, args.num_envs, NUM_AGENTS, 4000), dtype=torch.int32, device=device),
             'advantages': torch.zeros((args.num_steps, args.num_envs, NUM_AGENTS), dtype=torch.float32, device=device),
-            'returns': torch.zeros((args.num_steps, args.num_envs, NUM_AGENTS), dtype=torch.float32, device=device)
+            'returns': torch.zeros((args.num_steps, args.num_envs, NUM_AGENTS), dtype=torch.float32, device=device),
+            'unit_penalties': torch.ones((args.num_steps, args.num_envs, NUM_AGENTS, MAP_PROVINCES), dtype=torch.float32, device=device)
         }
         
     # Double-buffering architecture masks CPU environment latency behind GPU backpropagation
@@ -412,7 +425,7 @@ def main():
                                 for a in possible_agents:
                                     buf['rewards'][step, i, agent_to_idx[a]] = step_rewards.get(a, 0.0)
                                     next_done[i, agent_to_idx[a]] = float(terms.get(a, False))
-                            
+
                             for a in active_agents:
                                 a_idx = agent_to_idx[a]
                                 buf['masks'][step, i, a_idx] = True
@@ -420,8 +433,11 @@ def main():
                                 buf['sparse_masks'][step, i, a_idx] = torch.tensor(infos_dict[a]['action_mask'], dtype=torch.int32)
 
                                 if 'legality_metrics' in infos_dict[a]:
-                                    local_proposed += infos_dict[a]['legality_metrics']['proposed']
-                                    local_dropped += infos_dict[a]['legality_metrics']['illegal_dropped']
+                                    bad_indices = infos_dict[a]['legality_metrics'].get('illegal_prov_indices', [])
+                                    for bad_idx in bad_indices:
+                                        buf['unit_penalties'][step, i, agent_to_idx[a], bad_idx] = -1.0
+                                    local_proposed += infos_dict[a]['legality_metrics'].get('proposed', 0)
+                                    local_dropped += infos_dict[a]['legality_metrics'].get('illegal_dropped', 0)
 
                         flat_obs = buf['obs'][step][buf['masks'][step]]
                         if flat_obs.shape[0] > 0:
@@ -548,17 +564,22 @@ def main():
     rollout_thread = threading.Thread(target=rollout_worker, daemon=True)
     rollout_thread.start()
 
+    timestamp_list = [None]
     if global_rank == 0:
-        timestamp = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
-        run_name = f"ppo_run_{timestamp}"
+        timestamp_list[0] = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
         
-        base_dir = f"/data/restanislao/model_runs/{run_name}"
-        ckpt_dir = os.path.join(base_dir, "checkpoints")
-        eval_dir = os.path.join(base_dir, "eval_games")
-        
+    dist.broadcast_object_list(timestamp_list, src=0)
+    timestamp = timestamp_list[0]
+
+    run_name = f"ppo_run_{timestamp}"
+    base_dir = f"/data/restanislao/model_runs/{run_name}"
+    ckpt_dir = os.path.join(base_dir, "checkpoints")
+    eval_dir = os.path.join(base_dir, "eval_games")
+
+    if global_rank == 0:
         os.makedirs(ckpt_dir, exist_ok=True)
         os.makedirs(eval_dir, exist_ok=True)
-
+        
         writer = SummaryWriter(log_dir=f"/data/restanislao/tb_runs/{run_name}")
         wandb.init(
             project="diplomacy-ppo",
@@ -566,6 +587,8 @@ def main():
             config=vars(args),
             dir="/data/restanislao/wandb"
         )
+
+    dist.barrier()
 
     buffer_idx = 0
     for update in range(1, args.num_updates + 1):
@@ -599,6 +622,7 @@ def main():
         flat_ret = buf['returns'].view(-1)[valid]
         flat_val = buf['values'].view(-1)[valid]
         flat_sparse_masks = buf['sparse_masks'].view(-1, 4000)[valid]
+        flat_unit_penalties = buf['unit_penalties'].view(-1, MAP_PROVINCES)[valid]
 
         b_size = flat_obs.shape[0]
         
@@ -616,6 +640,7 @@ def main():
             flat_ret = flat_ret[perm][:min_b_size]
             flat_val = flat_val[perm][:min_b_size]
             flat_sparse_masks = flat_sparse_masks[perm][:min_b_size]
+            flat_unit_penalties = flat_unit_penalties[perm][:min_b_size]
             b_size = min_b_size
 
         if flat_adv.shape[0] > 1:
@@ -657,6 +682,7 @@ def main():
             epoch_ret = flat_ret[perm]
             epoch_val = flat_val[perm]
             epoch_sparse = flat_sparse_masks[perm]
+            epoch_unit_penalties = flat_unit_penalties[perm]
 
             start_indices = list(range(0, b_size, mb_size))
             
@@ -672,8 +698,8 @@ def main():
                 mb_adv = epoch_adv[start:end]
                 mb_ret = epoch_ret[start:end]
                 mb_val = epoch_val[start:end]
-                
                 mb_sparse_gpu = epoch_sparse[start:end].to(device)
+                mb_unit_penalties = epoch_unit_penalties[start:end]
                 
                 is_active_mask, packed_masks, padded_indices, max_active = rebuild_packed_masks(
                     mb_sparse_gpu, MAP_PROVINCES, VOCAB_SIZE, NONE_IDX, device
@@ -732,9 +758,12 @@ def main():
                             unit_ratios = torch.exp(unit_new_logprobs - unit_old_logprobs)
 
                             adv_expanded = mb_adv.unsqueeze(1).expand_as(unit_ratios)
+                            
+                            packed_penalties = mb_unit_penalties[b_idx_expand, padded_indices]
+                            unit_specific_adv = adv_expanded * packed_penalties * valid_mask
 
-                            pg_loss1 = -adv_expanded * unit_ratios
-                            pg_loss2 = -adv_expanded * torch.clamp(unit_ratios, 1 - args.clip_coef, 1 + args.clip_coef)
+                            pg_loss1 = -unit_specific_adv * unit_ratios
+                            pg_loss2 = -unit_specific_adv * torch.clamp(unit_ratios, 1 - args.clip_coef, 1 + args.clip_coef)
                             unit_pg_loss = torch.max(pg_loss1, pg_loss2) * valid_mask
 
                             total_valid_units = valid_mask.sum().clamp(min=1)
@@ -748,7 +777,8 @@ def main():
                                 print(f"Top 5 Probs: {torch.topk(probs, 5).values}")
                                 print(f"Target Prob: {probs[packed_targets[0, 0]]}")
                         
-                            unit_kl = 0.5 * (unit_old_logprobs - unit_new_logprobs).pow(2) * valid_mask
+                            log_ratio = (unit_new_logprobs - unit_old_logprobs) * valid_mask
+                            unit_kl = (torch.exp(log_ratio) - 1.0 - log_ratio) * valid_mask
                             kl_divergence = unit_kl.sum() / total_valid_units
                         else:
                             pg_loss = torch.tensor(0.0, device=device)
@@ -842,59 +872,59 @@ def main():
                 "global_step": update * global_steps,
             }, step=update)
 
-            if update % 10 == 0:
+            if update % 1 == 0:
                 ckpt_path = os.path.join(ckpt_dir, f"diplomacy_APPO_update_{update}.pth")
-                torch.save(net.module.state_dict(), ckpt_path)
-                print(f"  -> Saved checkpoint to {ckpt_path}")
+                if global_rank == 0:
+                    checkpoint = {
+                        'update': update,
+                        'model_state_dict': net.module.state_dict(),
+                        'optimizer_state_dict': optimizer.state_dict()
+                    }
+                    print(f"  -> Saved checkpoint to {ckpt_path}")
+            
+        EVAL_FREQ = 1
+        
+        if update % EVAL_FREQ == 0:
+            torch.cuda.empty_cache()
+            
+            world_size = dist.get_world_size()
+            my_powers = [p for i, p in enumerate(possible_agents) if i % world_size == global_rank]
+            
+            local_eval_scs = torch.zeros(NUM_AGENTS, dtype=torch.float32, device=device)
+            
+            net.eval()
+            for power in my_powers:
+                sc = evaluate_against_baseline(
+                    live_net=net.module,
+                    baseline_net=actor_net,
+                    device=device, 
+                    update_num=update, 
+                    live_power=power, 
+                    game_index=1, 
+                    save_dir=eval_dir
+                )
+                local_eval_scs[agent_to_idx[power]] = float(sc)
+            net.train()
+
+            dist.all_reduce(local_eval_scs, op=dist.ReduceOp.SUM)
+            
+            if global_rank == 0:
+                avg_eval_sc = local_eval_scs.mean().item()
                 
-                torch.cuda.empty_cache()
+                print(f"\n--- Evaluation Results (Update {update}) ---")
+                for i, power in enumerate(possible_agents):
+                    print(f"  {power}: {local_eval_scs[i].item()} SCs")
+                print(f"  Average SCs: {avg_eval_sc:.2f}\n")
                 
-                baseline_net = DiplomacyTransformer(num_provinces=MAP_PROVINCES, history_length=HISTORY_LENGTH, vocab_size=VOCAB_SIZE, none_idx=NONE_IDX)
-                if os.path.exists(args.bc_weights):
-                    baseline_net.load_state_dict(torch.load(args.bc_weights, map_location='cpu'), strict=False)
-                baseline_net.eval()
+                wandb.log({
+                    "Eval/Avg_SCs": avg_eval_sc,
+                    "global_step": update * global_steps
+                }, step=update)
                 
-                try:
-                    baseline_net = baseline_net.to(device)
-                except RuntimeError:
-                    print("  -> VRAM too low. Running baseline inference on CPU.")
-                    baseline_net = baseline_net.to('cpu')
+                for i, power in enumerate(possible_agents):
+                    wandb.log({f"Eval/{power}_SCs": local_eval_scs[i].item()}, step=update)
                     
-                print(f"  -> Initiating 70-game evaluation suite (10 games per power)...")
-                
-                total_scs = 0
-                power_sc_totals = {p: 0 for p in possible_agents}
-                
-                # The 70-Game Loop
-                for power in possible_agents:
-                    for i in range(10):
-                        scs = evaluate_against_baseline(net.module, baseline_net, device, update, power, i, save_dir=eval_dir)
-                        total_scs += scs
-                        power_sc_totals[power] += scs
-                        
-                # Log Aggregates to WandB
-                avg_overall = total_scs / 70.0
-                wandb.log({"Eval/Overall_Avg_SCs": avg_overall}, step=update)
-                print(f"  -> Evaluation Complete. Overall Average SCs: {avg_overall:.2f}")
-                
-                for power in possible_agents:
-                    avg_power = power_sc_totals[power] / 10.0
-                    wandb.log({f"Eval/{power}_Avg_SCs": avg_power}, step=update)
-                    
-                del baseline_net
-                torch.cuda.empty_cache()
-                
-                # Upload only the first game of each power to avoid artifact bloat
-                for power in possible_agents:
-                    eval_log_path = os.path.join(eval_dir, f"eval_update_{update}_{power}_game_0.txt")
-                    if os.path.exists(eval_log_path):
-                        eval_artifact = wandb.Artifact(
-                            name=f"eval_transcript_update_{update}_{power}",
-                            type="evaluation_log",
-                            description=f"Sample evaluation for {power} at update {update}"
-                        )
-                        eval_artifact.add_file(eval_log_path)
-                        wandb.log_artifact(eval_artifact)
+            torch.cuda.empty_cache()
         
     vec_env.close()
     if global_rank == 0:
