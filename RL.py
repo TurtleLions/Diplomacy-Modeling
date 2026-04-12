@@ -323,6 +323,7 @@ def main():
     # Model Initialization
     net = DiplomacyTransformer(num_provinces=MAP_PROVINCES, history_length=HISTORY_LENGTH, vocab_size=VOCAB_SIZE, none_idx=NONE_IDX).to(device)
     actor_net = DiplomacyTransformer(num_provinces=MAP_PROVINCES, history_length=HISTORY_LENGTH, vocab_size=VOCAB_SIZE, none_idx=NONE_IDX).to(device)
+    bc_baseline_net = DiplomacyTransformer(num_provinces=MAP_PROVINCES, history_length=HISTORY_LENGTH, vocab_size=VOCAB_SIZE, none_idx=NONE_IDX).to(device)
     
     if os.path.exists(args.bc_weights):
         bc_state_dict = torch.load(args.bc_weights, map_location=device)
@@ -896,7 +897,7 @@ def main():
             for power in my_powers:
                 sc = evaluate_against_baseline(
                     live_net=net.module,
-                    baseline_net=actor_net,
+                    baseline_net=bc_baseline_net,
                     device=device, 
                     update_num=update, 
                     live_power=power, 
