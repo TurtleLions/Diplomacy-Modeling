@@ -195,7 +195,7 @@ class DiplomacyTransformer(nn.Module):
         logits = self.action_head(decoder_input.squeeze(1))
         return logits, new_kv_cache
 
-    def decode_full(self, state_repr, actions, active_mask, return_hidden=False):
+    def decode_full(self, state_repr, actions, active_mask, padded_indices, return_hidden=False):
         """
         Unit-centric Teacher-forced forward pass utilized during Behavioral Cloning.
         Compresses the 82-province tensor down to only active units before decoding.
@@ -208,27 +208,9 @@ class DiplomacyTransformer(nn.Module):
             dummy_mask = torch.zeros((batch_size, 0), dtype=torch.bool, device=state_repr.device)
             return dummy_out, dummy_mask
 
-        active_states = []
-        active_acts = []
-        
-        for b in range(batch_size):
-            valid_indices = torch.where(active_mask[b])[0]
-            count = len(valid_indices)
-            
-            b_states = state_repr[b, valid_indices, :]
-            b_acts = actions[b, valid_indices]
-            
-            if count < max_units:
-                pad_states = torch.zeros((max_units - count, self.d_model), device=state_repr.device)
-                pad_acts = torch.full((max_units - count,), self.none_idx, dtype=torch.long, device=actions.device)
-                b_states = torch.cat([b_states, pad_states], dim=0)
-                b_acts = torch.cat([b_acts, pad_acts], dim=0)
-                
-            active_states.append(b_states)
-            active_acts.append(b_acts)
-            
-        active_states = torch.stack(active_states) # (B, max_units, D)
-        active_acts = torch.stack(active_acts)     # (B, max_units)
+        b_idx = torch.arange(batch_size, device=state_repr.device).unsqueeze(1)
+        active_states = state_repr[b_idx, padded_indices]
+        active_acts = actions[b_idx, padded_indices]
 
         if active_states.size(0) > 0 and not hasattr(self, '_debug_printed'):
             print("\n--- DEBUG: DECODE_FULL SEQUENCE ---")

@@ -9,7 +9,8 @@ import datetime
 import argparse
 import threading
 import contextlib
-import multiprocessing as mp
+import torch.multiprocessing as mp
+import multiprocessing.connection
 import random
 
 import numpy as np
@@ -134,8 +135,7 @@ class SubprocVecDiplomacy:
         remotes_left = {remote: i for i, remote in enumerate(self.remotes)}
         
         while remotes_left:
-            # mp.connection.wait() blocks until at least one pipe has data ready
-            ready_remotes = mp.connection.wait(remotes_left.keys())
+            ready_remotes = multiprocessing.connection.wait(remotes_left.keys())
             
             for remote in ready_remotes:
                 idx = remotes_left[remote]
@@ -280,6 +280,232 @@ def parse_args():
     parser.add_argument("--bc_kl_coef", type=float, default=0.05, help="KL divergence penalty coefficient for behavioral cloning")
     return parser.parse_args()
 
+def rollout_worker(local_rank, device, args, buffers, actor_net, bc_baseline_net, 
+                   update_complete_event, rollout_complete_event, worker_stats, 
+                   NUM_AGENTS, MAP_PROVINCES, VOCAB_SIZE, NONE_IDX, possible_agents, agent_to_idx):
+    """Background process responsible for filling the experience buffer asynchronously."""
+    torch.cuda.set_device(device) 
+    inference_stream = torch.cuda.Stream(device=device)
+    
+    vec_env = SubprocVecDiplomacy(num_envs=args.num_envs)
+    
+    buffer_idx = 0
+    next_env_results = vec_env.reset()
+    next_done = torch.zeros((args.num_envs, NUM_AGENTS), device=device)
+    
+    for update in range(1, args.num_updates + 1):
+        update_complete_event.wait()
+        update_complete_event.clear()
+
+        num_learning = 3
+        learning_assignment = torch.zeros((args.num_envs, NUM_AGENTS), dtype=torch.bool, device=device)
+        for i in range(args.num_envs):
+            perm = torch.randperm(NUM_AGENTS, device=device)
+            learning_assignment[i, perm[:num_learning]] = True
+
+        current_progress = (update - 1) / max(1, args.num_updates - 1)
+
+        buf = buffers[buffer_idx]
+        with torch.cuda.stream(inference_stream):
+            buf['masks'].zero_()
+            buf['rewards'].zero_()
+            
+            env_step_time, gpu_forward_time = 0.0, 0.0
+            local_proposed, local_dropped = 0, 0
+        
+            for step in range(args.num_steps):
+                buf['dones'][step] = next_done
+                actions_to_send = [{} for _ in range(args.num_envs)]
+                
+                baseline_obs_list = []
+                baseline_sparse_list = []
+                baseline_metadata = []
+                
+                with torch.no_grad():
+                    for i in range(args.num_envs):
+                        if len(next_env_results[i]) == 3:
+                            obs_dict, infos_dict, active_agents = next_env_results[i]
+                        else:
+                            obs_dict, step_rewards, terms, truncs, infos_dict, active_agents = next_env_results[i]
+                            for a in possible_agents:
+                                if learning_assignment[i, agent_to_idx[a]]:
+                                    buf['rewards'][step, i, agent_to_idx[a]] = step_rewards.get(a, 0.0)
+                                    next_done[i, agent_to_idx[a]] = float(terms.get(a, False))
+
+                        for a in active_agents:
+                            a_idx = agent_to_idx[a]
+                            obs_tensor = torch.tensor(obs_dict[a], dtype=torch.bfloat16, device=device)
+                            sparse_tensor = torch.tensor(infos_dict[a]['action_mask'], dtype=torch.int32)
+                            
+                            if learning_assignment[i, a_idx]:
+                                buf['masks'][step, i, a_idx] = True
+                                buf['obs'][step, i, a_idx] = obs_tensor
+                                buf['sparse_masks'][step, i, a_idx] = sparse_tensor
+
+                                if 'legality_metrics' in infos_dict[a]:
+                                    bad_indices = infos_dict[a]['legality_metrics'].get('illegal_prov_indices', [])
+                                    for bad_idx in bad_indices:
+                                        buf['unit_penalties'][step, i, a_idx, bad_idx] = -1.0
+                                    local_proposed += infos_dict[a]['legality_metrics'].get('proposed', 0)
+                                    local_dropped += infos_dict[a]['legality_metrics'].get('illegal_dropped', 0)
+                            else:
+                                baseline_obs_list.append(obs_tensor)
+                                baseline_sparse_list.append(sparse_tensor)
+                                baseline_metadata.append((i, a))
+
+                    t_gpu_start = time.time()
+                    
+                    flat_obs = buf['obs'][step][buf['masks'][step]]
+                    if flat_obs.shape[0] > 0:
+                        active_sparse = buf['sparse_masks'][step][buf['masks'][step]]
+                        is_active_mask, packed_masks, padded_indices, max_decode_steps = rebuild_packed_masks(
+                            active_sparse, MAP_PROVINCES, VOCAB_SIZE, NONE_IDX, device
+                        )
+                        
+                        if max_decode_steps > 0:
+                            with torch.autocast(device_type='cuda', dtype=torch.bfloat16):
+                                state_repr, values = actor_net.encode_state(flat_obs.to(dtype=torch.bfloat16))
+                            values = values.float()
+                            
+                            batch_size = flat_obs.size(0)
+                            final_actions = torch.full((batch_size, MAP_PROVINCES), NONE_IDX, dtype=torch.long, device=device)
+                            final_logprobs = torch.zeros((batch_size, MAP_PROVINCES), dtype=torch.float32, device=device)
+                            
+                            step_mask = torch.arange(max_decode_steps, device=device).unsqueeze(0) < is_active_mask.sum(dim=1, keepdim=True)
+                            current_action = torch.zeros(batch_size, dtype=torch.long, device=device)
+                            kv_cache = None
+                            batch_indices = torch.arange(batch_size, device=device)
+                            b_idx_expand = batch_indices.unsqueeze(1)
+                            active_states = state_repr[b_idx_expand, padded_indices, :]
+
+                            for decode_idx in range(max_decode_steps):
+                                prov_indices = padded_indices[:, decode_idx]
+                                valid_step = step_mask[:, decode_idx]
+                                
+                                with torch.autocast(device_type='cuda', dtype=torch.bfloat16):
+                                    logits, kv_cache = actor_net.decode_step(current_action, active_states, decode_idx, kv_cache)
+                                
+                                prov_mask = packed_masks[:, decode_idx, :]
+                                pure_logits = logits.float().masked_fill(~prov_mask, -1e9)
+                                true_dist = Categorical(logits=pure_logits)
+                                
+                                current_action = true_dist.sample()
+                                current_action = current_action.clone() 
+                                current_action[~valid_step] = NONE_IDX
+                                
+                                step_log_probs = true_dist.log_prob(current_action)
+                                final_actions[batch_indices[valid_step], prov_indices[valid_step]] = current_action[valid_step]
+                                final_logprobs[batch_indices[valid_step], prov_indices[valid_step]] = step_log_probs[valid_step]
+                                
+                            buf['values'][step][buf['masks'][step]] = values.squeeze(-1)
+                            buf['logprobs'][step][buf['masks'][step]] = final_logprobs
+                            
+                            idx_counter = 0
+                            for i in range(args.num_envs):
+                                for a in possible_agents:
+                                    if buf['masks'][step, i, agent_to_idx[a]]:
+                                        act_array = final_actions[idx_counter]
+                                        buf['actions'][step, i, agent_to_idx[a]] = act_array
+                                        actions_to_send[i][a] = act_array.cpu().numpy()
+                                        idx_counter += 1
+
+                    if baseline_obs_list:
+                        bc_obs_tensor = torch.stack(baseline_obs_list)
+                        bc_sparse_tensor = torch.stack(baseline_sparse_list).to(device)
+                        
+                        is_active_mask, packed_masks, padded_indices, max_decode_steps = rebuild_packed_masks(
+                            bc_sparse_tensor, MAP_PROVINCES, VOCAB_SIZE, NONE_IDX, device
+                        )
+                        
+                        if max_decode_steps > 0:
+                            with torch.autocast(device_type='cuda', dtype=torch.bfloat16):
+                                state_repr, _ = bc_baseline_net.encode_state(bc_obs_tensor)
+                                
+                            batch_size = bc_obs_tensor.size(0)
+                            bc_final_actions = torch.full((batch_size, MAP_PROVINCES), NONE_IDX, dtype=torch.long, device=device)
+                            
+                            step_mask = torch.arange(max_decode_steps, device=device).unsqueeze(0) < is_active_mask.sum(dim=1, keepdim=True)
+                            current_action = torch.zeros(batch_size, dtype=torch.long, device=device)
+                            kv_cache = None
+                            batch_indices = torch.arange(batch_size, device=device)
+                            b_idx_expand = batch_indices.unsqueeze(1)
+                            active_states = state_repr[b_idx_expand, padded_indices, :]
+
+                            for decode_idx in range(max_decode_steps):
+                                prov_indices = padded_indices[:, decode_idx]
+                                valid_step = step_mask[:, decode_idx]
+                                
+                                with torch.autocast(device_type='cuda', dtype=torch.bfloat16):
+                                    logits, kv_cache = bc_baseline_net.decode_step(current_action, active_states, decode_idx, kv_cache)
+                                
+                                prov_mask = packed_masks[:, decode_idx, :]
+                                pure_logits = logits.float().masked_fill(~prov_mask, -1e9)
+                                current_action = torch.argmax(pure_logits, dim=-1) # Greedy sample for BC proxy
+                                current_action[~valid_step] = NONE_IDX
+                                
+                                bc_final_actions[batch_indices[valid_step], prov_indices[valid_step]] = current_action[valid_step]
+                                
+                            for idx, (env_idx, agent_name) in enumerate(baseline_metadata):
+                                actions_to_send[env_idx][agent_name] = bc_final_actions[idx].cpu().numpy()
+
+                    gpu_forward_time += (time.time() - t_gpu_start)
+
+                t_env_start = time.time()
+                progress_to_send = [(update - 1) / max(1, args.num_updates - 1) for _ in range(args.num_envs)]
+                next_env_results = vec_env.step(actions_to_send, progress_to_send)
+                env_step_time += (time.time() - t_env_start)
+
+        # Calculate GAE Advantages
+        with torch.no_grad():
+            next_value = torch.zeros((args.num_envs, NUM_AGENTS), device=device)
+            obs_to_encode = []
+            indices_to_update = []
+            
+            for i in range(args.num_envs):
+                infos_dict = next_env_results[i][4]
+                
+                if '__terminal_observation' in infos_dict:
+                    obs_dict = infos_dict['__terminal_observation']
+                    active_agents_list = [a for a in possible_agents if a in obs_dict]
+                else:
+                    obs_dict = next_env_results[i][0]
+                    active_agents_list = next_env_results[i][5]
+                
+                for a in active_agents_list:
+                    if a in obs_dict:
+                        obs_to_encode.append(torch.tensor(obs_dict[a], dtype=torch.bfloat16, device=device))
+                        indices_to_update.append((i, agent_to_idx[a]))
+                    
+            if obs_to_encode:
+                obs_tensor = torch.stack(obs_to_encode)
+                with torch.autocast(device_type='cuda', dtype=torch.bfloat16):
+                    _, next_v = actor_net.encode_state(obs_tensor)
+                
+                for list_idx, (env_idx, agent_idx) in enumerate(indices_to_update):
+                    next_value[env_idx, agent_idx] = next_v[list_idx].float().squeeze(-1)
+            
+        lastgaelam = 0
+        for t in reversed(range(args.num_steps)):
+            if t == args.num_steps - 1:
+                nextnonterminal = 1.0 - next_done
+                nextvalues = next_value
+            else:
+                nextnonterminal = 1.0 - buf['dones'][t + 1]
+                nextvalues = buf['values'][t + 1]
+            delta = buf['rewards'][t] + args.gamma * nextvalues * nextnonterminal - buf['values'][t]
+            buf['advantages'][t] = lastgaelam = delta + args.gamma * args.gae_lambda * nextnonterminal * lastgaelam
+        buf['returns'] = buf['advantages'] + buf['values']
+        
+        inference_stream.synchronize()
+
+        worker_stats[0] = env_step_time
+        worker_stats[1] = gpu_forward_time
+        worker_stats[2] = local_proposed
+        worker_stats[3] = local_dropped
+    
+        rollout_complete_event.set()
+        buffer_idx = 1 - buffer_idx
+
 def main():
     mp.set_start_method('spawn', force=True)
     dist.init_process_group(backend="nccl")
@@ -388,238 +614,30 @@ def main():
     # Double-buffering architecture masks CPU environment latency behind GPU backpropagation
     buffers = {0: create_buffer(), 1: create_buffer()}
     
-    rollout_complete_event = threading.Event()
-    update_complete_event = threading.Event()
+    rollout_complete_event = mp.Event()
+    update_complete_event = mp.Event()
     update_complete_event.set() 
 
     thread_stats = {"env_time": 0.0, "gpu_fwd_time": 0.0, "proposed": 0, "dropped": 0}
+
+    actor_net.share_memory()
+    bc_baseline_net.share_memory()
+
+    worker_stats = torch.zeros(4, dtype=torch.float32, device=device)
     agent_to_idx = {a: i for i, a in enumerate(possible_agents)}
 
     inference_stream = torch.cuda.Stream(device=device)
 
-    def rollout_worker():
-        """Background thread responsible for filling the experience buffer asynchronously."""
-        torch.cuda.set_device(device) 
-        buffer_idx = 0
-        next_env_results = vec_env.reset()
-        next_done = torch.zeros((args.num_envs, NUM_AGENTS), device=device)
-        
-        for update in range(1, args.num_updates + 1):
-            update_complete_event.wait()
-            update_complete_event.clear()
-
-            num_learning = 3
-            learning_assignment = torch.zeros((args.num_envs, NUM_AGENTS), dtype=torch.bool, device=device)
-            for i in range(args.num_envs):
-                perm = torch.randperm(NUM_AGENTS, device=device)
-                learning_assignment[i, perm[:num_learning]] = True
-
-            current_progress = (update - 1) / max(1, args.num_updates - 1)
-
-            buf = buffers[buffer_idx]
-            with torch.cuda.stream(inference_stream):
-                buf['masks'].zero_()
-                buf['rewards'].zero_()
-                
-                env_step_time, gpu_forward_time = 0.0, 0.0
-                local_proposed, local_dropped = 0, 0
-            
-                for step in range(args.num_steps):
-                    buf['dones'][step] = next_done
-                    actions_to_send = [{} for _ in range(args.num_envs)]
-                    
-                    baseline_obs_list = []
-                    baseline_sparse_list = []
-                    baseline_metadata = []
-                    
-                    with torch.no_grad():
-                        for i in range(args.num_envs):
-                            if len(next_env_results[i]) == 3:
-                                obs_dict, infos_dict, active_agents = next_env_results[i]
-                            else:
-                                obs_dict, step_rewards, terms, truncs, infos_dict, active_agents = next_env_results[i]
-                                for a in possible_agents:
-                                    if learning_assignment[i, agent_to_idx[a]]:
-                                        buf['rewards'][step, i, agent_to_idx[a]] = step_rewards.get(a, 0.0)
-                                        next_done[i, agent_to_idx[a]] = float(terms.get(a, False))
-
-                            for a in active_agents:
-                                a_idx = agent_to_idx[a]
-                                obs_tensor = torch.tensor(obs_dict[a], dtype=torch.bfloat16, device=device)
-                                sparse_tensor = torch.tensor(infos_dict[a]['action_mask'], dtype=torch.int32)
-                                
-                                if learning_assignment[i, a_idx]:
-                                    buf['masks'][step, i, a_idx] = True
-                                    buf['obs'][step, i, a_idx] = obs_tensor
-                                    buf['sparse_masks'][step, i, a_idx] = sparse_tensor
-
-                                    if 'legality_metrics' in infos_dict[a]:
-                                        bad_indices = infos_dict[a]['legality_metrics'].get('illegal_prov_indices', [])
-                                        for bad_idx in bad_indices:
-                                            buf['unit_penalties'][step, i, a_idx, bad_idx] = -1.0
-                                        local_proposed += infos_dict[a]['legality_metrics'].get('proposed', 0)
-                                        local_dropped += infos_dict[a]['legality_metrics'].get('illegal_dropped', 0)
-                                else:
-                                    baseline_obs_list.append(obs_tensor)
-                                    baseline_sparse_list.append(sparse_tensor)
-                                    baseline_metadata.append((i, a))
-
-                        t_gpu_start = time.time()
-                        
-                        flat_obs = buf['obs'][step][buf['masks'][step]]
-                        if flat_obs.shape[0] > 0:
-                            active_sparse = buf['sparse_masks'][step][buf['masks'][step]]
-                            is_active_mask, packed_masks, padded_indices, max_decode_steps = rebuild_packed_masks(
-                                active_sparse, MAP_PROVINCES, VOCAB_SIZE, NONE_IDX, device
-                            )
-                            
-                            if max_decode_steps > 0:
-                                with torch.autocast(device_type='cuda', dtype=torch.bfloat16):
-                                    state_repr, values = actor_net.encode_state(flat_obs.to(dtype=torch.bfloat16))
-                                values = values.float()
-                                
-                                batch_size = flat_obs.size(0)
-                                final_actions = torch.full((batch_size, MAP_PROVINCES), NONE_IDX, dtype=torch.long, device=device)
-                                final_logprobs = torch.zeros((batch_size, MAP_PROVINCES), dtype=torch.float32, device=device)
-                                
-                                step_mask = torch.arange(max_decode_steps, device=device).unsqueeze(0) < is_active_mask.sum(dim=1, keepdim=True)
-                                current_action = torch.zeros(batch_size, dtype=torch.long, device=device)
-                                kv_cache = None
-                                batch_indices = torch.arange(batch_size, device=device)
-                                b_idx_expand = batch_indices.unsqueeze(1)
-                                active_states = state_repr[b_idx_expand, padded_indices, :]
-
-                                for decode_idx in range(max_decode_steps):
-                                    prov_indices = padded_indices[:, decode_idx]
-                                    valid_step = step_mask[:, decode_idx]
-                                    
-                                    with torch.autocast(device_type='cuda', dtype=torch.bfloat16):
-                                        logits, kv_cache = actor_net.decode_step(current_action, active_states, decode_idx, kv_cache)
-                                    
-                                    prov_mask = packed_masks[:, decode_idx, :]
-                                    pure_logits = logits.float().masked_fill(~prov_mask, -1e9)
-                                    true_dist = Categorical(logits=pure_logits)
-                                    
-                                    current_action = true_dist.sample()
-                                    current_action = current_action.clone() 
-                                    current_action[~valid_step] = NONE_IDX
-                                    
-                                    step_log_probs = true_dist.log_prob(current_action)
-                                    final_actions[batch_indices[valid_step], prov_indices[valid_step]] = current_action[valid_step]
-                                    final_logprobs[batch_indices[valid_step], prov_indices[valid_step]] = step_log_probs[valid_step]
-                                    
-                                buf['values'][step][buf['masks'][step]] = values.squeeze(-1)
-                                buf['logprobs'][step][buf['masks'][step]] = final_logprobs
-                                
-                                idx_counter = 0
-                                for i in range(args.num_envs):
-                                    for a in possible_agents:
-                                        if buf['masks'][step, i, agent_to_idx[a]]:
-                                            act_array = final_actions[idx_counter]
-                                            buf['actions'][step, i, agent_to_idx[a]] = act_array
-                                            actions_to_send[i][a] = act_array.cpu().numpy()
-                                            idx_counter += 1
-
-                        if baseline_obs_list:
-                            bc_obs_tensor = torch.stack(baseline_obs_list)
-                            bc_sparse_tensor = torch.stack(baseline_sparse_list).to(device)
-                            
-                            is_active_mask, packed_masks, padded_indices, max_decode_steps = rebuild_packed_masks(
-                                bc_sparse_tensor, MAP_PROVINCES, VOCAB_SIZE, NONE_IDX, device
-                            )
-                            
-                            if max_decode_steps > 0:
-                                with torch.autocast(device_type='cuda', dtype=torch.bfloat16):
-                                    state_repr, _ = bc_baseline_net.encode_state(bc_obs_tensor)
-                                    
-                                batch_size = bc_obs_tensor.size(0)
-                                bc_final_actions = torch.full((batch_size, MAP_PROVINCES), NONE_IDX, dtype=torch.long, device=device)
-                                
-                                step_mask = torch.arange(max_decode_steps, device=device).unsqueeze(0) < is_active_mask.sum(dim=1, keepdim=True)
-                                current_action = torch.zeros(batch_size, dtype=torch.long, device=device)
-                                kv_cache = None
-                                batch_indices = torch.arange(batch_size, device=device)
-                                b_idx_expand = batch_indices.unsqueeze(1)
-                                active_states = state_repr[b_idx_expand, padded_indices, :]
-
-                                for decode_idx in range(max_decode_steps):
-                                    prov_indices = padded_indices[:, decode_idx]
-                                    valid_step = step_mask[:, decode_idx]
-                                    
-                                    with torch.autocast(device_type='cuda', dtype=torch.bfloat16):
-                                        logits, kv_cache = bc_baseline_net.decode_step(current_action, active_states, decode_idx, kv_cache)
-                                    
-                                    prov_mask = packed_masks[:, decode_idx, :]
-                                    pure_logits = logits.float().masked_fill(~prov_mask, -1e9)
-                                    current_action = torch.argmax(pure_logits, dim=-1) # Greedy sample for BC proxy
-                                    current_action[~valid_step] = NONE_IDX
-                                    
-                                    bc_final_actions[batch_indices[valid_step], prov_indices[valid_step]] = current_action[valid_step]
-                                    
-                                for idx, (env_idx, agent_name) in enumerate(baseline_metadata):
-                                    actions_to_send[env_idx][agent_name] = bc_final_actions[idx].cpu().numpy()
-
-                        gpu_forward_time += (time.time() - t_gpu_start)
-
-                    t_env_start = time.time()
-                    progress_to_send = [(update - 1) / max(1, args.num_updates - 1) for _ in range(args.num_envs)]
-                    next_env_results = vec_env.step(actions_to_send, progress_to_send)
-                    env_step_time += (time.time() - t_env_start)
-
-            # Calculate GAE Advantages
-            with torch.no_grad():
-                next_value = torch.zeros((args.num_envs, NUM_AGENTS), device=device)
-                obs_to_encode = []
-                indices_to_update = []
-                
-                for i in range(args.num_envs):
-                    infos_dict = next_env_results[i][4]
-                    
-                    if '__terminal_observation' in infos_dict:
-                        obs_dict = infos_dict['__terminal_observation']
-                        active_agents_list = [a for a in possible_agents if a in obs_dict]
-                    else:
-                        obs_dict = next_env_results[i][0]
-                        active_agents_list = next_env_results[i][5]
-                    
-                    for a in active_agents_list:
-                        if a in obs_dict:
-                            obs_to_encode.append(torch.tensor(obs_dict[a], dtype=torch.bfloat16, device=device))
-                            indices_to_update.append((i, agent_to_idx[a]))
-                        
-                if obs_to_encode:
-                    obs_tensor = torch.stack(obs_to_encode)
-                    with torch.autocast(device_type='cuda', dtype=torch.bfloat16):
-                        _, next_v = actor_net.encode_state(obs_tensor)
-                    
-                    for list_idx, (env_idx, agent_idx) in enumerate(indices_to_update):
-                        next_value[env_idx, agent_idx] = next_v[list_idx].float().squeeze(-1)
-                
-            lastgaelam = 0
-            for t in reversed(range(args.num_steps)):
-                if t == args.num_steps - 1:
-                    nextnonterminal = 1.0 - next_done
-                    nextvalues = next_value
-                else:
-                    nextnonterminal = 1.0 - buf['dones'][t + 1]
-                    nextvalues = buf['values'][t + 1]
-                delta = buf['rewards'][t] + args.gamma * nextvalues * nextnonterminal - buf['values'][t]
-                buf['advantages'][t] = lastgaelam = delta + args.gamma * args.gae_lambda * nextnonterminal * lastgaelam
-            buf['returns'] = buf['advantages'] + buf['values']
-            
-            inference_stream.synchronize()
-
-            thread_stats["env_time"] = env_step_time
-            thread_stats["gpu_fwd_time"] = gpu_forward_time
-
-            thread_stats["proposed"] = local_proposed
-            thread_stats["dropped"] = local_dropped
-        
-            rollout_complete_event.set()
-            buffer_idx = 1 - buffer_idx
-
-    rollout_thread = threading.Thread(target=rollout_worker, daemon=True)
-    rollout_thread.start()
+    rollout_process = mp.Process(
+        target=rollout_worker, 
+        args=(
+            local_rank, device, args, buffers, actor_net, bc_baseline_net,
+            update_complete_event, rollout_complete_event, worker_stats,
+            NUM_AGENTS, MAP_PROVINCES, VOCAB_SIZE, NONE_IDX, possible_agents, agent_to_idx
+        ),
+        daemon=False
+    )
+    rollout_process.start()
 
     timestamp_list = [None]
     if global_rank == 0:
@@ -661,11 +679,10 @@ def main():
         torch.cuda.current_stream().synchronize()
 
         buf = buffers[buffer_idx]
-        env_step_time = thread_stats["env_time"]
-        gpu_forward_time = thread_stats["gpu_fwd_time"]
-
-        proposed_actions = thread_stats["proposed"]
-        illegal_dropped = thread_stats["dropped"]
+        env_step_time = worker_stats[0].item()
+        gpu_forward_time = worker_stats[1].item()
+        proposed_actions = int(worker_stats[2].item())
+        illegal_dropped = int(worker_stats[3].item())
 
         # Signal background thread to begin filling the alternate buffer
         update_complete_event.set()
@@ -730,6 +747,17 @@ def main():
         target_kl = 0.02
         global_avg_kl = 0.0
 
+        flat_bc_state_repr = torch.zeros((b_size, MAP_PROVINCES, net.module.d_model), dtype=torch.bfloat16, device=device)
+        
+        with torch.no_grad():
+            chunk_size = 1024
+            for start in range(0, b_size, chunk_size):
+                end = min(start + chunk_size, b_size)
+                chunk_obs = flat_obs[start:end].to(dtype=torch.bfloat16)
+                with torch.autocast(device_type='cuda', dtype=torch.bfloat16):
+                    c_repr, _ = bc_baseline_net.encode_state(chunk_obs)
+                flat_bc_state_repr[start:end] = c_repr
+
         for epoch in range(args.update_epochs):
             perm = torch.randperm(b_size, device=device)
             epoch_obs = flat_obs[perm]
@@ -740,6 +768,7 @@ def main():
             epoch_val = flat_val[perm]
             epoch_sparse = flat_sparse_masks[perm]
             epoch_unit_penalties = flat_unit_penalties[perm]
+            epoch_bc_repr = flat_bc_state_repr[perm]
 
             start_indices = list(range(0, b_size, mb_size))
             
@@ -750,6 +779,7 @@ def main():
                 end = start + mb_size
                 
                 mb_obs = epoch_obs[start:end].to(dtype=torch.bfloat16)
+                mb_bc_repr = epoch_bc_repr[start:end]
                 mb_act = epoch_act[start:end]
                 mb_logprobs = epoch_logprobs[start:end]
                 mb_adv = epoch_adv[start:end]
@@ -771,16 +801,16 @@ def main():
                 with my_context:
                     with torch.autocast(device_type='cuda', dtype=torch.bfloat16):
                         state_repr, new_val = net.module.encode_state(mb_obs)
-                        batch_size_mb = mb_obs.size(0)
-
-                        with torch.no_grad():
-                            bc_state_repr, _ = bc_baseline_net.encode_state(mb_obs)
 
                         if max_active > 0:
-                            active_logits_seq, padding_mask = net.module.decode_full(state_repr, mb_act, is_active_mask)
+                            active_logits_seq, padding_mask = net.module.decode_full(
+                                state_repr, mb_act, is_active_mask, padded_indices
+                            )
                             
                             with torch.no_grad():
-                                bc_logits_seq, _ = bc_baseline_net.decode_full(bc_state_repr, mb_act, is_active_mask)
+                                bc_logits_seq, _ = bc_baseline_net.decode_full(
+                                    mb_bc_repr, mb_act, is_active_mask, padded_indices
+                                )
                                 
                             bc_logits_seq = bc_logits_seq.float()
                             active_logits_seq = active_logits_seq.float()
@@ -791,7 +821,7 @@ def main():
                             bc_logits_seq = bc_logits_seq.masked_fill(~packed_masks, -1e8)
                             active_logits_seq = active_logits_seq.masked_fill(~packed_masks, -1e8)
                             
-                            b_idx_expand = torch.arange(batch_size_mb, device=device).unsqueeze(1)
+                            b_idx_expand = torch.arange(mb_act.size(0), device=device).unsqueeze(1)
                             packed_targets = mb_act[b_idx_expand, padded_indices]
                             
                             dist_cat = Categorical(logits=active_logits_seq)
@@ -835,7 +865,7 @@ def main():
                                 print(f"Target Actions:    {packed_targets[0][:5]}")
                                 print(f"Old Logprobs:      {packed_old_logprobs[0][:5]}")
                                 print(f"New Logprobs:      {logp_seq[0][:5]}")
-                                diff = (packed_old_logprobs - logp_seq).abs()
+                                diff = ((packed_old_logprobs - logp_seq) * valid_mask).abs()
                                 print(f"Max Diff in Batch: {diff.max().item():.4f}")
                                 print(f"Mean Diff:         {diff.mean().item():.4f}")
                             
@@ -970,6 +1000,7 @@ def main():
         EVAL_FREQ = 1
         
         if update % EVAL_FREQ == 0:
+            eval_start_time = time.time()
             torch.cuda.empty_cache()
             
             world_size = dist.get_world_size()
@@ -1000,9 +1031,11 @@ def main():
                 for i, power in enumerate(possible_agents):
                     print(f"  {power}: {local_eval_scs[i].item()} SCs")
                 print(f"  Average SCs: {avg_eval_sc:.2f}\n")
+                print(f"  Eval Duration: {eval_duration:.2f}s\n")
                 
                 wandb.log({
                     "Eval/Avg_SCs": avg_eval_sc,
+                    "Perf/Eval_Time_s": eval_duration, # Log it
                     "global_step": update * global_steps
                 }, step=update)
                 
@@ -1012,6 +1045,7 @@ def main():
             torch.cuda.empty_cache()
         
     vec_env.close()
+    rollout_process.join()
     if global_rank == 0:
         writer.close()
         wandb.finish()
