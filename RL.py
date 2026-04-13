@@ -266,7 +266,7 @@ def evaluate_against_baseline(live_net, baseline_net, device, update_num, live_p
 def parse_args():
     parser = argparse.ArgumentParser(description="PPO Training for Diplomacy")
     parser.add_argument("--num_envs", type=int, default=28, help="Number of parallel environments per GPU")
-    parser.add_argument("--num_steps", type=int, default=512, help="Number of steps per rollout")
+    parser.add_argument("--num_steps", type=int, default=1024, help="Number of steps per rollout")
     parser.add_argument("--num_updates", type=int, default=1000, help="Total number of PPO updates")
     parser.add_argument("--lr", type=float, default=1e-5, help="Learning rate")
     parser.add_argument("--gamma", type=float, default=0.99, help="Discount factor")
@@ -275,7 +275,7 @@ def parse_args():
     parser.add_argument("--ent_coef", type=float, default=0.001, help="Entropy coefficient")
     parser.add_argument("--v_coef", type=float, default=0.1, help="Value function loss coefficient")
     parser.add_argument("--kl_coef", type=float, default=0.05, help="KL divergence penalty coefficient")
-    parser.add_argument("--update_epochs", type=int, default=3, help="Number of epochs per PPO update")
+    parser.add_argument("--update_epochs", type=int, default=6, help="Number of epochs per PPO update")
     parser.add_argument("--bc_weights", type=str, default="diplomacy_transformer_bc.pth", help="Path to pre-trained Behavioral Cloning weights")
     parser.add_argument("--resume_weights", type=str, default=None, help="Path to RL checkpoint to resume training from")
     parser.add_argument("--bc_kl_coef", type=float, default=0.05, help="KL divergence penalty coefficient for behavioral cloning")
@@ -745,8 +745,8 @@ def main():
         t_update_start = time.time()
         net.train()
         
-        mb_size = 1024
-        accum_steps = 4
+        mb_size = 512
+        accum_steps = 8
         optimizer.zero_grad() 
 
         target_kl = 0.02
@@ -849,12 +849,8 @@ def main():
                             bc_log_probs = torch.log_softmax(bc_logits_seq, dim=-1)
                             bc_probs = torch.exp(bc_log_probs)
                             
-                            unit_bc_kl = torch.nn.functional.kl_div(
-                                live_log_probs,
-                                bc_log_probs,
-                                reduction='none',
-                                log_target=True
-                            ).sum(dim=-1)
+                            live_probs = torch.exp(live_log_probs)
+                            unit_bc_kl = (live_probs * (live_log_probs - bc_log_probs)).sum(dim=-1)
                             
                             unit_bc_kl = unit_bc_kl * valid_mask
                             total_valid_units = valid_mask.sum().clamp(min=1)
