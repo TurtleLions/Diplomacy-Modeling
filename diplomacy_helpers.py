@@ -533,9 +533,9 @@ class DiplomacyTransformerEnv(ParallelEnv):
         infos = {a: {'action_mask': get_sparse_action_mask(self.game, a, self.provinces, self.order_to_idx)} for a in self.agents}
         return observations, infos
 
-    def step(self, actions):
+    def step(self, actions, progress=0.0):
         self.step_count += 1
-        
+        anneal_factor = max(0.0, 1.0 - progress)
         prev_sc_counts = {a: len(self.game.get_centers(a)) for a in self.possible_agents}
         self.game.clear_orders()
 
@@ -625,19 +625,19 @@ class DiplomacyTransformerEnv(ParallelEnv):
             # Supply Center Deltas
             sc_delta = current_sc_count - prev_sc_counts.get(agent, 0)
             if sc_delta != 0:
-                rewards[agent] += sc_delta * 10.0
+                rewards[agent] += (sc_delta * 10.0) * anneal_factor
                         
             occupied_unowned_scs = 0
             for unit_str in agent_units:
                 prov_base = unit_str.split()[1].split('/')[0] 
                 if prov_base in all_map_scs and prov_base not in current_scs:
                     occupied_unowned_scs += 1
-            rewards[agent] += (occupied_unowned_scs * 1.0)
+            rewards[agent] += (occupied_unowned_scs * 1.0) * anneal_factor
                 
             # Dislodgement Penalty
             current_dislodged = current_state_dict.get('dislodged', {}).get(agent, [])
             if len(current_dislodged) > 0:
-                rewards[agent] -= (len(current_dislodged) * 0.5)
+                rewards[agent] -= (len(current_dislodged) * 0.5) * anneal_factor
                 
         # Terminal States & Truncation Multipliers
         if is_done:
