@@ -274,7 +274,7 @@ def parse_args():
     parser.add_argument("--ent_coef", type=float, default=0.001, help="Entropy coefficient")
     parser.add_argument("--v_coef", type=float, default=0.1, help="Value function loss coefficient")
     parser.add_argument("--kl_coef", type=float, default=0.05, help="KL divergence penalty coefficient")
-    parser.add_argument("--update_epochs", type=int, default=2, help="Number of epochs per PPO update")
+    parser.add_argument("--update_epochs", type=int, default=3, help="Number of epochs per PPO update")
     parser.add_argument("--bc_weights", type=str, default="diplomacy_transformer_bc.pth", help="Path to pre-trained Behavioral Cloning weights")
     parser.add_argument("--resume_weights", type=str, default=None, help="Path to RL checkpoint to resume training from")
     parser.add_argument("--bc_kl_coef", type=float, default=0.05, help="KL divergence penalty coefficient for behavioral cloning")
@@ -332,6 +332,7 @@ def main():
         net.load_state_dict(bc_state_dict, strict=False)
         
         actor_net.load_state_dict(net.state_dict())
+        bc_baseline_net.load_state_dict(bc_state_dict, strict=False)
 
         # Freeze reference models
         actor_net.eval()
