@@ -64,7 +64,7 @@ class KVCacheAttentionBlock(nn.Module):
             nn.Linear(dim_feedforward, d_model)
         )
 
-    def forward(self, x, kv_cache=None, padding_mask=None):
+    def forward(self, x, kv_cache=None, step_idx=None, padding_mask=None):
         batch_size, seq_len, _ = x.size()
         
         x_norm = self.norm1(x)
@@ -73,38 +73,39 @@ class KVCacheAttentionBlock(nn.Module):
         k = self.k_proj(x_norm).view(batch_size, seq_len, self.nhead, self.head_dim).transpose(1, 2)
         v = self.v_proj(x_norm).view(batch_size, seq_len, self.nhead, self.head_dim).transpose(1, 2)
 
-        if kv_cache is not None:
-            past_k, past_v = kv_cache
-            k = torch.cat([past_k, k], dim=2)
-            v = torch.cat([past_v, v], dim=2)
-        
-        new_kv_cache = (k, v)
+        if kv_cache is not None and step_idx is not None:
+            k_cache, v_cache = kv_cache
+            k_cache[:, :, step_idx:step_idx+seq_len, :] = k
+            v_cache[:, :, step_idx:step_idx+seq_len, :] = v
+            
+            k_out = k_cache[:, :, :step_idx+seq_len, :]
+            v_out = v_cache[:, :, :step_idx+seq_len, :]
+        else:
+            k_out, v_out = k, v
 
         # Build custom attention mask to handle causal + unit padding constraints
         if padding_mask is not None or seq_len > 1:
-            causal_mask = torch.tril(torch.ones((seq_len, k.size(2)), dtype=torch.bool, device=x.device))
+            causal_mask = torch.tril(torch.ones((seq_len, k_out.size(2)), dtype=torch.bool, device=x.device))
             causal_mask = causal_mask.unsqueeze(0).unsqueeze(1) # (1, 1, seq_len, total_seq_len)
             
             if padding_mask is not None:
                 valid_keys = (~padding_mask).unsqueeze(1).unsqueeze(2) # (batch, 1, 1, total_seq_len)
-                
                 is_query_padded = padding_mask.unsqueeze(1).unsqueeze(-1) # (batch, 1, seq_len, 1)
-                
                 attn_mask = causal_mask & (valid_keys | is_query_padded)
             else:
                 attn_mask = causal_mask
                 
-            attn_out = torch.nn.functional.scaled_dot_product_attention(q, k, v, attn_mask=attn_mask)
+            attn_out = torch.nn.functional.scaled_dot_product_attention(q, k_out, v_out, attn_mask=attn_mask)
         else:
             # Single step decoding without padding
-            attn_out = torch.nn.functional.scaled_dot_product_attention(q, k, v, is_causal=False)
+            attn_out = torch.nn.functional.scaled_dot_product_attention(q, k_out, v_out, is_causal=False)
         
         attn_out = attn_out.transpose(1, 2).reshape(batch_size, seq_len, self.d_model)
         
         x = x + self.out_proj(attn_out) 
         out = x + self.ffn(self.norm2(x))
         
-        return out, new_kv_cache
+        return out
 
 class DiplomacyTransformer(nn.Module):
     """
@@ -171,15 +172,26 @@ class DiplomacyTransformer(nn.Module):
         
         return current_state_repr, state_value
 
-    def decode_step(self, prev_action, active_state_repr, step_idx, kv_cache=None):
+    def init_kv_cache(self, batch_size, max_seq_len, device, dtype=torch.bfloat16):
+        """Pre-allocates the KV cache for fast in-place updates during autoregressive decoding."""
+        cache = []
+        nhead = self.decoder_layers[0].nhead
+        head_dim = self.decoder_layers[0].head_dim
+        for _ in range(len(self.decoder_layers)):
+            k_cache = torch.zeros((batch_size, nhead, max_seq_len, head_dim), dtype=dtype, device=device)
+            v_cache = torch.zeros((batch_size, nhead, max_seq_len, head_dim), dtype=dtype, device=device)
+            cache.append((k_cache, v_cache))
+        return cache
+
+    def decode_step(self, prev_action, active_state_repr, step_idx, kv_cache):
         """
         Executes a single step of autoregressive decoding for a specific active unit.
         active_state_repr: (batch_size, max_active_units, d_model) pre-gathered tensor.
+        kv_cache: Pre-allocated list of (k_cache, v_cache) tuples.
         """
         batch_size = active_state_repr.size(0)
         
-        if kv_cache is None:
-            kv_cache = [None] * len(self.decoder_layers)
+        if step_idx == 0:
             action_emb = self.start_token_embedding.expand(batch_size, -1, -1).squeeze(1)
         else:
             action_emb = self.action_embedding(prev_action)
@@ -187,13 +199,11 @@ class DiplomacyTransformer(nn.Module):
         unit_state = active_state_repr[:, step_idx, :]
         decoder_input = (action_emb + unit_state).unsqueeze(1)
         
-        new_kv_cache = []
         for i, layer in enumerate(self.decoder_layers):
-            decoder_input, layer_cache = layer(decoder_input, kv_cache[i])
-            new_kv_cache.append(layer_cache)
+            decoder_input = layer(decoder_input, kv_cache=kv_cache[i], step_idx=step_idx)
             
         logits = self.action_head(decoder_input.squeeze(1))
-        return logits, new_kv_cache
+        return logits
 
     def decode_full(self, state_repr, actions, active_mask, padded_indices, return_hidden=False):
         """
@@ -217,7 +227,7 @@ class DiplomacyTransformer(nn.Module):
             print(f"Max Units in Sequence: {max_units}")
             print(f"Active Mask Sums:      {active_mask.sum(dim=1)[:5]}")
             print(f"Packed Actions:        {active_acts[0][:5]}")
-            self._debug_printed = True # Ensure it only prints once
+            self._debug_printed = True
         
         seq_lengths = active_mask.sum(dim=1, keepdim=True)
         idx = torch.arange(max_units, device=state_repr.device).unsqueeze(0)
@@ -237,7 +247,7 @@ class DiplomacyTransformer(nn.Module):
 
         x = decoder_input
         for layer in self.decoder_layers:
-            x, _ = layer(x, kv_cache=None, padding_mask=padding_mask)
+            x = layer(x, kv_cache=None, padding_mask=padding_mask) 
         decoder_out = x
         
         if return_hidden:

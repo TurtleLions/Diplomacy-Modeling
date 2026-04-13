@@ -199,13 +199,14 @@ def evaluate_against_baseline(live_net, baseline_net, device, update_num, live_p
                 b_idx_expand = batch_indices.unsqueeze(1)
                 active_states = state_repr[b_idx_expand, padded_indices, :]
 
+                kv_cache = net.init_kv_cache(batch_size, max_decode_steps, net_device)
+
                 for decode_idx in range(max_decode_steps):
                     prov_indices = padded_indices[:, decode_idx]
                     valid_step = step_mask[:, decode_idx]
                     
                     with torch.autocast(device_type=autocast_device, dtype=torch.bfloat16):
-                        logits, kv_cache = net.decode_step(current_action, active_states, decode_idx, kv_cache)
-                    
+                        logits = net.decode_step(current_action, active_states, decode_idx, kv_cache)
                     prov_mask = packed_masks[:, decode_idx, :]
                     logits = logits.float().masked_fill(~prov_mask, -1e9)
                     
@@ -378,12 +379,14 @@ def rollout_worker(local_rank, device, args, buffers, actor_net, bc_baseline_net
                             b_idx_expand = batch_indices.unsqueeze(1)
                             active_states = state_repr[b_idx_expand, padded_indices, :]
 
+                            kv_cache = actor_net.init_kv_cache(batch_size, max_decode_steps, device)
+
                             for decode_idx in range(max_decode_steps):
                                 prov_indices = padded_indices[:, decode_idx]
                                 valid_step = step_mask[:, decode_idx]
                                 
                                 with torch.autocast(device_type='cuda', dtype=torch.bfloat16):
-                                    logits, kv_cache = actor_net.decode_step(current_action, active_states, decode_idx, kv_cache)
+                                    logits = actor_net.decode_step(current_action, active_states, decode_idx, kv_cache)
                                 
                                 prov_mask = packed_masks[:, decode_idx, :]
                                 pure_logits = logits.float().masked_fill(~prov_mask, -1e9)
@@ -431,12 +434,14 @@ def rollout_worker(local_rank, device, args, buffers, actor_net, bc_baseline_net
                             b_idx_expand = batch_indices.unsqueeze(1)
                             active_states = state_repr[b_idx_expand, padded_indices, :]
 
+                            kv_cache = bc_baseline_net.init_kv_cache(batch_size, max_decode_steps, device)
+
                             for decode_idx in range(max_decode_steps):
                                 prov_indices = padded_indices[:, decode_idx]
                                 valid_step = step_mask[:, decode_idx]
                                 
                                 with torch.autocast(device_type='cuda', dtype=torch.bfloat16):
-                                    logits, kv_cache = bc_baseline_net.decode_step(current_action, active_states, decode_idx, kv_cache)
+                                    logits = bc_baseline_net.decode_step(current_action, active_states, decode_idx, kv_cache)
                                 
                                 prov_mask = packed_masks[:, decode_idx, :]
                                 pure_logits = logits.float().masked_fill(~prov_mask, -1e9)
@@ -1026,7 +1031,7 @@ def main():
             
             if global_rank == 0:
                 avg_eval_sc = local_eval_scs.mean().item()
-                
+                eval_duration = time.time() - eval_start_time
                 print(f"\n--- Evaluation Results (Update {update}) ---")
                 for i, power in enumerate(possible_agents):
                     print(f"  {power}: {local_eval_scs[i].item()} SCs")
