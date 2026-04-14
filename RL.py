@@ -59,9 +59,14 @@ def rebuild_packed_masks(sparse_masks, num_provs, vocab_size, none_idx, device):
         padded_indices = torch.zeros((batch_size, 0), dtype=torch.long, device=device)
         return is_active_mask, packed_masks, padded_indices, max_active
         
-    active_cumsum = is_active_mask.cumsum(dim=1) - 1
+    noise = torch.rand((batch_size, num_provs), device=device)
+    
+    noise.masked_fill_(~is_active_mask, float('inf')) 
+    
+    ranks = noise.argsort(dim=1).argsort(dim=1)
+    
     prov_to_active_idx = torch.full((batch_size, num_provs), -1, dtype=torch.long, device=device)
-    prov_to_active_idx[is_active_mask] = active_cumsum[is_active_mask]
+    prov_to_active_idx[is_active_mask] = ranks[is_active_mask]
     
     padded_indices = torch.zeros((batch_size, max_active), dtype=torch.long, device=device)
     active_b_all, active_p_all = torch.where(is_active_mask)
@@ -265,8 +270,8 @@ def evaluate_against_baseline(live_net, baseline_net, device, update_num, live_p
 
 def parse_args():
     parser = argparse.ArgumentParser(description="PPO Training for Diplomacy")
-    parser.add_argument("--num_envs", type=int, default=28, help="Number of parallel environments per GPU")
-    parser.add_argument("--num_steps", type=int, default=1024, help="Number of steps per rollout")
+    parser.add_argument("--num_envs", type=int, default=21, help="Number of parallel environments per GPU")
+    parser.add_argument("--num_steps", type=int, default=512, help="Number of steps per rollout")
     parser.add_argument("--num_updates", type=int, default=1000, help="Total number of PPO updates")
     parser.add_argument("--lr", type=float, default=1e-5, help="Learning rate")
     parser.add_argument("--gamma", type=float, default=0.99, help="Discount factor")
@@ -745,8 +750,8 @@ def main():
         t_update_start = time.time()
         net.train()
         
-        mb_size = 512
-        accum_steps = 8
+        mb_size = 256
+        accum_steps = 16
         optimizer.zero_grad() 
 
         target_kl = 0.02

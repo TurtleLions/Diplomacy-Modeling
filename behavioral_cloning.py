@@ -323,16 +323,17 @@ def train_worker(rank, world_size, paths_and_metadata, args):
                     state_repr, _ = net.module.encode_state(history)
                     
                     if max_units > 0:
-                        # Decode Unit-Centric Sequence
-                        logits, padding_mask = net.module.decode_full(state_repr, targets, is_active_mask)
-                        
                         # Pack Targets and Dense Masks to align with the dynamic (B, max_units) shape
                         padded_indices = torch.zeros((batch_size, max_units), dtype=torch.long, device=rank)
                         for b in range(batch_size):
                             valid_idx = torch.where(is_active_mask[b])[0]
                             if len(valid_idx) > 0:
+                                valid_idx = valid_idx[torch.randperm(len(valid_idx), device=rank)]
                                 padded_indices[b, :len(valid_idx)] = valid_idx
-                                
+
+                        # Decode Unit-Centric Sequence        
+                        logits, padding_mask = net.module.decode_full(state_repr, targets, is_active_mask, padded_indices)
+                        
                         b_idx_expand = torch.arange(batch_size, device=rank).unsqueeze(1)
                         packed_targets = targets[b_idx_expand, padded_indices]
                         packed_masks = dense_mask[b_idx_expand, padded_indices, :]
