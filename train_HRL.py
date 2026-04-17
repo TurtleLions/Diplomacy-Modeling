@@ -184,8 +184,10 @@ def evaluate_against_baseline(live_net, baseline_net, device, update_num, live_p
     
     log_path = os.path.join(save_dir, f"eval_update_{update_num}_{live_power}_game_{game_index}.txt")
     
+    live_z_memory = {a: torch.zeros((1, 8, 256), dtype=torch.bfloat16, device=device) for a in env.possible_agents}
+
     # Helper function to process inference for a specific subset of agents
-    def get_actions(net, agents, net_device):
+    def get_actions(net, agents, net_device, is_baseline=False):
         if not agents:
             return {}
         
@@ -196,7 +198,6 @@ def evaluate_against_baseline(live_net, baseline_net, device, update_num, live_p
         MAP_PROVINCES = 82
         VOCAB_SIZE = 22231
         
-        # Materializing the dense mask here is safe and efficient due to the extremely small evaluation batch sizes (B <= 7).
         valid_mask = sparse_masks_tensor != -1
         row_offsets = torch.arange(B, device=net_device).unsqueeze(1) * (MAP_PROVINCES * VOCAB_SIZE)
         global_indices = sparse_masks_tensor + row_offsets
@@ -210,21 +211,26 @@ def evaluate_against_baseline(live_net, baseline_net, device, update_num, live_p
             autocast_device = 'cuda' if net_device.type == 'cuda' else 'cpu'
             with torch.autocast(device_type=autocast_device, dtype=torch.bfloat16):
                 
-                x_emb = net.worker.feature_projection(obs_tensor)
-                S_mu_encoded = net.worker.encoder_transformer(x_emb)
-                S_M = net.pooler(S_mu_encoded)
+                if is_baseline:
+                    z_eval = torch.zeros((B, 8, 256), dtype=torch.bfloat16, device=net_device)
+                else:
+                    x_emb = net.worker.feature_projection(obs_tensor)
+                    S_mu_encoded = net.worker.encoder_transformer(x_emb)
+                    S_M = net.pooler(S_mu_encoded)
 
-                real_H = torch.stack([torch.tensor(infos[a]['H_matrix'], dtype=torch.float32) for a in agents]).to(net_device)
-                dummy_z_prev = torch.zeros((B, 8, 256), dtype=torch.bfloat16, device=net_device)
-                
-                z_eval = net.manager(S_M, real_H, dummy_z_prev)
+                    real_H = torch.stack([torch.tensor(infos[a]['H_matrix'], dtype=torch.float32) for a in agents]).to(net_device)
+                    
+                    z_prev = torch.cat([live_z_memory[a] for a in agents], dim=0)
+                    
+                    z_eval = net.manager(S_M, real_H, z_prev)
+                    
+                    for i, a in enumerate(agents):
+                        live_z_memory[a] = z_eval[i].unsqueeze(0).detach()
 
                 logits, _ = net.worker(obs_tensor, z_eval, net.D)
                 
                 logits = torch.nan_to_num(logits, nan=-1e8, posinf=1e8, neginf=-1e8)
-                
                 logits = logits.float().masked_fill(~dense_mask, -1e20)
-                
                 final_actions = torch.argmax(logits, dim=-1)
                 
         return {a: final_actions[i].cpu().numpy() for i, a in enumerate(agents)}
@@ -245,8 +251,8 @@ def evaluate_against_baseline(live_net, baseline_net, device, update_num, live_p
             
             baseline_device = next(baseline_net.parameters()).device
             
-            live_actions = get_actions(live_net, live_agents, device)
-            baseline_actions = get_actions(baseline_net, baseline_agents, baseline_device)
+            live_actions = get_actions(live_net, live_agents, device, is_baseline=False)
+            baseline_actions = get_actions(baseline_net, baseline_agents, baseline_device, is_baseline=True)
             
             action_dict = {**live_actions, **baseline_actions}
             
@@ -397,7 +403,7 @@ def rollout_worker(local_rank, device, args, buffers, actor_net, bc_baseline_net
                             active_S_M = actor_net.pooler(S_mu_encoded)
                             
                             # Mamba Manager (Strategy generation)
-                            new_z = actor_net.manager(active_S_M, active_H, active_prev_z)
+                            new_z = actor_net.manager(active_S_M, active_H, active_z)
                             new_z = F.normalize(new_z.float(), p=2, dim=-1).to(torch.bfloat16)
                             
                             # Worker Decoder (One-Shot action generation)
@@ -854,16 +860,19 @@ def main():
                         current_beta = 2.0 
                         feudal_adv = mb_ret - (current_beta * distance_penalty)
                         
-                        if feudal_adv.shape[0] > 1:
-                            raw_manager_loss = F.mse_loss(predicted_z, manager_z_target.detach(), reduction='none').mean(dim=-1)
-                        else:
-                            manager_adv = feudal_adv - feudal_adv.mean()
-                            
                         dynamic_threshold = torch.quantile(distance_penalty, 0.80) 
                         failed_mask = distance_penalty > dynamic_threshold
 
                         manager_z_target = mb_z_float.clone()
                         manager_z_target[failed_mask] = z_achieved[failed_mask]
+
+                        raw_manager_loss = F.mse_loss(predicted_z, manager_z_target.detach(), reduction='none').mean(dim=-1)
+                        
+                        if feudal_adv.shape[0] > 1:
+                            manager_adv = (feudal_adv - feudal_adv.mean()) / (feudal_adv.std() + 1e-8)
+                        else:
+                            manager_adv = feudal_adv - feudal_adv.mean()
+
                         manager_loss = (raw_manager_loss * manager_adv.detach()).mean()
                         inv_loss = F.mse_loss(z_achieved, mb_z_float.detach())
 
