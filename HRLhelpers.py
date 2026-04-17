@@ -134,7 +134,7 @@ def get_sparse_action_mask(game, power, provinces, order_to_idx, max_len=MAX_SPA
     return sparse_mask
 
 def parse_state_to_tensor(turn_data, observing_agent=None):
-     """
+    """
     Parses a single game phase into a standardized geometric feature tensor.
     
     Feature Vector Layout (Dim: 46):

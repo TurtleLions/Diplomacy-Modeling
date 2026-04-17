@@ -196,6 +196,7 @@ def evaluate_against_baseline(live_net, baseline_net, device, update_num, live_p
         MAP_PROVINCES = 82
         VOCAB_SIZE = 22231
         
+        # Materializing the dense mask here is safe and efficient due to the extremely small evaluation batch sizes (B <= 7).
         valid_mask = sparse_masks_tensor != -1
         row_offsets = torch.arange(B, device=net_device).unsqueeze(1) * (MAP_PROVINCES * VOCAB_SIZE)
         global_indices = sparse_masks_tensor + row_offsets
@@ -413,21 +414,26 @@ def rollout_worker(local_rank, device, args, buffers, actor_net, bc_baseline_net
                         buf['H'][step][buf['masks'][step]] = active_H
 
                         active_sparse = buf['sparse_masks'][step][buf['masks'][step]]
-                        valid_mask = active_sparse != -1
-                        row_offsets = torch.arange(flat_obs.size(0), device=device).unsqueeze(1) * (MAP_PROVINCES * VOCAB_SIZE)
-                        global_indices = active_sparse + row_offsets
-                        valid_global_indices = global_indices[valid_mask]
                         
-                        dense_mask = torch.zeros(flat_obs.size(0) * MAP_PROVINCES * VOCAB_SIZE, dtype=torch.bool, device=device)
-                        dense_mask[valid_global_indices.long()] = True
-                        dense_mask = dense_mask.view(flat_obs.size(0), MAP_PROVINCES, VOCAB_SIZE)
+                        is_active_mask, packed_masks, padded_indices, max_active = rebuild_packed_masks(
+                            active_sparse, MAP_PROVINCES, VOCAB_SIZE, NONE_IDX, device
+                        )
                         
-                        logits = logits.float().masked_fill(~dense_mask, -1e9)
+                        # Extract only active logits to bypass the massive (B, 82, V) allocation
+                        active_logits = torch.gather(logits, 1, padded_indices.unsqueeze(-1).expand(-1, -1, VOCAB_SIZE))
+                        active_logits = active_logits.float().masked_fill(~packed_masks, -1e9)
                         
-                        # Sample all actions instantly
-                        dist_cat = Categorical(logits=logits)
-                        final_actions = dist_cat.sample()
-                        final_logprobs = dist_cat.log_prob(final_actions)
+                        # Sample actions only for active units
+                        dist_cat = Categorical(logits=active_logits)
+                        packed_actions = dist_cat.sample()
+                        packed_logprobs = dist_cat.log_prob(packed_actions)
+                        
+                        # Scatter results back to the full (B, 82) shape for the environment
+                        final_actions = torch.full((flat_obs.size(0), MAP_PROVINCES), NONE_IDX, dtype=torch.long, device=device)
+                        final_actions.scatter_(1, padded_indices, packed_actions)
+                        
+                        final_logprobs = torch.zeros((flat_obs.size(0), MAP_PROVINCES), dtype=torch.float32, device=device)
+                        final_logprobs.scatter_(1, padded_indices, packed_logprobs)
                         
                         buf['values'][step][buf['masks'][step]] = values
                         buf['logprobs'][step][buf['masks'][step]] = final_logprobs
@@ -876,20 +882,24 @@ def main():
                         logits, _ = net.module.worker(mb_obs, worker_z_target.to(torch.bfloat16), net.module.D)
                         logits = torch.nan_to_num(logits, nan=-1e8, posinf=1e8, neginf=-1e8)
                         
-                        valid_mask = mb_sparse_gpu != -1
-                        row_offsets = torch.arange(mb_obs.size(0), device=device).unsqueeze(1) * (MAP_PROVINCES * VOCAB_SIZE)
-                        global_indices = mb_sparse_gpu + row_offsets
-                        valid_global_indices = global_indices[valid_mask]
+                        is_active_mask, packed_masks, padded_indices, max_active = rebuild_packed_masks(
+                            mb_sparse_gpu, MAP_PROVINCES, VOCAB_SIZE, NONE_IDX, device
+                        )
                         
-                        dense_mask = torch.zeros(mb_obs.size(0) * MAP_PROVINCES * VOCAB_SIZE, dtype=torch.bool, device=device)
-                        dense_mask[valid_global_indices.long()] = True
-                        dense_mask = dense_mask.view(mb_obs.size(0), MAP_PROVINCES, VOCAB_SIZE)
+                        active_logits = torch.gather(logits, 1, padded_indices.unsqueeze(-1).expand(-1, -1, VOCAB_SIZE))
+                        active_logits = active_logits.float().masked_fill(~packed_masks, -1e9)
                         
-                        logits = logits.float().masked_fill(~dense_mask, -1e9)
+                        dist_cat = Categorical(logits=active_logits)
+                        mb_act_active = torch.gather(mb_act, 1, padded_indices)
+                        new_logprobs_active = dist_cat.log_prob(mb_act_active)
+                        entropy_seq_active = dist_cat.entropy()
                         
-                        dist_cat = Categorical(logits=logits)
-                        new_logprobs = dist_cat.log_prob(mb_act)
-                        entropy_seq = dist_cat.entropy()
+                        # Scatter back to full (B, 82) shape
+                        new_logprobs = torch.zeros_like(mb_logprobs)
+                        new_logprobs.scatter_(1, padded_indices, new_logprobs_active)
+                        
+                        entropy_seq = torch.zeros_like(mb_logprobs)
+                        entropy_seq.scatter_(1, padded_indices, entropy_seq_active)
 
                         is_active_mask_f = (mb_act != NONE_IDX).float()
                         total_valid_units = is_active_mask_f.sum().clamp(min=1)
@@ -914,20 +924,27 @@ def main():
                         with torch.no_grad():
                             bc_logits, _ = bc_baseline_net.worker(mb_obs, worker_z_target.to(torch.bfloat16), bc_baseline_net.D)
                             bc_logits = torch.nan_to_num(bc_logits, nan=-1e8, posinf=1e8, neginf=-1e8)
-                            bc_logits = bc_logits.float().masked_fill(~dense_mask, -1e9)
-                            bc_log_probs = torch.log_softmax(bc_logits, dim=-1)
                             
-                        live_log_probs = torch.log_softmax(logits, dim=-1)
-                        live_probs = torch.exp(live_log_probs)
+                            active_bc_logits = torch.gather(bc_logits, 1, padded_indices.unsqueeze(-1).expand(-1, -1, VOCAB_SIZE))
+                            active_bc_logits = active_bc_logits.float().masked_fill(~packed_masks, -1e9)
+                            bc_log_probs_active = torch.log_softmax(active_bc_logits, dim=-1)
+                            
+                        live_log_probs_active = torch.log_softmax(active_logits, dim=-1)
+                        live_probs_active = torch.exp(live_log_probs_active)
                         
-                        live_log_probs = torch.nan_to_num(live_log_probs, nan=0.0, posinf=0.0, neginf=-100.0)
-                        bc_log_probs = torch.nan_to_num(bc_log_probs, nan=0.0, posinf=0.0, neginf=-100.0)
-                        live_probs = torch.nan_to_num(live_probs, nan=0.0)
+                        live_log_probs_active = torch.nan_to_num(live_log_probs_active, nan=0.0, posinf=0.0, neginf=-100.0)
+                        bc_log_probs_active = torch.nan_to_num(bc_log_probs_active, nan=0.0, posinf=0.0, neginf=-100.0)
+                        live_probs_active = torch.nan_to_num(live_probs_active, nan=0.0)
                         
-                        bc_log_ratio = torch.clamp(live_log_probs - bc_log_probs, min=-20.0, max=20.0)
+                        bc_log_ratio_active = torch.clamp(live_log_probs_active - bc_log_probs_active, min=-20.0, max=20.0)
                         
-                        unit_bc_kl = (live_probs * bc_log_ratio).sum(dim=-1) 
-                        unit_bc_kl = torch.nan_to_num(unit_bc_kl, nan=0.0) * is_active_mask_f
+                        # Calculate KL natively in packed state, scatter, then mask out any edge cases
+                        unit_bc_kl_active = (live_probs_active * bc_log_ratio_active).sum(dim=-1) 
+                        unit_bc_kl_active = torch.nan_to_num(unit_bc_kl_active, nan=0.0)
+                        
+                        unit_bc_kl = torch.zeros_like(mb_logprobs)
+                        unit_bc_kl.scatter_(1, padded_indices, unit_bc_kl_active)
+                        unit_bc_kl = unit_bc_kl * is_active_mask_f
                         bc_kl_penalty = unit_bc_kl.sum() / total_valid_units
 
                         values_pred = net.module.value_head(mb_S_M.view(mb_S_M.size(0), -1)).squeeze(-1).float()
@@ -1025,7 +1042,6 @@ def main():
             writer.add_scalar("Reward/Extrinsic_Manager", avg_step_reward, update)
             writer.add_scalar("Reward/Avg_Episodic_Return", last_avg_ep_reward, update)
             writer.add_scalar("Reward/Intrinsic_Worker", avg_intrinsic_reward, update)
-            writer.add_scalar("Reward/Avg_Step_Reward", avg_step_reward, update)
             writer.add_scalar("Loss/Total_Loss", avg_total_loss, update)
             writer.add_scalar("Loss/PG_Surrogate", avg_pg_loss, update)
             writer.add_scalar("Loss/Manager_MSE", avg_manager_loss, update)
@@ -1039,7 +1055,6 @@ def main():
                 "Reward/Extrinsic_Manager": avg_step_reward,
                 "Reward/Avg_Episodic_Return": last_avg_ep_reward,
                 "Reward/Intrinsic_Worker": avg_intrinsic_reward,
-                "Reward/Avg_Step_Reward": avg_step_reward,
                 "Loss/Total_Loss": avg_total_loss,
                 "Loss/PG_Surrogate": avg_pg_loss,
                 "Loss/Manager_MSE": avg_manager_loss,
@@ -1061,6 +1076,7 @@ def main():
                         'optimizer_state_dict': optimizer.state_dict()
                     }
                     print(f"  -> Saved checkpoint to {ckpt_path}")
+                    torch.save(checkpoint, ckpt_path)
             
         EVAL_FREQ = 1
         
