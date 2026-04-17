@@ -1,0 +1,1148 @@
+"""
+Distributed Proximal Policy Optimization (PPO) pipeline for the Diplomacy Transformer.
+Features asynchronous environment rollouts, double-buffered experience collection to mask
+CPU latency, and multi-GPU training via Distributed Data Parallel (DDP).
+"""
+import os
+import time
+import datetime
+import argparse
+import threading
+import contextlib
+import torch.multiprocessing as mp  
+import multiprocessing.connection
+import random
+
+import numpy as np
+import torch
+import torch.nn as nn
+import torch.optim as optim
+import torch.distributed as dist
+import torch.nn.functional as F
+from torch.distributions import Categorical
+from torch.nn.parallel import DistributedDataParallel as DDP
+from torch.utils.tensorboard import SummaryWriter
+from diplomacy import Game
+
+import wandb
+from dotenv import load_dotenv
+from gymnasium.vector import AsyncVectorEnv
+
+from HRLhelpers import FeudalDiplomacyAgent, DiplomacyTransformerEnv, build_global_vocab, build_distance_matrix, InteractionMatrixTracker
+
+def rebuild_packed_masks(sparse_masks, num_provs, vocab_size, none_idx, device):
+    """
+    Directly builds the dynamically sized `packed_masks` and `is_active_mask` 
+    from sparse indices without materializing the massive (B, 82, V) dense tensor.
+    Fully vectorized for maximum GPU throughput.
+    """
+    batch_size = sparse_masks.size(0)
+    
+    valid_mask = sparse_masks != -1
+    valid_flat_indices = sparse_masks[valid_mask].long()
+    
+    b_indices = torch.arange(batch_size, device=device).view(batch_size, 1).expand(batch_size, sparse_masks.size(1))
+    valid_b_indices = b_indices[valid_mask]
+    
+    valid_prov_indices = valid_flat_indices // vocab_size
+    valid_action_indices = valid_flat_indices % vocab_size
+    
+    is_not_none = valid_action_indices != none_idx
+    active_b = valid_b_indices[is_not_none]
+    active_p = valid_prov_indices[is_not_none]
+    
+    is_active_mask = torch.zeros((batch_size, num_provs), dtype=torch.bool, device=device)
+    is_active_mask[active_b, active_p] = True
+    
+    max_active = is_active_mask.sum(dim=1).max().item()
+    
+    if max_active == 0:
+        packed_masks = torch.zeros((batch_size, 0, vocab_size), dtype=torch.bool, device=device)
+        padded_indices = torch.zeros((batch_size, 0), dtype=torch.long, device=device)
+        return is_active_mask, packed_masks, padded_indices, max_active
+        
+    noise = torch.rand((batch_size, num_provs), device=device)
+    
+    noise.masked_fill_(~is_active_mask, float('inf')) 
+    
+    ranks = noise.argsort(dim=1).argsort(dim=1)
+    
+    prov_to_active_idx = torch.full((batch_size, num_provs), -1, dtype=torch.long, device=device)
+    prov_to_active_idx[is_active_mask] = ranks[is_active_mask]
+    
+    padded_indices = torch.zeros((batch_size, max_active), dtype=torch.long, device=device)
+    active_b_all, active_p_all = torch.where(is_active_mask)
+    active_seq_idx = prov_to_active_idx[active_b_all, active_p_all]
+    padded_indices[active_b_all, active_seq_idx] = active_p_all
+    
+    a_idx = prov_to_active_idx[valid_b_indices, valid_prov_indices]
+    keep = a_idx != -1
+    kb = valid_b_indices[keep]
+    ka = a_idx[keep]
+    kact = valid_action_indices[keep]
+    
+    packed_masks = torch.zeros((batch_size, max_active, vocab_size), dtype=torch.bool, device=device)
+    packed_masks[kb, ka, kact] = True
+    
+    return is_active_mask, packed_masks, padded_indices, max_active
+
+def worker(remote, parent_remote):
+    """Background worker process for executing environment steps."""
+    torch.set_num_threads(1)
+    parent_remote.close()
+    env = DiplomacyTransformerEnv(history_length=1) 
+    
+    episode_rewards = {a: 0.0 for a in env.possible_agents}
+    
+    while True:
+        try:
+            cmd, data = remote.recv()
+            if cmd == 'step': 
+                action_dict, progress = data
+                obs, rewards, terms, truncs, infos = env.step(action_dict, progress=progress)
+                
+                for a, r in rewards.items():
+                    episode_rewards[a] += r
+                
+                env_is_done = len(terms) == 0 or all(terms.values()) or all(truncs.values()) or len(env.agents) == 0
+                
+                if env_is_done:
+                    terminal_obs = obs
+                    obs, infos_reset = env.reset()
+                    
+                    infos_reset['__terminal_observation'] = terminal_obs
+                    infos_reset['episode_reward'] = episode_rewards.copy()
+                    
+                    episode_rewards = {a: 0.0 for a in env.possible_agents}
+
+                    infos = infos_reset
+
+                remote.send((obs, rewards, terms, truncs, infos, env.agents))
+            elif cmd == 'reset': 
+                episode_rewards = {a: 0.0 for a in env.possible_agents}
+                remote.send((*env.reset(), env.agents))
+            elif cmd == 'close':
+                remote.close()
+                break
+        except EOFError: 
+            break
+        except Exception as e:
+            print(f"Worker process terminated unexpectedly: {e}")
+            remote.close()
+            break
+
+class SubprocVecDiplomacy:
+    """Asynchronous vector environment using multiprocessing pipes for parallel simulation."""
+    def __init__(self, num_envs):
+        self.num_envs = num_envs
+        self.remotes, self.work_remotes = zip(*[mp.Pipe() for _ in range(num_envs)])
+        self.ps = [mp.Process(target=worker, args=(work_remote, remote)) for (work_remote, remote) in zip(self.work_remotes, self.remotes)]
+        for p in self.ps:
+            p.daemon = True 
+            p.start()
+        for remote in self.work_remotes: 
+            remote.close()
+
+    def _gather_results(self):
+        """Safely polls ready pipes to prevent OS buffer lockups."""
+        results = [None] * self.num_envs
+        
+        # Keep a dictionary mapping each active remote to its original index
+        remotes_left = {remote: i for i, remote in enumerate(self.remotes)}
+        
+        while remotes_left:
+            ready_remotes = multiprocessing.connection.wait(remotes_left.keys())
+            
+            for remote in ready_remotes:
+                idx = remotes_left[remote]
+                results[idx] = remote.recv() # Clear the buffer instantly
+                del remotes_left[remote]     # Remove from the polling pool
+                
+        return results
+
+    def reset(self):
+        for remote in self.remotes: 
+            remote.send(('reset', None))
+        return self._gather_results()
+
+    def step(self, actions_list, progress_list):
+        for remote, action_dict, prog in zip(self.remotes, actions_list, progress_list): 
+            remote.send(('step', (action_dict, prog)))
+        return self._gather_results()
+        
+    def close(self):
+        for remote in self.remotes: 
+            remote.send(('close', None))
+        for p in self.ps: 
+            p.join()
+
+def evaluate_against_baseline(live_net, baseline_net, device, update_num, live_power, game_index, save_dir="./eval_games"):
+    """Runs a single evaluation game for a specific assigned power."""
+    os.makedirs(save_dir, exist_ok=True)
+    env = DiplomacyTransformerEnv(history_length=1)
+    obs, infos = env.reset()
+    
+    log_path = os.path.join(save_dir, f"eval_update_{update_num}_{live_power}_game_{game_index}.txt")
+    
+    # Helper function to process inference for a specific subset of agents
+    def get_actions(net, agents, net_device):
+        if not agents:
+            return {}
+        
+        obs_tensor = torch.stack([torch.tensor(obs[a][0]) for a in agents]).to(device=net_device, dtype=torch.bfloat16)
+        sparse_masks_tensor = torch.stack([torch.tensor(infos[a]['action_mask'], dtype=torch.long) for a in agents]).to(net_device)
+        
+        B = obs_tensor.size(0)
+        MAP_PROVINCES = 82
+        VOCAB_SIZE = 22231
+        
+        valid_mask = sparse_masks_tensor != -1
+        row_offsets = torch.arange(B, device=net_device).unsqueeze(1) * (MAP_PROVINCES * VOCAB_SIZE)
+        global_indices = sparse_masks_tensor + row_offsets
+        valid_global_indices = global_indices[valid_mask]
+        
+        dense_mask = torch.zeros(B * MAP_PROVINCES * VOCAB_SIZE, dtype=torch.bool, device=net_device)
+        dense_mask[valid_global_indices.long()] = True
+        dense_mask = dense_mask.view(B, MAP_PROVINCES, VOCAB_SIZE)
+        
+        with torch.no_grad():
+            autocast_device = 'cuda' if net_device.type == 'cuda' else 'cpu'
+            with torch.autocast(device_type=autocast_device, dtype=torch.bfloat16):
+                
+                x_emb = net.worker.feature_projection(obs_tensor)
+                S_mu_encoded = net.worker.encoder_transformer(x_emb)
+                S_M = net.pooler(S_mu_encoded)
+
+                dummy_H = torch.zeros((B, 7, 7), dtype=torch.float32, device=net_device)
+                dummy_z_prev = torch.zeros((B, 256), dtype=torch.bfloat16, device=net_device)
+
+                z_eval = net.manager(S_M, dummy_H, dummy_z_prev)
+
+                logits, _ = net.worker(obs_tensor, z_eval, net.D)
+                
+                logits = torch.nan_to_num(logits, nan=-1e8, posinf=1e8, neginf=-1e8)
+                
+                logits = logits.float().masked_fill(~dense_mask, -1e9)
+                
+                final_actions = torch.argmax(logits, dim=-1)
+                
+        return {a: final_actions[i].cpu().numpy() for i, a in enumerate(agents)}
+
+    with open(log_path, "w") as f:
+        f.write(f"Evaluation Game - Update {update_num} | Game {game_index}/10\n")
+        f.write(f"Live Network Power: {live_power} | Baseline Power: ALL OTHERS\n")
+        f.write("=" * 40 + "\n")
+        
+        step_count = 0
+        while len(env.agents) > 0 and step_count < 150:
+            phase_name = env.game.get_current_phase()
+            f.write(f"\n--- Phase {phase_name} ---\n")
+            active_agents = env.agents
+            
+            live_agents = [a for a in active_agents if a == live_power]
+            baseline_agents = [a for a in active_agents if a != live_power]
+            
+            baseline_device = next(baseline_net.parameters()).device
+            
+            live_actions = get_actions(live_net, live_agents, device)
+            baseline_actions = get_actions(baseline_net, baseline_agents, baseline_device)
+            
+            action_dict = {**live_actions, **baseline_actions}
+            
+            for agent in active_agents:
+                f.write(f"{agent} ({'LIVE' if agent == live_power else 'BASELINE'}) Orders\n")
+                orders_issued = False
+                for prov_idx, order_idx in enumerate(action_dict[agent]):
+                    order_str = env.idx_to_order[order_idx.item()]
+                    if order_str != 'NONE':
+                        f.write(f"  {order_str}\n")
+                        orders_issued = True
+                if not orders_issued:
+                    f.write("  (No valid orders)\n")
+                    
+            obs, rewards, terms, truncs, infos = env.step(action_dict)
+            step_count += 1
+            
+        f.write("\n" + "=" * 40 + "\n")
+        f.write("FINAL SUPPLY CENTER COUNTS\n")
+        
+        live_scs = 0
+        for agent in env.possible_agents:
+            scs = env.game.get_centers(agent)
+            count = len(scs)
+            if agent == live_power:
+                live_scs = count
+            f.write(f"{agent} ({'LIVE' if agent == live_power else 'BASELINE'}): {count}\n")
+            
+    return live_scs
+
+def parse_args():
+    parser = argparse.ArgumentParser(description="PPO Training for Diplomacy")
+    parser.add_argument("--num_envs", type=int, default=21, help="Number of parallel environments per GPU")
+    parser.add_argument("--num_steps", type=int, default=512, help="Number of steps per rollout")
+    parser.add_argument("--num_updates", type=int, default=1000, help="Total number of PPO updates")
+    parser.add_argument("--lr", type=float, default=1e-5, help="Learning rate")
+    parser.add_argument("--gamma", type=float, default=0.99, help="Discount factor")
+    parser.add_argument("--gae_lambda", type=float, default=0.95, help="GAE lambda parameter")
+    parser.add_argument("--clip_coef", type=float, default=0.2, help="PPO policy clipping coefficient")
+    parser.add_argument("--ent_coef", type=float, default=0.001, help="Entropy coefficient")
+    parser.add_argument("--v_coef", type=float, default=0.1, help="Value function loss coefficient")
+    parser.add_argument("--kl_coef", type=float, default=0.05, help="KL divergence penalty coefficient")
+    parser.add_argument("--update_epochs", type=int, default=4, help="Number of epochs per PPO update")
+    parser.add_argument("--bc_weights", type=str, default="feudal_agent_bc.pth", help="Path to pre-trained Behavioral Cloning weights")
+    parser.add_argument("--resume_weights", type=str, default=None, help="Path to RL checkpoint to resume training from")
+    parser.add_argument("--bc_kl_coef", type=float, default=0.05, help="KL divergence penalty coefficient for behavioral cloning")
+    return parser.parse_args()
+
+def rollout_worker(local_rank, device, args, buffers, actor_net, bc_baseline_net, 
+                   update_complete_event, rollout_complete_event, worker_stats, 
+                   NUM_AGENTS, MAP_PROVINCES, VOCAB_SIZE, NONE_IDX, possible_agents, agent_to_idx):
+    """Background process responsible for filling the experience buffer asynchronously."""
+    torch.cuda.set_device(device) 
+    inference_stream = torch.cuda.Stream(device=device)
+    
+    vec_env = SubprocVecDiplomacy(num_envs=args.num_envs)
+    
+    buffer_idx = 0
+    next_env_results = vec_env.reset()
+    next_done = torch.zeros((args.num_envs, NUM_AGENTS), device=device)
+    
+    batch_H = torch.zeros((args.num_envs, NUM_AGENTS, 7, 7), dtype=torch.float32, device=device)
+    batch_z = torch.zeros((args.num_envs, NUM_AGENTS, 256), dtype=torch.bfloat16, device=device)
+    batch_prev_z = torch.zeros((args.num_envs, NUM_AGENTS, 256), dtype=torch.bfloat16, device=device)
+    batch_S_M = torch.zeros((args.num_envs, NUM_AGENTS, 8, 256), dtype=torch.bfloat16, device=device)
+
+    for update in range(1, args.num_updates + 1):
+        update_complete_event.wait()
+        update_complete_event.clear()
+
+        num_learning = 3
+        learning_assignment = torch.zeros((args.num_envs, NUM_AGENTS), dtype=torch.bool, device=device)
+        for i in range(args.num_envs):
+            perm = torch.randperm(NUM_AGENTS, device=device)
+            learning_assignment[i, perm[:num_learning]] = True
+
+        current_progress = (update - 1) / max(1, args.num_updates - 1)
+
+        buf = buffers[buffer_idx]
+        with torch.cuda.stream(inference_stream):
+            buf['masks'].zero_()
+            buf['rewards'].zero_()
+            
+            env_step_time, gpu_forward_time = 0.0, 0.0
+            local_proposed, local_dropped = 0, 0
+            local_ep_reward_sum, local_ep_count = 0.0, 0
+        
+            for step in range(args.num_steps):
+                buf['dones'][step] = next_done
+                actions_to_send = [{} for _ in range(args.num_envs)]
+                
+                baseline_obs_list = []
+                baseline_sparse_list = []
+                baseline_metadata = []
+                
+                with torch.no_grad():
+                    for i in range(args.num_envs):
+                        if len(next_env_results[i]) == 3:
+                            obs_dict, infos_dict, active_agents = next_env_results[i]
+                        else:
+                            obs_dict, step_rewards, terms, truncs, infos_dict, active_agents = next_env_results[i]
+                            for a in possible_agents:
+                                if learning_assignment[i, agent_to_idx[a]]:
+                                    buf['rewards'][step, i, agent_to_idx[a]] = step_rewards.get(a, 0.0)
+                                    next_done[i, agent_to_idx[a]] = float(terms.get(a, False))
+
+                        if '__terminal_observation' in infos_dict and 'episode_reward' in infos_dict:
+                            for r in infos_dict['episode_reward'].values():
+                                local_ep_reward_sum += r
+                                local_ep_count += 1
+
+                        for a in active_agents:
+                            a_idx = agent_to_idx[a]
+                            obs_tensor = torch.tensor(obs_dict[a][0], dtype=torch.bfloat16, device=device)
+                            sparse_tensor = torch.tensor(infos_dict[a]['action_mask'], dtype=torch.int32)
+                            
+                            if learning_assignment[i, a_idx]:
+                                buf['masks'][step, i, a_idx] = True
+                                buf['obs'][step, i, a_idx] = obs_tensor
+                                buf['sparse_masks'][step, i, a_idx] = sparse_tensor
+
+                                if 'legality_metrics' in infos_dict[a]:
+                                    bad_indices = infos_dict[a]['legality_metrics'].get('illegal_prov_indices', [])
+                                    for bad_idx in bad_indices:
+                                        buf['unit_penalties'][step, i, a_idx, bad_idx] = -1.0
+                                    local_proposed += infos_dict[a]['legality_metrics'].get('proposed', 0)
+                                    local_dropped += infos_dict[a]['legality_metrics'].get('illegal_dropped', 0)
+                            else:
+                                baseline_obs_list.append(obs_tensor)
+                                baseline_sparse_list.append(sparse_tensor)
+                                baseline_metadata.append((i, a))
+
+                    t_gpu_start = time.time()
+
+                    flat_obs = buf['obs'][step][buf['masks'][step]]
+                    if flat_obs.shape[0] > 0:
+                        
+                        active_H = batch_H[buf['masks'][step]]
+                        active_z = batch_z[buf['masks'][step]]
+                        active_prev_z = batch_prev_z[buf['masks'][step]]
+                        
+                        with torch.autocast(device_type='cuda', dtype=torch.bfloat16):
+                            x_emb = actor_net.worker.feature_projection(flat_obs)
+                            S_mu_encoded = actor_net.worker.encoder_transformer(x_emb)
+                            active_S_M = actor_net.pooler(S_mu_encoded)
+                            
+                            # Mamba Manager (Strategy generation)
+                            new_z = actor_net.manager(active_S_M, active_H, active_prev_z)
+                            new_z = F.normalize(new_z.float(), p=2, dim=-1).to(torch.bfloat16)
+                            
+                            # Worker Decoder (One-Shot action generation)
+                            logits, _ = actor_net.worker(flat_obs, new_z, actor_net.D)
+                            
+                            values = actor_net.value_head(active_S_M.view(active_S_M.size(0), -1)).squeeze(-1).float()
+                        
+                        # Update persistent tensors
+                        batch_S_M[buf['masks'][step]] = active_S_M
+                        batch_prev_z[buf['masks'][step]] = active_z
+                        batch_z[buf['masks'][step]] = new_z
+                        
+                        # Record to buffer
+                        buf['S_M'][step][buf['masks'][step]] = active_S_M
+                        buf['z'][step][buf['masks'][step]] = new_z
+                        buf['prev_z'][step][buf['masks'][step]] = active_z
+                        buf['H'][step][buf['masks'][step]] = active_H
+
+                        active_sparse = buf['sparse_masks'][step][buf['masks'][step]]
+                        valid_mask = active_sparse != -1
+                        row_offsets = torch.arange(flat_obs.size(0), device=device).unsqueeze(1) * (MAP_PROVINCES * VOCAB_SIZE)
+                        global_indices = active_sparse + row_offsets
+                        valid_global_indices = global_indices[valid_mask]
+                        
+                        dense_mask = torch.zeros(flat_obs.size(0) * MAP_PROVINCES * VOCAB_SIZE, dtype=torch.bool, device=device)
+                        dense_mask[valid_global_indices.long()] = True
+                        dense_mask = dense_mask.view(flat_obs.size(0), MAP_PROVINCES, VOCAB_SIZE)
+                        
+                        logits = logits.float().masked_fill(~dense_mask, -1e9)
+                        
+                        # Sample all actions instantly
+                        dist_cat = Categorical(logits=logits)
+                        final_actions = dist_cat.sample()
+                        final_logprobs = dist_cat.log_prob(final_actions)
+                        
+                        buf['values'][step][buf['masks'][step]] = values
+                        buf['logprobs'][step][buf['masks'][step]] = final_logprobs
+                        
+                        idx_counter = 0
+                        for i in range(args.num_envs):
+                            for a in possible_agents:
+                                if buf['masks'][step, i, agent_to_idx[a]]:
+                                    act_array = final_actions[idx_counter]
+                                    buf['actions'][step, i, agent_to_idx[a]] = act_array
+                                    actions_to_send[i][a] = act_array.cpu().numpy()
+                                    idx_counter += 1
+                                    
+                    if baseline_obs_list:
+                        bc_obs_tensor = torch.stack(baseline_obs_list)
+                        bc_sparse_tensor = torch.stack(baseline_sparse_list).to(device)
+                        
+                        with torch.no_grad():
+                            with torch.autocast(device_type='cuda', dtype=torch.bfloat16):
+                                # Baseline receives a dummy 0 strategy vector
+                                bc_z = torch.zeros(bc_obs_tensor.size(0), 256, device=device, dtype=torch.bfloat16)
+                                bc_logits, _ = bc_baseline_net.worker(bc_obs_tensor, bc_z, bc_baseline_net.D)
+
+                            # Fast One-Shot Masking for Baseline
+                            valid_mask_bc = bc_sparse_tensor != -1
+                            row_offsets_bc = torch.arange(bc_obs_tensor.size(0), device=device).unsqueeze(1) * (MAP_PROVINCES * VOCAB_SIZE)
+                            global_indices_bc = bc_sparse_tensor + row_offsets_bc
+                            valid_global_indices_bc = global_indices_bc[valid_mask_bc]
+
+                            dense_mask_bc = torch.zeros(bc_obs_tensor.size(0) * MAP_PROVINCES * VOCAB_SIZE, dtype=torch.bool, device=device)
+                            dense_mask_bc[valid_global_indices_bc.long()] = True
+                            dense_mask_bc = dense_mask_bc.view(bc_obs_tensor.size(0), MAP_PROVINCES, VOCAB_SIZE)
+
+                            bc_logits = bc_logits.float().masked_fill(~dense_mask_bc, -1e9)
+                            bc_final_actions = torch.argmax(bc_logits, dim=-1) # Greedy sample for BC proxy
+
+                        for idx, (env_idx, agent_name) in enumerate(baseline_metadata):
+                            actions_to_send[env_idx][agent_name] = bc_final_actions[idx].cpu().numpy()
+
+                    gpu_forward_time += (time.time() - t_gpu_start)
+
+                t_env_start = time.time()
+                progress_to_send = [(update - 1) / max(1, args.num_updates - 1) for _ in range(args.num_envs)]
+                next_env_results = vec_env.step(actions_to_send, progress_to_send)
+                env_step_time += (time.time() - t_env_start)
+
+        # Calculate GAE Advantages
+        with torch.no_grad():
+            next_value = torch.zeros((args.num_envs, NUM_AGENTS), device=device)
+            obs_to_encode = []
+            indices_to_update = []
+            
+            for i in range(args.num_envs):
+                infos_dict = next_env_results[i][4]
+                
+                if '__terminal_observation' in infos_dict:
+                    obs_dict = infos_dict['__terminal_observation']
+                    active_agents_list = [a for a in possible_agents if a in obs_dict]
+                else:
+                    obs_dict = next_env_results[i][0]
+                    active_agents_list = next_env_results[i][5]
+                
+                for a in active_agents_list:
+                    if a in obs_dict:
+                        obs_to_encode.append(torch.tensor(obs_dict[a][0], dtype=torch.bfloat16, device=device))
+                        indices_to_update.append((i, agent_to_idx[a]))
+                    
+            if obs_to_encode:
+                obs_tensor = torch.stack(obs_to_encode)
+                next_v = torch.zeros(obs_tensor.size(0), 1, dtype=torch.float32, device=device)
+                
+                for list_idx, (env_idx, agent_idx) in enumerate(indices_to_update):
+                    next_value[env_idx, agent_idx] = next_v[list_idx].float().squeeze(-1)
+            
+        lastgaelam = 0
+        for t in reversed(range(args.num_steps)):
+            if t == args.num_steps - 1:
+                nextnonterminal = 1.0 - next_done
+                nextvalues = next_value
+            else:
+                nextnonterminal = 1.0 - buf['dones'][t + 1]
+                nextvalues = buf['values'][t + 1]
+            delta = buf['rewards'][t] + args.gamma * nextvalues * nextnonterminal - buf['values'][t]
+            buf['advantages'][t] = lastgaelam = delta + args.gamma * args.gae_lambda * nextnonterminal * lastgaelam
+        buf['returns'] = buf['advantages'] + buf['values']
+        
+        inference_stream.synchronize()
+
+        worker_stats[0] = env_step_time
+        worker_stats[1] = gpu_forward_time
+        worker_stats[2] = local_proposed
+        worker_stats[3] = local_dropped
+        worker_stats[4] = local_ep_reward_sum
+        worker_stats[5] = local_ep_count
+    
+        rollout_complete_event.set()
+        buffer_idx = 1 - buffer_idx
+
+def main():
+    mp.set_start_method('spawn', force=True)
+    dist.init_process_group(backend="nccl")
+    local_rank = int(os.environ["LOCAL_RANK"])
+    global_rank = int(os.environ["RANK"])
+    device = torch.device(f"cuda:{local_rank}")
+    torch.cuda.set_device(device)
+    torch.set_num_threads(1)
+
+    args = parse_args()
+
+    NUM_AGENTS = 7
+    HISTORY_LENGTH = 1
+
+    if global_rank == 0:
+        print("--- Initiating Distributed PPO Pipeline ---")
+        load_dotenv()
+        wandb_key = os.environ.get("WANDB_KEY")
+        if wandb_key:
+            wandb.login(key=wandb_key)
+        else:
+            print("Warning: WANDB_KEY not found in .env file.")
+
+    if global_rank == 0:
+        # Rank 0 builds the vocabulary cache file for all workers
+        build_global_vocab() 
+        
+    dist.barrier() 
+
+    # Initialize environment metadata
+    dummy_env = DiplomacyTransformerEnv()
+    possible_agents = dummy_env.possible_agents
+    MAP_PROVINCES = dummy_env.num_provinces
+    VOCAB_SIZE = dummy_env.vocab_size
+    NONE_IDX = dummy_env.order_to_idx['NONE']
+    del dummy_env
+
+    if global_rank == 0:
+        print(f"Environment Initialized: {MAP_PROVINCES} Provinces | Action Space: {VOCAB_SIZE}")
+
+    vec_env = SubprocVecDiplomacy(num_envs=args.num_envs)
+    
+    # Model Initialization
+    net = FeudalDiplomacyAgent(d_model=256, vocab_size=VOCAB_SIZE).to(device)
+    actor_net = FeudalDiplomacyAgent(d_model=256, vocab_size=VOCAB_SIZE).to(device)
+    bc_baseline_net = FeudalDiplomacyAgent(d_model=256, vocab_size=VOCAB_SIZE).to(device)
+
+    
+    temp_game = Game()
+    provinces = sorted([p.upper() for p in list(temp_game.map.locs)])
+    
+    D_matrix = build_distance_matrix(provinces).to(device)
+    net.D.copy_(D_matrix)
+    actor_net.D.copy_(D_matrix)
+    bc_baseline_net.D.copy_(D_matrix)
+    
+    if os.path.exists(args.bc_weights):
+        bc_state_dict = torch.load(args.bc_weights, map_location=device)
+        net.load_state_dict(bc_state_dict, strict=False)
+        
+        actor_net.load_state_dict(net.state_dict())
+        bc_baseline_net.load_state_dict(bc_state_dict, strict=False)
+
+        # Freeze reference models
+        actor_net.eval()
+        for param in actor_net.parameters(): param.requires_grad = False
+            
+        if global_rank == 0: 
+            print("Successfully loaded pre-trained BC weights for policy initialization.")
+
+    loaded_opt_state = None
+    start_update = 1
+
+    if args.resume_weights and os.path.exists(args.resume_weights):
+        checkpoint = torch.load(args.resume_weights, map_location=device)
+        
+        if 'model_state_dict' in checkpoint:
+            net.load_state_dict(checkpoint['model_state_dict'], strict=False)
+            actor_net.load_state_dict(checkpoint['model_state_dict'], strict=False)
+            loaded_opt_state = checkpoint['optimizer_state_dict']
+            
+            start_update = checkpoint.get('update', 0) + 1 
+        else:
+            net.load_state_dict(checkpoint, strict=False)
+            actor_net.load_state_dict(checkpoint, strict=False)
+            
+        if global_rank == 0:
+            print(f"Successfully resumed RL training from checkpoint: {args.resume_weights}")
+
+    net = DDP(net, device_ids=[local_rank])
+    
+    optimizer = optim.Adam(net.parameters(), lr=args.lr, eps=1e-5)
+    
+    if loaded_opt_state is not None:
+        optimizer.load_state_dict(loaded_opt_state)
+        if global_rank == 0:
+            print("Successfully restored Optimizer momentum and variance states.")
+
+    def create_buffer():
+        """Creates a memory-pinned tensor buffer for experience collection."""
+        return {
+            'obs': torch.zeros((args.num_steps, args.num_envs, NUM_AGENTS, 82, 46), dtype=torch.bfloat16, device=device),
+            'actions': torch.zeros((args.num_steps, args.num_envs, NUM_AGENTS, 82), dtype=torch.long, device=device),
+            'logprobs': torch.zeros((args.num_steps, args.num_envs, NUM_AGENTS, 82), dtype=torch.float32, device=device),
+            'rewards': torch.zeros((args.num_steps, args.num_envs, NUM_AGENTS), dtype=torch.float32, device=device),
+            'dones': torch.zeros((args.num_steps, args.num_envs, NUM_AGENTS), dtype=torch.float32, device=device),
+            'values': torch.zeros((args.num_steps, args.num_envs, NUM_AGENTS), dtype=torch.float32, device=device),
+            'masks': torch.zeros((args.num_steps, args.num_envs, NUM_AGENTS), dtype=torch.bool, device=device),
+            'sparse_masks': torch.full((args.num_steps, args.num_envs, NUM_AGENTS, 4000), -1, dtype=torch.int32, device=device),
+            'advantages': torch.zeros((args.num_steps, args.num_envs, NUM_AGENTS), dtype=torch.float32, device=device),
+            'returns': torch.zeros((args.num_steps, args.num_envs, NUM_AGENTS), dtype=torch.float32, device=device),
+            'S_M': torch.zeros((args.num_steps, args.num_envs, NUM_AGENTS, 8, 256), dtype=torch.bfloat16, device=device),
+            'S_M_next': torch.zeros((args.num_steps, args.num_envs, NUM_AGENTS, 8, 256), dtype=torch.bfloat16, device=device),
+            'z': torch.zeros((args.num_steps, args.num_envs, NUM_AGENTS, 256), dtype=torch.bfloat16, device=device),
+            'prev_z': torch.zeros((args.num_steps, args.num_envs, NUM_AGENTS, 256), dtype=torch.bfloat16, device=device),
+            'H': torch.zeros((args.num_steps, args.num_envs, NUM_AGENTS, 7, 7), dtype=torch.float32, device=device),
+            'unit_penalties': torch.zeros((args.num_steps, args.num_envs, NUM_AGENTS, 82), dtype=torch.float32, device=device)
+        }
+        
+    # Double-buffering architecture masks CPU environment latency behind GPU backpropagation
+    buffers = {0: create_buffer(), 1: create_buffer()}
+    
+    rollout_complete_event = threading.Event()
+    update_complete_event = threading.Event()
+    update_complete_event.set() 
+
+    thread_stats = {"env_time": 0.0, "gpu_fwd_time": 0.0, "proposed": 0, "dropped": 0}
+
+    actor_net.share_memory()
+    bc_baseline_net.share_memory()
+
+    worker_stats = torch.zeros(6, dtype=torch.float32, device=device)
+    last_avg_ep_reward = 0.0
+    agent_to_idx = {a: i for i, a in enumerate(possible_agents)}
+
+    inference_stream = torch.cuda.Stream(device=device)
+
+    rollout_process = threading.Thread(target=rollout_worker, args=(
+        local_rank, device, args, buffers, actor_net, bc_baseline_net,
+        update_complete_event, rollout_complete_event, worker_stats,
+        NUM_AGENTS, MAP_PROVINCES, VOCAB_SIZE, NONE_IDX, possible_agents, agent_to_idx
+    ))
+    rollout_process.start()
+
+    timestamp_list = [None]
+    if global_rank == 0:
+        timestamp_list[0] = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
+        
+    dist.broadcast_object_list(timestamp_list, src=0)
+    timestamp = timestamp_list[0]
+
+    run_name = f"ppo_run_{timestamp}"
+    base_dir = f"/data/restanislao/model_runs/{run_name}"
+    ckpt_dir = os.path.join(base_dir, "checkpoints")
+    eval_dir = os.path.join(base_dir, "eval_games")
+
+    if global_rank == 0:
+        os.makedirs(ckpt_dir, exist_ok=True)
+        os.makedirs(eval_dir, exist_ok=True)
+        
+        writer = SummaryWriter(log_dir=f"/data/restanislao/tb_runs/{run_name}")
+        wandb.init(
+            project="diplomacy-ppo",
+            name=run_name,
+            config=vars(args),
+            dir="/data/restanislao/wandb"
+        )
+
+    dist.barrier()
+
+    buffer_idx = 0
+    for update in range(1, args.num_updates + 1):
+        start_time = time.time()
+        
+        # Await experience buffer completion
+        rollout_complete_event.wait()
+        rollout_complete_event.clear()
+        
+        with torch.no_grad():
+            for param, actor_param in zip(net.module.parameters(), actor_net.parameters()):
+                actor_param.data.copy_(param)
+        torch.cuda.current_stream().synchronize()
+
+        buf = buffers[buffer_idx]
+        env_step_time = worker_stats[0].item()
+        gpu_forward_time = worker_stats[1].item()
+        proposed_actions = int(worker_stats[2].item())
+        illegal_dropped = int(worker_stats[3].item())
+
+        # Signal background thread to begin filling the alternate buffer
+        update_complete_event.set()
+        inference_stream.wait_stream(torch.cuda.current_stream())
+        
+        valid = buf['masks'].view(-1)
+        flat_obs = buf['obs'].view(-1, MAP_PROVINCES, 46)[valid] 
+        flat_act = buf['actions'].view(-1, MAP_PROVINCES)[valid]
+        flat_logprobs = buf['logprobs'].view(-1, MAP_PROVINCES)[valid]
+        flat_adv = buf['advantages'].view(-1)[valid]
+        flat_ret = buf['returns'].view(-1)[valid]
+        flat_sparse_masks = buf['sparse_masks'].view(-1, 4000)[valid]
+        
+        flat_S_M = buf['S_M'].view(-1, 8, 256)[valid]
+        flat_S_M_next = buf['S_M_next'].view(-1, 8, 256)[valid]
+        flat_z = buf['z'].view(-1, 256)[valid]
+        flat_prev_z = buf['prev_z'].view(-1, 256)[valid]
+        flat_H = buf['H'].view(-1, 7, 7)[valid]
+
+        b_size = flat_obs.shape[0]
+        
+        # DDP min-batch synchronization to prevent NCCL hanging
+        local_b_size = torch.tensor([b_size], dtype=torch.long, device=device)
+        dist.all_reduce(local_b_size, op=dist.ReduceOp.MIN)
+        min_b_size = local_b_size.item()
+
+        if b_size > min_b_size:
+            perm = torch.randperm(b_size, device=device)
+            flat_obs = flat_obs[perm][:min_b_size]
+            flat_act = flat_act[perm][:min_b_size]
+            flat_logprobs = flat_logprobs[perm][:min_b_size]
+            flat_adv = flat_adv[perm][:min_b_size]
+            flat_ret = flat_ret[perm][:min_b_size]
+            flat_sparse_masks = flat_sparse_masks[perm][:min_b_size]
+            
+            flat_S_M = flat_S_M[perm][:min_b_size]
+            flat_S_M_next = flat_S_M_next[perm][:min_b_size]
+            flat_z = flat_z[perm][:min_b_size]
+            flat_prev_z = flat_prev_z[perm][:min_b_size]
+            flat_H = flat_H[perm][:min_b_size]
+            b_size = min_b_size
+
+        # Advantage Normalization across GPUs
+        if flat_adv.shape[0] > 1:
+            local_sum, local_sq_sum = flat_adv.sum(), (flat_adv ** 2).sum()
+            local_count = torch.tensor(flat_adv.shape[0], dtype=torch.float32, device=device)
+        else:
+            local_sum = local_sq_sum = local_count = torch.tensor(0.0, device=device)
+            
+        stats = torch.stack([local_sum, local_sq_sum, local_count])
+        dist.all_reduce(stats, op=dist.ReduceOp.SUM)
+
+        if stats[2] > 1:
+            global_mean = stats[0] / stats[2]
+            global_var = (stats[1] / stats[2]) - (global_mean ** 2)
+            global_std = torch.sqrt(torch.clamp(global_var, min=1e-8))
+            flat_adv = (flat_adv - global_mean) / (global_std + 1e-8)
+
+        t_update_start = time.time()
+        net.train()
+        
+        mb_size = 256
+        accum_steps = 16
+        optimizer.zero_grad() 
+
+        epoch_pg_loss_sum = 0.0
+        epoch_manager_loss_sum = 0.0
+        epoch_inv_loss_sum = 0.0
+        epoch_bc_kl_sum = 0.0
+        epoch_entropy_sum = 0.0
+        epoch_total_loss_sum = 0.0
+        epoch_intrinsic_reward_sum = 0.0
+        track_steps = 0
+
+        target_kl = 0.02
+        global_avg_kl = 0.0
+
+        for epoch in range(args.update_epochs):
+            perm = torch.randperm(b_size, device=device)
+            epoch_obs = flat_obs[perm]
+            epoch_act = flat_act[perm]
+            epoch_logprobs = flat_logprobs[perm]
+            epoch_adv = flat_adv[perm]
+            epoch_ret = flat_ret[perm]
+            epoch_sparse = flat_sparse_masks[perm]
+            
+            epoch_S_M = flat_S_M[perm]
+            epoch_S_M_next = flat_S_M_next[perm]
+            epoch_z = flat_z[perm]
+            epoch_prev_z = flat_prev_z[perm]
+            epoch_H = flat_H[perm]
+
+            start_indices = list(range(0, b_size, mb_size))
+            epoch_kl_sum, epoch_kl_steps = 0.0, 0
+
+            for step_idx, start in enumerate(start_indices):
+                end = start + mb_size
+                
+                mb_obs = epoch_obs[start:end].to(dtype=torch.bfloat16)
+                mb_act = epoch_act[start:end]
+                mb_logprobs = epoch_logprobs[start:end]
+                mb_adv = epoch_adv[start:end]
+                mb_ret = epoch_ret[start:end]
+                mb_sparse_gpu = epoch_sparse[start:end].to(device)
+                
+                mb_S_M = epoch_S_M[start:end].to(dtype=torch.bfloat16)
+                mb_S_M_next = epoch_S_M_next[start:end].to(dtype=torch.bfloat16)
+                mb_z = epoch_z[start:end].to(dtype=torch.bfloat16)
+                mb_prev_z = epoch_prev_z[start:end].to(dtype=torch.bfloat16)
+                mb_H = epoch_H[start:end]
+
+                is_last_batch = (step_idx + 1) == len(start_indices)
+                sync_this_step = (step_idx + 1) % accum_steps == 0 or is_last_batch
+                my_context = net.no_sync() if not sync_this_step else contextlib.nullcontext()
+                
+                with my_context:
+                    with torch.autocast(device_type='cuda', dtype=torch.bfloat16):
+                        
+                        # ==========================================================
+                        # --- A. FEUDAL MANAGER & INVERSE MODEL (Calculate Reality)
+                        # ==========================================================
+                        z_achieved = net.module.inverse_model(mb_S_M, mb_S_M_next)
+                        predicted_z = net.module.manager(mb_S_M, mb_H, mb_prev_z)
+
+                        # Force L2 Normalization
+                        z_achieved = F.normalize(z_achieved.float(), p=2, dim=-1)
+                        predicted_z = F.normalize(predicted_z.float(), p=2, dim=-1)
+                        mb_z_float = mb_z.float()
+
+                        # Manager Penalty (Did it ask for something impossible?)
+                        distance_penalty = (z_achieved - mb_z_float).pow(2).sum(dim=-1)
+
+                        # Manager's Extrinsic Advantage
+                        current_beta = 2.0 
+                        feudal_adv = mb_ret - (current_beta * distance_penalty)
+                        
+                        if feudal_adv.shape[0] > 1:
+                            manager_adv = (feudal_adv - feudal_adv.mean()) / (feudal_adv.std(unbiased=False) + 1e-5)
+                        else:
+                            manager_adv = feudal_adv - feudal_adv.mean()
+                            
+                        # Manager Loss (L2 distance to achieved state if failed, otherwise follow predicted)
+                        dynamic_threshold = torch.quantile(distance_penalty, 0.80) 
+                        failed_mask = distance_penalty > dynamic_threshold
+
+                        manager_z_target = mb_z_float.clone()
+                        manager_z_target[failed_mask] = z_achieved[failed_mask]
+                        manager_loss = F.mse_loss(predicted_z, manager_z_target.detach())
+                        inv_loss = F.mse_loss(z_achieved, mb_z_float.detach())
+
+                        # ==========================================================
+                        # --- B. HINDSIGHT EXPERIENCE REPLAY (HER) RELABELING
+                        # ==========================================================
+                        worker_z_target = mb_z_float.clone()
+                        
+                        # 50% chance to apply HER to failed transitions
+                        her_prob = torch.rand(worker_z_target.size(0), device=device) < 0.5
+                        relabel_mask = failed_mask & her_prob
+                        
+                        # RELABEL: "You missed the goal, but let's pretend you were aiming for what you hit."
+                        worker_z_target[relabel_mask] = z_achieved[relabel_mask].detach()
+                        
+                        # Worker's Intrinsic Reward (Negative L2 distance to the HER relabeled target)
+                        # If HER was applied, distance is 0.0 (Max Intrinsic Reward)
+                        intrinsic_reward = -1.0 * (z_achieved.detach() - worker_z_target).pow(2).sum(dim=-1)
+
+                        epoch_intrinsic_reward_sum += intrinsic_reward.mean().item() # <--- ADD THIS
+                        
+                        if intrinsic_reward.shape[0] > 1:
+                            intrinsic_adv = (intrinsic_reward - intrinsic_reward.mean()) / (intrinsic_reward.std(unbiased=False) + 1e-5)
+                        else:
+                            intrinsic_adv = intrinsic_reward - intrinsic_reward.mean()
+
+                        # ==========================================================
+                        # --- C. ONE-SHOT WORKER INFERENCE (Using Relabeled Goal)
+                        # ==========================================================
+                        # Notice we pass `worker_z_target` instead of `mb_z`!
+                        logits, _ = net.module.worker(mb_obs, worker_z_target.to(torch.bfloat16), net.module.D)
+                        logits = torch.nan_to_num(logits, nan=-1e8, posinf=1e8, neginf=-1e8)
+                        
+                        valid_mask = mb_sparse_gpu != -1
+                        row_offsets = torch.arange(mb_obs.size(0), device=device).unsqueeze(1) * (MAP_PROVINCES * VOCAB_SIZE)
+                        global_indices = mb_sparse_gpu + row_offsets
+                        valid_global_indices = global_indices[valid_mask]
+                        
+                        dense_mask = torch.zeros(mb_obs.size(0) * MAP_PROVINCES * VOCAB_SIZE, dtype=torch.bool, device=device)
+                        dense_mask[valid_global_indices.long()] = True
+                        dense_mask = dense_mask.view(mb_obs.size(0), MAP_PROVINCES, VOCAB_SIZE)
+                        
+                        logits = logits.float().masked_fill(~dense_mask, -1e9)
+                        
+                        dist_cat = Categorical(logits=logits)
+                        new_logprobs = dist_cat.log_prob(mb_act)
+                        entropy_seq = dist_cat.entropy()
+
+                        # ==========================================================
+                        # --- D. WORKER PPO SURROGATE LOSS (Using Intrinsic Adv)
+                        # ==========================================================
+                        is_active_mask_f = (mb_act != NONE_IDX).float()
+                        total_valid_units = is_active_mask_f.sum().clamp(min=1)
+                        
+                        new_logprobs = torch.nan_to_num(new_logprobs, nan=0.0)
+                        unit_new_logprobs = new_logprobs * is_active_mask_f
+                        unit_old_logprobs = mb_logprobs * is_active_mask_f
+                        unit_ratios = torch.exp(unit_new_logprobs - unit_old_logprobs)
+                        
+                        # Expand Intrinsic Advantage across the 82 provinces
+                        adv_expanded = intrinsic_adv.unsqueeze(1).expand_as(unit_ratios)
+                        unit_specific_adv = adv_expanded * is_active_mask_f
+                        
+                        pg_loss1 = -unit_specific_adv * unit_ratios
+                        pg_loss2 = -unit_specific_adv * torch.clamp(unit_ratios, 1 - args.clip_coef, 1 + args.clip_coef)
+                        
+                        pg_loss = (torch.max(pg_loss1, pg_loss2) * is_active_mask_f).sum() / total_valid_units
+                        entropy = (entropy_seq * is_active_mask_f).sum() / total_valid_units
+                        
+                        log_ratio = torch.clamp(unit_new_logprobs - unit_old_logprobs, min=-20.0, max=20.0) * is_active_mask_f
+                        kl_divergence = ((torch.exp(log_ratio) - 1.0 - log_ratio) * is_active_mask_f).sum() / total_valid_units
+
+                        # ==========================================================
+                        # --- E. BEHAVIORAL CLONING KL PENALTY
+                        # ==========================================================
+                        with torch.no_grad():
+                            bc_logits, _ = bc_baseline_net.worker(mb_obs, worker_z_target.to(torch.bfloat16), bc_baseline_net.D)
+                            bc_logits = torch.nan_to_num(bc_logits, nan=-1e8, posinf=1e8, neginf=-1e8)
+                            bc_logits = bc_logits.float().masked_fill(~dense_mask, -1e9)
+                            bc_log_probs = torch.log_softmax(bc_logits, dim=-1)
+                            
+                        live_log_probs = torch.log_softmax(logits, dim=-1)
+                        live_probs = torch.exp(live_log_probs)
+                        
+                        live_log_probs = torch.nan_to_num(live_log_probs, nan=0.0, posinf=0.0, neginf=-100.0)
+                        bc_log_probs = torch.nan_to_num(bc_log_probs, nan=0.0, posinf=0.0, neginf=-100.0)
+                        live_probs = torch.nan_to_num(live_probs, nan=0.0)
+                        
+                        bc_log_ratio = torch.clamp(live_log_probs - bc_log_probs, min=-20.0, max=20.0)
+                        
+                        unit_bc_kl = (live_probs * bc_log_ratio).sum(dim=-1) 
+                        unit_bc_kl = torch.nan_to_num(unit_bc_kl, nan=0.0) * is_active_mask_f
+                        bc_kl_penalty = unit_bc_kl.sum() / total_valid_units
+
+                        # ==========================================================
+                        # --- F. COMBINED LOSS & BACKPROP (With Value Head)
+                        # ==========================================================
+                        values_pred = net.module.value_head(mb_S_M.view(mb_S_M.size(0), -1)).squeeze(-1).float()
+                        v_loss = F.mse_loss(values_pred, mb_ret.float())
+                        
+                        unscaled_loss = pg_loss - (args.ent_coef * entropy) + manager_loss + inv_loss + (args.bc_kl_coef * bc_kl_penalty) + (args.v_coef * v_loss)
+
+                        epoch_pg_loss_sum += pg_loss.item()
+                        epoch_manager_loss_sum += manager_loss.item()
+                        epoch_inv_loss_sum += inv_loss.item()
+                        epoch_bc_kl_sum += bc_kl_penalty.item() 
+                        epoch_entropy_sum += entropy.item()
+                        epoch_total_loss_sum += unscaled_loss.item()
+                        track_steps += 1
+
+                        current_block_start = (step_idx // accum_steps) * accum_steps
+                        current_block_end = min(current_block_start + accum_steps, len(start_indices))
+                        actual_accum_steps = current_block_end - current_block_start
+                        
+                        loss = unscaled_loss / actual_accum_steps
+                        loss.backward()
+
+                if sync_this_step:
+                    nn.utils.clip_grad_norm_(net.parameters(), 0.5)
+                    optimizer.step()
+                    optimizer.zero_grad()
+                
+                epoch_kl_sum += kl_divergence.item()
+                epoch_kl_steps += 1
+
+            local_epoch_kl = epoch_kl_sum / max(1, epoch_kl_steps)
+            epoch_kl_tensor = torch.tensor([local_epoch_kl], device=device)
+            dist.all_reduce(epoch_kl_tensor, op=dist.ReduceOp.SUM)
+            global_epoch_kl = epoch_kl_tensor.item() / dist.get_world_size()
+            
+            global_avg_kl = global_epoch_kl
+            
+            if global_epoch_kl > target_kl * 1.5:
+                if global_rank == 0:
+                    print(f"Early stopping triggered at epoch {epoch+1} due to high KL: {global_epoch_kl:.4f}")
+                break
+            
+        args.kl_coef = max(0.0001, min(5.0, args.kl_coef))
+
+        local_metrics = torch.tensor([
+            epoch_pg_loss_sum / max(1, track_steps),
+            epoch_manager_loss_sum / max(1, track_steps),
+            epoch_inv_loss_sum / max(1, track_steps),
+            epoch_bc_kl_sum / max(1, track_steps),
+            epoch_entropy_sum / max(1, track_steps),
+            epoch_total_loss_sum / max(1, track_steps),
+            epoch_intrinsic_reward_sum / max(1, track_steps),
+            worker_stats[4].item(),
+            worker_stats[5].item()
+        ], device=device)
+
+        dist.all_reduce(local_metrics, op=dist.ReduceOp.SUM)
+        global_metrics = local_metrics[:7] / dist.get_world_size()
+
+        avg_pg_loss = global_metrics[0].item()
+        avg_manager_loss = global_metrics[1].item()
+        avg_inv_loss = global_metrics[2].item()
+        avg_bc_kl = global_metrics[3].item()
+        avg_entropy = global_metrics[4].item()
+        avg_total_loss = global_metrics[5].item()
+        avg_intrinsic_reward = global_metrics[6].item()
+        global_ep_reward_sum = local_metrics[7].item()
+        global_ep_count = local_metrics[8].item()
+
+        if global_ep_count > 0:
+            last_avg_ep_reward = global_ep_reward_sum / global_ep_count
+
+        update_time = time.time() - t_update_start
+        buffer_idx = 1 - buffer_idx
+        
+        if global_rank == 0:
+            total_time = time.time() - start_time
+            global_steps = args.num_envs * args.num_steps * NUM_AGENTS * dist.get_world_size()
+            sps = int(global_steps / total_time)  
+            total_active_steps = buf['masks'].sum().item()
+            if total_active_steps > 0:
+                avg_step_reward = buf['rewards'].sum().item() / total_active_steps
+            else:
+                avg_step_reward = 0.0
+
+            illegal_rate = (illegal_dropped / max(1, proposed_actions)) * 100.0
+            
+            print(f"Update {update}/{args.num_updates} | SPS: {sps} | Ext. Reward (Manager): {avg_step_reward:.2f} | Int. Reward (Worker): {avg_intrinsic_reward:.4f}")
+            print(f"  CPU Time: {env_step_time:.2f}s | GPU Fwd: {gpu_forward_time:.2f}s | Bwd: {update_time:.2f}s")
+            print(f"  Components -> Total Loss: {avg_total_loss:.4f} | PG: {avg_pg_loss:.4f} | Manager: {avg_manager_loss:.4f} | Inv: {avg_inv_loss:.4f} | BC_KL: {avg_bc_kl:.4f}")
+            print(f"  Legality Audit: {proposed_actions - illegal_dropped}/{proposed_actions} legal actions ({illegal_rate:.1f}% illegal)")
+            print(f"  Avg Episode Return: {last_avg_ep_reward:.2f} (Completed {int(global_ep_count)} episodes this update)")
+
+            writer.add_scalar("Perf/SPS", sps, update)
+            writer.add_scalar("Reward/Extrinsic_Manager", avg_step_reward, update)
+            writer.add_scalar("Reward/Avg_Episodic_Return", last_avg_ep_reward, update)
+            writer.add_scalar("Reward/Intrinsic_Worker", avg_intrinsic_reward, update)
+            writer.add_scalar("Reward/Avg_Step_Reward", avg_step_reward, update)
+            writer.add_scalar("Loss/Total_Loss", avg_total_loss, update)
+            writer.add_scalar("Loss/PG_Surrogate", avg_pg_loss, update)
+            writer.add_scalar("Loss/Manager_MSE", avg_manager_loss, update)
+            writer.add_scalar("Loss/Inverse_MSE", avg_inv_loss, update)
+            writer.add_scalar("Loss/BC_KL_Penalty", avg_bc_kl, update)
+            writer.add_scalar("Loss/Entropy", avg_entropy, update)
+            writer.add_scalar("Metrics/Illegal_Action_Rate", illegal_rate, update)
+
+            wandb.log({
+                "Perf/SPS": sps,
+                "Reward/Extrinsic_Manager": avg_step_reward,
+                "Reward/Avg_Episodic_Return": last_avg_ep_reward,
+                "Reward/Intrinsic_Worker": avg_intrinsic_reward,
+                "Reward/Avg_Step_Reward": avg_step_reward,
+                "Loss/Total_Loss": avg_total_loss,
+                "Loss/PG_Surrogate": avg_pg_loss,
+                "Loss/Manager_MSE": avg_manager_loss,
+                "Loss/Inverse_MSE": avg_inv_loss,
+                "Loss/BC_KL_Penalty": avg_bc_kl,
+                "Loss/Entropy": avg_entropy,
+                "Loss/KL_Div": global_avg_kl,
+                "Metrics/Illegal_Action_Rate": illegal_rate,
+                "Metrics/Proposed_Actions": proposed_actions,
+                "global_step": update * global_steps,
+            }, step=update)
+
+            if update % 1 == 0:
+                ckpt_path = os.path.join(ckpt_dir, f"diplomacy_APPO_update_{update}.pth")
+                if global_rank == 0:
+                    checkpoint = {
+                        'update': update,
+                        'model_state_dict': net.module.state_dict(),
+                        'optimizer_state_dict': optimizer.state_dict()
+                    }
+                    print(f"  -> Saved checkpoint to {ckpt_path}")
+            
+        EVAL_FREQ = 1
+        
+        if update % EVAL_FREQ == 0:
+            eval_start_time = time.time()
+            torch.cuda.empty_cache()
+            
+            world_size = dist.get_world_size()
+            my_powers = [p for i, p in enumerate(possible_agents) if i % world_size == global_rank]
+            
+            local_eval_scs = torch.zeros(NUM_AGENTS, dtype=torch.float32, device=device)
+            
+            net.eval()
+            for power in my_powers:
+                sc = evaluate_against_baseline(
+                    live_net=net.module,
+                    baseline_net=bc_baseline_net,
+                    device=device, 
+                    update_num=update, 
+                    live_power=power, 
+                    game_index=1, 
+                    save_dir=eval_dir
+                )
+                local_eval_scs[agent_to_idx[power]] = float(sc)
+            net.train()
+
+            dist.all_reduce(local_eval_scs, op=dist.ReduceOp.SUM)
+            
+            if global_rank == 0:
+                avg_eval_sc = local_eval_scs.mean().item()
+                eval_duration = time.time() - eval_start_time
+                print(f"\n--- Evaluation Results (Update {update}) ---")
+                for i, power in enumerate(possible_agents):
+                    print(f"  {power}: {local_eval_scs[i].item()} SCs")
+                print(f"  Average SCs: {avg_eval_sc:.2f}\n")
+                print(f"  Eval Duration: {eval_duration:.2f}s\n")
+                
+                wandb.log({
+                    "Eval/Avg_SCs": avg_eval_sc,
+                    "Perf/Eval_Time_s": eval_duration, # Log it
+                    "global_step": update * global_steps
+                }, step=update)
+                
+                for i, power in enumerate(possible_agents):
+                    wandb.log({f"Eval/{power}_SCs": local_eval_scs[i].item()}, step=update)
+                    
+            torch.cuda.empty_cache()
+        
+    vec_env.close()
+    rollout_process.join()
+    if global_rank == 0:
+        writer.close()
+        wandb.finish()
+    dist.destroy_process_group()
+
+if __name__ == "__main__":
+    main()
