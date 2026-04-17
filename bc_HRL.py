@@ -94,7 +94,7 @@ worker_order_to_idx = None
 worker_num_provs = None
 worker_none_idx = None
 worker_vocab_size = None
-worker_max_mask_len = 1200
+worker_max_mask_len = 4000
 
 def init_worker(p_idx, o_idx, n_provs, n_idx, v_size):
     signal.signal(signal.SIGINT, signal.SIG_IGN)
@@ -289,7 +289,7 @@ def process_and_save_to_disk(json_path, cache_dir, max_games=None):
         return history_path, mask_sparse_path, targets_path, total_samples, num_provs, vocab_size, none_idx, derived_mask_len
 
     print("Building binary cache from JSON... (This may take a while)")
-    provinces = list(temp_engine.map.locs)
+    provinces = sorted([p.upper() for p in list(temp_engine.map.locs)])
     prov_to_idx = {p: i for i, p in enumerate(provinces)}
     
     def line_generator():
@@ -301,7 +301,7 @@ def process_and_save_to_disk(json_path, cache_dir, max_games=None):
                 games_yielded += 1
                 if max_games and games_yielded >= max_games: break
 
-    num_cores = min(21, smp.cpu_count())
+    num_cores = min(28, smp.cpu_count())
     print(f"Starting multiprocessing pool with {num_cores} workers.")
     total_samples = 0
     
@@ -369,11 +369,11 @@ def train_worker(rank, world_size, paths_and_metadata, args):
     torch.cuda.set_device(rank)
     
     dataset = DiplomacyMemmapDataset(history_path, mask_sparse_path, targets_path, total_samples, num_provs, vocab_size, derived_mask_len)
-    sampler = DistributedSampler(dataset, num_replicas=world_size, rank=rank)
+    sampler = DistributedSampler(dataset, num_replicas=world_size, rank=rank, shuffle=False)
     
     dataloader = DataLoader(
         dataset, batch_size=args.batch_size, shuffle=False, sampler=sampler,
-        num_workers=2, pin_memory=True, prefetch_factor=2, persistent_workers=True
+        num_workers=6, pin_memory=True, prefetch_factor=2, persistent_workers=True
     )
     
     agent = FeudalDiplomacyAgent(d_model=256, vocab_size=vocab_size).to(rank)

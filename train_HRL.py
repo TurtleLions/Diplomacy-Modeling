@@ -215,7 +215,7 @@ def evaluate_against_baseline(live_net, baseline_net, device, update_num, live_p
                 S_M = net.pooler(S_mu_encoded)
 
                 real_H = torch.stack([torch.tensor(infos[a]['H_matrix'], dtype=torch.float32) for a in agents]).to(net_device)
-                dummy_z_prev = torch.zeros((B, 256), dtype=torch.bfloat16, device=net_device)
+                dummy_z_prev = torch.zeros((B, 8, 256), dtype=torch.bfloat16, device=net_device)
                 
                 z_eval = net.manager(S_M, real_H, dummy_z_prev)
 
@@ -309,8 +309,8 @@ def rollout_worker(local_rank, device, args, buffers, actor_net, bc_baseline_net
     next_done = torch.zeros((args.num_envs, NUM_AGENTS), device=device)
     
     batch_H = torch.zeros((args.num_envs, NUM_AGENTS, 7, 7), dtype=torch.float32, device=device)
-    batch_z = torch.zeros((args.num_envs, NUM_AGENTS, 256), dtype=torch.bfloat16, device=device)
-    batch_prev_z = torch.zeros((args.num_envs, NUM_AGENTS, 256), dtype=torch.bfloat16, device=device)
+    batch_z = torch.zeros((args.num_envs, NUM_AGENTS, 8, 256), dtype=torch.bfloat16, device=device)
+    batch_prev_z = torch.zeros((args.num_envs, NUM_AGENTS, 8, 256), dtype=torch.bfloat16, device=device)
     batch_S_M = torch.zeros((args.num_envs, NUM_AGENTS, 8, 256), dtype=torch.bfloat16, device=device)
 
     for update in range(1, args.num_updates + 1):
@@ -403,7 +403,8 @@ def rollout_worker(local_rank, device, args, buffers, actor_net, bc_baseline_net
                             # Worker Decoder (One-Shot action generation)
                             logits, _ = actor_net.worker(flat_obs, new_z, actor_net.D)
                             
-                            values = actor_net.value_head(active_S_M.view(active_S_M.size(0), -1)).squeeze(-1).float()
+                            pooled_S_M = active_S_M.mean(dim=1)
+                            values = actor_net.value_head(pooled_S_M).squeeze(-1).float()
                         
                         # Update persistent tensors
                         batch_S_M[buf['masks'][step]] = active_S_M
@@ -457,7 +458,7 @@ def rollout_worker(local_rank, device, args, buffers, actor_net, bc_baseline_net
                         with torch.no_grad():
                             with torch.autocast(device_type='cuda', dtype=torch.bfloat16):
                                 # Baseline receives a dummy 0 strategy vector
-                                bc_z = torch.zeros(bc_obs_tensor.size(0), 256, device=device, dtype=torch.bfloat16)
+                                bc_z = torch.zeros(bc_obs_tensor.size(0), 8, 256, device=device, dtype=torch.bfloat16)
                                 bc_logits, _ = bc_baseline_net.worker(bc_obs_tensor, bc_z, bc_baseline_net.D)
 
                             # Fast One-Shot Masking for Baseline
@@ -648,8 +649,8 @@ def main():
             'returns': torch.zeros((args.num_steps, args.num_envs, NUM_AGENTS), dtype=torch.float32, device=device),
             'S_M': torch.zeros((args.num_steps, args.num_envs, NUM_AGENTS, 8, 256), dtype=torch.bfloat16, device=device),
             'S_M_next': torch.zeros((args.num_steps, args.num_envs, NUM_AGENTS, 8, 256), dtype=torch.bfloat16, device=device),
-            'z': torch.zeros((args.num_steps, args.num_envs, NUM_AGENTS, 256), dtype=torch.bfloat16, device=device),
-            'prev_z': torch.zeros((args.num_steps, args.num_envs, NUM_AGENTS, 256), dtype=torch.bfloat16, device=device),
+            'z': torch.zeros((args.num_steps, args.num_envs, NUM_AGENTS, 8, 256), dtype=torch.bfloat16, device=device),
+            'prev_z': torch.zeros((args.num_steps, args.num_envs, NUM_AGENTS, 8, 256), dtype=torch.bfloat16, device=device),
             'H': torch.zeros((args.num_steps, args.num_envs, NUM_AGENTS, 7, 7), dtype=torch.float32, device=device),
             'unit_penalties': torch.zeros((args.num_steps, args.num_envs, NUM_AGENTS, 82), dtype=torch.float32, device=device)
         }
@@ -738,8 +739,8 @@ def main():
         
         flat_S_M = buf['S_M'].view(-1, 8, 256)[valid]
         flat_S_M_next = buf['S_M_next'].view(-1, 8, 256)[valid]
-        flat_z = buf['z'].view(-1, 256)[valid]
-        flat_prev_z = buf['prev_z'].view(-1, 256)[valid]
+        flat_z = buf['z'].view(-1, 8, 256)[valid]
+        flat_prev_z = buf['prev_z'].view(-1, 8, 256)[valid]
         flat_H = buf['H'].view(-1, 7, 7)[valid]
 
         b_size = flat_obs.shape[0]
@@ -848,13 +849,13 @@ def main():
                         predicted_z = F.normalize(predicted_z.float(), p=2, dim=-1)
                         mb_z_float = mb_z.float()
 
-                        distance_penalty = (z_achieved - mb_z_float).pow(2).sum(dim=-1)
+                        distance_penalty = (z_achieved.detach() - mb_z_float).pow(2).sum(dim=-1)
 
                         current_beta = 2.0 
                         feudal_adv = mb_ret - (current_beta * distance_penalty)
                         
                         if feudal_adv.shape[0] > 1:
-                            manager_adv = (feudal_adv - feudal_adv.mean()) / (feudal_adv.std(unbiased=False) + 1e-5)
+                            raw_manager_loss = F.mse_loss(predicted_z, manager_z_target.detach(), reduction='none').mean(dim=-1)
                         else:
                             manager_adv = feudal_adv - feudal_adv.mean()
                             
@@ -863,7 +864,7 @@ def main():
 
                         manager_z_target = mb_z_float.clone()
                         manager_z_target[failed_mask] = z_achieved[failed_mask]
-                        manager_loss = F.mse_loss(predicted_z, manager_z_target.detach())
+                        manager_loss = (raw_manager_loss * manager_adv.detach()).mean()
                         inv_loss = F.mse_loss(z_achieved, mb_z_float.detach())
 
                         worker_z_target = mb_z_float.clone()

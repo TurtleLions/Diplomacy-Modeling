@@ -435,33 +435,35 @@ class TacticalWorker(nn.Module):
         
         self.feature_projection = nn.Linear(FEATURE_DIM, d_model)
         self.encoder_transformer = nn.TransformerEncoderLayer(d_model=d_model, nhead=8, batch_first=True)
-        self.z_to_start_token = nn.Linear(d_model, d_model)
         
-        self.action_embedding = nn.Embedding(vocab_size, d_model)
+        self.strategy_cross_attn = nn.MultiheadAttention(embed_dim=d_model, num_heads=8, batch_first=True)
+        self.strategy_norm = nn.LayerNorm(d_model)
+        
         self.decoder_layer = GraphBiasedAttentionBlock(d_model, nhead=8)
         self.action_head = nn.Linear(d_model, vocab_size)
 
     def forward(self, S_mu_raw, z_t, distance_matrix_D):
         B, L, _ = S_mu_raw.size()
         x_emb = self.feature_projection(S_mu_raw)
-        S_mu_encoded = self.encoder_transformer(x_emb) 
         
-        # Broadcast strategy z_t across all 82 provinces
-        z_emb = self.z_to_start_token(z_t).unsqueeze(1).expand(-1, L, -1)
+        S_mu_encoded = self.encoder_transformer(x_emb) # Shape: (B, 82, 256)
         
-        # Graph-Biased Attention (Full spatial awareness, no causal mask)
-        decoder_out = self.decoder_layer(S_mu_encoded + z_emb, distance_matrix_D)
+        # z_t is shape (B, 8, 256)
+        strat_context, _ = self.strategy_cross_attn(query=S_mu_encoded, key=z_t, value=z_t)
+        
+        S_mu_strat = self.strategy_norm(S_mu_encoded + strat_context)
+        
+        decoder_out = self.decoder_layer(S_mu_strat, distance_matrix_D)
         
         logits = self.action_head(decoder_out)
         return logits, S_mu_encoded
 
 class InverseModel(nn.Module):
-    """I_psi: Calculates the achieved z based on state transitions."""
-    def __init__(self, k=8, d_val=256, d_model=256):
+    """I_psi: Calculates the achieved z based on state transitions per theater."""
+    def __init__(self, d_val=256, d_model=256):
         super().__init__()
-        input_dim = (k * d_val) * 2 
         self.mlp = nn.Sequential(
-            nn.Linear(input_dim, 512),
+            nn.Linear(d_val * 2, 512),
             nn.LayerNorm(512),
             nn.GELU(),
             nn.Linear(512, d_model),
@@ -469,11 +471,9 @@ class InverseModel(nn.Module):
         )
 
     def forward(self, S_M_t, S_M_t_next):
-        B = S_M_t.size(0)
-        flat_t = S_M_t.view(B, -1)
-        flat_next = S_M_t_next.view(B, -1)
-        x = torch.cat([flat_t, flat_next], dim=-1)
-        return self.mlp(x)
+        x = torch.cat([S_M_t, S_M_t_next], dim=-1)
+        
+        return self.mlp(x) # Output shape: (B, 8, 256)
 
 class MacroManager(nn.Module):
     """
@@ -503,21 +503,25 @@ class MacroManager(nn.Module):
 
     def forward(self, S_M_t, H_t, z_prev):
         B = S_M_t.size(0)
+        H_emb = self.H_proj(H_t.view(B, -1)).unsqueeze(1) # Shape: (B, 1, d_model)
         
-        H_t = H_t.to(S_M_t.dtype)
-        
-        flat_H = H_t.view(B, -1)
-        H_emb = self.H_proj(flat_H) # Shape: (B, d_model)
-        
-        query = (z_prev + H_emb).unsqueeze(1) 
+        # Broadcast H_emb across the 8 theaters
+        query = z_prev + H_emb.expand(-1, 8, -1) 
         
         attn_out, _ = self.cross_attn(query=query, key=S_M_t, value=S_M_t)
-        attn_out = self.attn_norm(attn_out.squeeze(1) + query.squeeze(1))
+        attn_out = self.attn_norm(attn_out + query)
         
-        z_t = self.gru_cell(attn_out, z_prev) 
+        # Flatten Batch and Theaters to process all 8 regions independently and simultaneously
+        attn_out_flat = attn_out.view(B * 8, -1)
+        z_prev_flat = z_prev.view(B * 8, -1)
+        
+        z_t_flat = self.gru_cell(attn_out_flat, z_prev_flat)
+        
+        # Unflatten back to sequence
+        z_t = z_t_flat.view(B, 8, -1)
         
         z_t = torch.tanh(self.z_out(self.z_norm(z_t)))
-        return z_t
+        return z_t # Shape: (B, 8, 256)
 
 # --- THE FEUDAL ENVELOPE ---
 
@@ -529,12 +533,11 @@ class FeudalDiplomacyAgent(nn.Module):
         self.manager = MacroManager(d_model=d_model)
         self.inverse_model = InverseModel(d_model=d_model)
         
-        # --- NEW VALUE HEAD ---
-        # Maps the 8 macro-theaters (8 * 256) down to a single state value scalar
         self.value_head = nn.Sequential(
-            nn.Linear(8 * 256, 256),
+            nn.Linear(256, 128),
+            nn.LayerNorm(128),
             nn.GELU(),
-            nn.Linear(256, 1)
+            nn.Linear(128, 1)
         )
         
         num_provs = len(GLOBAL_PROVINCES)
@@ -543,7 +546,7 @@ class FeudalDiplomacyAgent(nn.Module):
     def forward_phase_2_bc(self, S_mu_raw):
         """Pre-training: z_t is forced to 0. (One-Shot Prediction)"""
         B = S_mu_raw.size(0)
-        z_zero = torch.zeros((B, self.worker.d_model), device=S_mu_raw.device, dtype=S_mu_raw.dtype)
+        z_zero = torch.zeros((B, 8, self.worker.d_model), device=S_mu_raw.device, dtype=S_mu_raw.dtype)
         logits, _ = self.worker(S_mu_raw, z_zero, self.D)
         return logits
 
@@ -779,14 +782,14 @@ class DiplomacyTransformerEnv(ParallelEnv):
             # Supply Center Deltas
             sc_delta = current_sc_count - prev_sc_counts.get(agent, 0)
             if sc_delta != 0:
-                rewards[agent] += (sc_delta * 10.0) * anneal_factor
+                rewards[agent] += (sc_delta * 5.0) * anneal_factor
                         
             occupied_unowned_scs = 0
             for unit_str in agent_units:
                 prov_base = unit_str.split()[1].split('/')[0] 
                 if prov_base in all_map_scs and prov_base not in current_scs:
                     occupied_unowned_scs += 1
-            rewards[agent] += (occupied_unowned_scs * 1.0) * anneal_factor
+            rewards[agent] += (occupied_unowned_scs * 0.2) * anneal_factor
                 
             # Dislodgement Penalty
             current_dislodged = current_state_dict.get('dislodged', {}).get(agent, [])
