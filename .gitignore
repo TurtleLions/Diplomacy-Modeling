@@ -11,3 +11,4 @@ eval_games/
 __pycache__/
 todo.txt
 .cursor/
+feudal_agent_bc.pth
