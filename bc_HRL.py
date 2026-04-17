@@ -24,11 +24,32 @@ from torch.utils.data.distributed import DistributedSampler
 from torch.utils.data import Dataset, DataLoader
 
 from diplomacy import Game
-from HRLhelpers import FeudalDiplomacyAgent, build_global_vocab, parse_state_to_tensor
+from HRLhelpers import FeudalDiplomacyAgent, build_global_vocab, parse_state_to_tensor, InteractionMatrixTracker
 
-# Constants
+# --- GLOBAL CONSTANTS ---
+FEATURE_DIM = 61
+MAX_SPARSE_MASK_LEN = 4000
+
+_DUMMY_GAME = Game()
+GLOBAL_PROVINCES = sorted([prov.upper() for prov in list(_DUMMY_GAME.map.locs)])
+GLOBAL_PROV_TO_IDX = {prov: i for i, prov in enumerate(GLOBAL_PROVINCES)}
+
 GLOBAL_POWERS = ['AUSTRIA', 'ENGLAND', 'FRANCE', 'GERMANY', 'ITALY', 'RUSSIA', 'TURKEY']
-FEATURE_DIM = 46
+GLOBAL_POWER_TO_IDX = {power: i for i, power in enumerate(GLOBAL_POWERS)}
+
+GLOBAL_PROV_TYPES = {}
+for prov in GLOBAL_PROVINCES:
+    GLOBAL_PROV_TYPES[prov] = _DUMMY_GAME.map.area_type(prov).upper()
+
+GLOBAL_HSCS = {
+    'AUSTRIA': ['VIE', 'BUD', 'TRI'],
+    'ENGLAND': ['LON', 'EDI', 'LVP'],
+    'FRANCE': ['PAR', 'MAR', 'BRE'],
+    'GERMANY': ['BER', 'MUN', 'KIE'],
+    'ITALY': ['ROM', 'VEN', 'NAP'],
+    'RUSSIA': ['MOS', 'SEV', 'WAR', 'STP'],
+    'TURKEY': ['ANK', 'CON', 'SMY']
+}
 
 # --- OFFLINE GRAPH BUILDER ---
 
@@ -110,25 +131,40 @@ def _process_single_line(line):
         return None
         
     game_engine = Game()
+    tracker = InteractionMatrixTracker(num_agents=7, gamma=0.9)
     provinces = list(game_engine.map.locs)
     
     agent_histories = {p: np.zeros((3, worker_num_provs, FEATURE_DIM), dtype=np.int8) for p in GLOBAL_POWERS}
     g_histories, g_masks, g_targets = [], [], []
     
-    for phase in game_data.get('phases', []):
-        game_engine.set_state(phase['state'])
+    prev_state_for_obs = None
+    bounces_for_obs = None
+    
+    for phase_data in game_data.get('phases', []):
+        phase_name = phase_data.get('name')
+        historical_orders = phase_data.get('orders', {})
+        
+        current_state_dict = game_engine.get_state()
         
         for power in GLOBAL_POWERS:
-            current_state = parse_state_to_tensor(phase, observing_agent=power)
-            agent_histories[power] = np.roll(agent_histories[power], shift=1, axis=0)
-            agent_histories[power][0] = current_state
-        
-        orders_dict = phase.get('orders', {})
-        for power, text_orders in orders_dict.items():
-            if not text_orders:
-                continue
+            power_upper = power.upper()
             
-            mask = get_global_action_mask(game_engine, power, provinces, worker_order_to_idx)
+            obs_tensor = parse_state_to_tensor(
+                turn_data={'name': phase_name, 'state': current_state_dict}, 
+                observing_agent=power_upper,
+                prev_state=prev_state_for_obs,
+                bounces=bounces_for_obs,
+                H_matrix=tracker.H 
+            )
+            
+            agent_histories[power_upper] = np.roll(agent_histories[power_upper], shift=1, axis=0)
+            agent_histories[power_upper][0] = obs_tensor
+            
+        for power, text_orders in historical_orders.items():
+            if not text_orders: continue
+            power_upper = power.upper()
+            
+            mask = get_global_action_mask(game_engine, power_upper, provinces, worker_order_to_idx)
             targets = np.full(worker_num_provs, worker_none_idx, dtype=np.int64)
             
             for order_str in text_orders:
@@ -150,9 +186,76 @@ def _process_single_line(line):
             sparse_mask = np.full(worker_max_mask_len, -1, dtype=np.int32)
             sparse_mask[:num_valid] = valid_indices
             
-            g_histories.append(agent_histories[power].copy())
+            g_histories.append(agent_histories[power_upper].copy())
             g_masks.append(sparse_mask)
             g_targets.append(targets)
+
+        prev_units = {a: current_state_dict['units'].get(a, []) for a in GLOBAL_POWERS}
+        
+        for power, orders in historical_orders.items():
+            if orders:
+                clean_orders = [o.replace('*', '').upper() for o in orders]
+                game_engine.set_orders(power, clean_orders)
+                
+        delta_H = torch.zeros((7, 7), dtype=torch.float32)
+        prov_to_power_idx = {}
+        
+        for p, units in prev_units.items():
+            if p not in GLOBAL_POWER_TO_IDX: continue
+            p_idx = GLOBAL_POWER_TO_IDX[p]
+            for u in units:
+                loc_base = u.split()[1].split('/')[0]
+                prov_to_power_idx[loc_base] = p_idx
+                
+        prev_centers = current_state_dict.get('centers', {})
+        for p, scs in prev_centers.items():
+            if p not in GLOBAL_POWER_TO_IDX: continue
+            p_idx = GLOBAL_POWER_TO_IDX[p]
+            for sc in scs:
+                if sc not in prov_to_power_idx:
+                    prov_to_power_idx[sc] = p_idx
+                    
+        for agent, orders in historical_orders.items():
+            if not orders: continue
+            agent_upper = agent.upper()
+            if agent_upper not in GLOBAL_POWER_TO_IDX: continue
+            agent_idx = GLOBAL_POWER_TO_IDX[agent_upper]
+            
+            for order in orders:
+                clean_order = order.replace('*', '').upper()
+                try:
+                    if ' S ' in clean_order or ' C ' in clean_order:
+                        target_str = clean_order.replace(' S ', '|').replace(' C ', '|').split('|')[1]
+                        parts = target_str.strip().split()
+                        
+                        if len(parts) >= 2:
+                            target_loc = parts[1].split('/')[0]
+                        elif len(parts) == 1:
+                            target_loc = parts[0].split('/')[0]
+                        else:
+                            continue
+                            
+                        target_owner_idx = prov_to_power_idx.get(target_loc)
+                        if target_owner_idx is not None and target_owner_idx != agent_idx:
+                            delta_H[agent_idx, target_owner_idx] += 0.5
+                            
+                    elif ' - ' in clean_order:
+                        target_loc = clean_order.split(' - ')[1].strip().split()[0].split('/')[0]
+                        target_owner_idx = prov_to_power_idx.get(target_loc)
+                        if target_owner_idx is not None and target_owner_idx != agent_idx:
+                            delta_H[agent_idx, target_owner_idx] -= 1.0
+                            delta_H[target_owner_idx, agent_idx] -= 1.0
+                except Exception as e:
+                    print(f"\n[PARSER WARNING] Ignored malformed order: '{order}' | Error: {e}")
+                    continue
+                        
+        delta_H = torch.clamp(delta_H, -1.0, 1.0)
+        tracker.update(delta_H)
+        
+        game_engine.process()
+        
+        prev_state_for_obs = current_state_dict
+        bounces_for_obs = [loc for loc, msg in game_engine.get_order_status().items() if 'bounced' in msg or 'fails' in msg]
             
     if not g_histories:
         return None
@@ -316,7 +419,7 @@ def train_worker(rank, world_size, paths_and_metadata, args):
             
             with torch.autocast(device_type='cuda', dtype=torch.bfloat16):
                 logits = agent.module.forward_phase_2_bc(S_mu)
-                logits_masked = logits.masked_fill(~dense_mask, -1e4).float()
+                logits_masked = logits.masked_fill(~dense_mask, -1e20).float()
                 
                 logits_flat = logits_masked.view(-1, vocab_size)
                 targets_flat = targets.view(-1)

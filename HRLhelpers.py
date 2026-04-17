@@ -19,7 +19,7 @@ from diplomacy import Game
 from pettingzoo import ParallelEnv
 
 # --- GLOBAL CONSTANTS ---
-FEATURE_DIM = 46
+FEATURE_DIM = 61
 MAX_SPARSE_MASK_LEN = 4000
 
 _DUMMY_GAME = Game()
@@ -28,6 +28,10 @@ GLOBAL_PROV_TO_IDX = {prov: i for i, prov in enumerate(GLOBAL_PROVINCES)}
 
 GLOBAL_POWERS = ['AUSTRIA', 'ENGLAND', 'FRANCE', 'GERMANY', 'ITALY', 'RUSSIA', 'TURKEY']
 GLOBAL_POWER_TO_IDX = {power: i for i, power in enumerate(GLOBAL_POWERS)}
+
+GLOBAL_PROV_TYPES = {}
+for prov in GLOBAL_PROVINCES:
+    GLOBAL_PROV_TYPES[prov] = _DUMMY_GAME.map.area_type(prov).upper()
 
 GLOBAL_HSCS = {
     'AUSTRIA': ['VIE', 'BUD', 'TRI'],
@@ -133,11 +137,11 @@ def get_sparse_action_mask(game, power, provinces, order_to_idx, max_len=MAX_SPA
     sparse_mask[:num_valid] = valid_indices
     return sparse_mask
 
-def parse_state_to_tensor(turn_data, observing_agent=None):
+def parse_state_to_tensor(turn_data, observing_agent=None, prev_state=None, bounces=None, H_matrix=None):
     """
     Parses a single game phase into a standardized geometric feature tensor.
     
-    Feature Vector Layout (Dim: 46):
+    Feature Vector Layout (Dim: 61):
       [0-6]   : Active unit presence (One-hot mapped to powers)
       [7]     : Unit is an Army
       [8]     : Unit is a Fleet
@@ -148,10 +152,15 @@ def parse_state_to_tensor(turn_data, observing_agent=None):
       [25-31] : Build deficits (Broadcasted globally per power)
       [32-38] : Static Home Supply Center mapping
       [39-45] : Observing Agent identity mapping
+      [46-48] : Province Type (Inland, Coast, Water)
+      [49]    : Buildable Home SC (Empty, owned by observer, is HSC)
+      [50]    : Standoff / Bounce occurred here last phase
+      [51-57] : Previous SC ownership (One-hot mapped to powers)
+      [58-60] : Relative Diplomatic Stance (Occupied by: Self, Ally, Enemy)
     """
     state_tensor = np.zeros((len(GLOBAL_PROV_TO_IDX), FEATURE_DIM), dtype=np.float32)
     state_info = turn_data.get('state', {})
-    phase_name = turn_data.get('name', 'S1901M') 
+    phase_name = turn_data.get('name', 'S1901M')
     
     is_m, is_r, is_a, is_spring, is_fall_winter = 1.0, 0.0, 0.0, 1.0, 0.0
     
@@ -171,9 +180,77 @@ def parse_state_to_tensor(turn_data, observing_agent=None):
     state_tensor[:, 22] = is_spring
     state_tensor[:, 23] = is_fall_winter
 
+    for prov, p_idx in GLOBAL_PROV_TO_IDX.items():
+        ptype = GLOBAL_PROV_TYPES.get(prov, 'LAND')
+        if ptype in ['LAND', 'SHUT']: 
+            state_tensor[p_idx, 46] = 1.0
+        elif ptype in ['COAST', 'PORT']: 
+            state_tensor[p_idx, 47] = 1.0
+        elif ptype == 'WATER': 
+            state_tensor[p_idx, 48] = 1.0
+
+    for power, hsc_list in GLOBAL_HSCS.items():
+        power_idx = GLOBAL_POWER_TO_IDX[power]
+        for hsc in hsc_list:
+            if hsc in GLOBAL_PROV_TO_IDX:
+                p_idx = GLOBAL_PROV_TO_IDX[hsc]
+                state_tensor[p_idx, 32 + power_idx] = 1.0
+
     units = state_info.get('units', {})
     centers = state_info.get('centers', {})
     dislodged = state_info.get('dislodged', {})
+
+    occupied_bases = set()
+
+    for power, unit_list in units.items():
+        power_upper = power.upper()
+        if power_upper not in GLOBAL_POWER_TO_IDX: continue
+        power_idx = GLOBAL_POWER_TO_IDX[power_upper] 
+        
+        for unit_str in unit_list:
+            clean_str = unit_str.replace('*', '').upper()
+            parts = clean_str.split()
+            if len(parts) >= 2:
+                u_type = parts[0]
+                loc_full = parts[1]
+                loc_base = loc_full.split('/')[0]
+                coast = loc_full.split('/')[1] if len(loc_full.split('/')) > 1 else None
+                
+                occupied_bases.add(loc_base)
+
+                if loc_full in GLOBAL_PROV_TO_IDX:
+                    p_idx = GLOBAL_PROV_TO_IDX[loc_full]
+                    state_tensor[p_idx, power_idx] = 1.0
+                    if u_type == 'A': state_tensor[p_idx, 7] = 1.0
+                    elif u_type == 'F': state_tensor[p_idx, 8] = 1.0
+                    
+                    if coast == 'NC': state_tensor[p_idx, 16] = 1.0
+                    elif coast == 'SC': state_tensor[p_idx, 17] = 1.0
+                    elif coast == 'EC': state_tensor[p_idx, 18] = 1.0
+                    
+                    if observing_agent and H_matrix is not None:
+                        obs_idx = GLOBAL_POWER_TO_IDX[observing_agent.upper()]
+                        if power_idx == obs_idx:
+                            state_tensor[p_idx, 58] = 1.0 # Self
+                        elif H_matrix[obs_idx, power_idx].item() > 0.5:
+                            state_tensor[p_idx, 59] = 1.0 # Ally
+                        elif H_matrix[obs_idx, power_idx].item() < -0.5:
+                            state_tensor[p_idx, 60] = 1.0 # Enemy
+
+                if loc_base != loc_full and loc_base in GLOBAL_PROV_TO_IDX:
+                    base_idx = GLOBAL_PROV_TO_IDX[loc_base]
+                    state_tensor[base_idx, power_idx] = 1.0
+                    if u_type == 'A': state_tensor[base_idx, 7] = 1.0
+                    elif u_type == 'F': state_tensor[base_idx, 8] = 1.0
+                    
+                    if observing_agent and H_matrix is not None:
+                        obs_idx = GLOBAL_POWER_TO_IDX[observing_agent.upper()]
+                        if power_idx == obs_idx:
+                            state_tensor[base_idx, 58] = 1.0
+                        elif H_matrix[obs_idx, power_idx].item() > 0.5:
+                            state_tensor[base_idx, 59] = 1.0
+                        elif H_matrix[obs_idx, power_idx].item() < -0.5:
+                            state_tensor[base_idx, 60] = 1.0
 
     for power, hsc_list in GLOBAL_HSCS.items():
         power_idx = GLOBAL_POWER_TO_IDX[power]
@@ -251,6 +328,27 @@ def parse_state_to_tensor(turn_data, observing_agent=None):
         if agent_upper in GLOBAL_POWER_TO_IDX:
             power_idx = GLOBAL_POWER_TO_IDX[agent_upper]
             state_tensor[:, 39 + power_idx] = 1.0
+            my_scs = centers.get(agent_upper, [])
+            for hsc in GLOBAL_HSCS.get(agent_upper, []):
+                if hsc in my_scs and hsc not in occupied_bases and hsc in GLOBAL_PROV_TO_IDX:
+                    state_tensor[GLOBAL_PROV_TO_IDX[hsc], 49] = 1.0
+
+    if bounces is not None:
+        for b_loc in bounces:
+            b_loc_upper = b_loc.upper()
+            if b_loc_upper in GLOBAL_PROV_TO_IDX:
+                state_tensor[GLOBAL_PROV_TO_IDX[b_loc_upper], 50] = 1.0
+
+    if prev_state is not None:
+        prev_centers = prev_state.get('centers', {})
+        for prev_power, prev_sc_list in prev_centers.items():
+            prev_power_upper = prev_power.upper()
+            if prev_power_upper in GLOBAL_POWER_TO_IDX:
+                prev_p_idx = GLOBAL_POWER_TO_IDX[prev_power_upper]
+                for sc in prev_sc_list:
+                    sc_upper = sc.upper()
+                    if sc_upper in GLOBAL_PROV_TO_IDX:
+                        state_tensor[GLOBAL_PROV_TO_IDX[sc_upper], 51 + prev_p_idx] = 1.0
 
     return state_tensor
 
@@ -335,7 +433,7 @@ class TacticalWorker(nn.Module):
         super().__init__()
         self.d_model = d_model
         
-        self.feature_projection = nn.Linear(46, d_model)
+        self.feature_projection = nn.Linear(FEATURE_DIM, d_model)
         self.encoder_transformer = nn.TransformerEncoderLayer(d_model=d_model, nhead=8, batch_first=True)
         self.z_to_start_token = nn.Linear(d_model, d_model)
         
@@ -399,6 +497,10 @@ class MacroManager(nn.Module):
         
         self.z_norm = nn.LayerNorm(d_model)
 
+        self.z_out = nn.Linear(d_model, d_model)
+        nn.init.zeros_(self.z_out.weight)
+        nn.init.zeros_(self.z_out.bias)
+
     def forward(self, S_M_t, H_t, z_prev):
         B = S_M_t.size(0)
         
@@ -414,7 +516,7 @@ class MacroManager(nn.Module):
         
         z_t = self.gru_cell(attn_out, z_prev) 
         
-        z_t = torch.tanh(self.z_norm(z_t))
+        z_t = torch.tanh(self.z_out(self.z_norm(z_t)))
         return z_t
 
 # --- THE FEUDAL ENVELOPE ---
@@ -473,6 +575,8 @@ class DiplomacyTransformerEnv(ParallelEnv):
         self.order_to_idx, self.idx_to_order = build_global_vocab()
         self.vocab_size = len(self.order_to_idx)
         
+        self.tracker = InteractionMatrixTracker(num_agents=7, gamma=0.9)
+        
         self.state_history = {
             a: np.zeros((self.history_length, self.num_provinces, FEATURE_DIM), dtype=np.float32) 
             for a in self.possible_agents
@@ -490,6 +594,7 @@ class DiplomacyTransformerEnv(ParallelEnv):
         self.agents = self.possible_agents[:]
         self.game = Game()
         self.step_count = 0
+        self.tracker = InteractionMatrixTracker(num_agents=7, gamma=0.9)
         
         self.state_history = {
             a: np.zeros((self.history_length, self.num_provinces, FEATURE_DIM), dtype=np.float32) 
@@ -499,14 +604,27 @@ class DiplomacyTransformerEnv(ParallelEnv):
         self.stalemate_counter = 0
         self.last_year_sc_owners = {sc: a for a in self.agents for sc in self.game.get_centers(a)}
 
+        current_state = self.game.get_state()
+        current_phase = self.game.get_current_phase()
+
+        bounces = [loc for loc, msg in self.game.get_order_status().items() if 'bounced' in msg or 'fails' in msg]
 
         observations = {}
         for a in self.agents:
-            agent_obs = parse_state_to_tensor({'name': self.game.get_current_phase(), 'state': self.game.get_state()}, observing_agent=a)
+            agent_obs = parse_state_to_tensor(
+                turn_data={'name': current_phase, 'state': current_state}, 
+                observing_agent=a,
+                prev_state=None,
+                bounces=None,
+                H_matrix=self.tracker.H
+            )
             self._update_history(a, agent_obs)
             observations[a] = self.state_history[a].copy()
             
-        infos = {a: {'action_mask': get_sparse_action_mask(self.game, a, self.provinces, self.order_to_idx)} for a in self.agents}
+        infos = {a: {
+            'action_mask': get_sparse_action_mask(self.game, a, self.provinces, self.order_to_idx),
+            'H_matrix': self.tracker.H.cpu().numpy()
+        } for a in self.agents}
         return observations, infos
 
     def step(self, actions, progress=0.0):
@@ -553,11 +671,75 @@ class DiplomacyTransformerEnv(ParallelEnv):
                         
             self.game.set_orders(agent, text_orders)
 
+        delta_H = torch.zeros((7, 7), dtype=torch.float32)
+        
+        prov_to_power_idx = {}
+        
+        for p, units in prev_units.items():
+            if p not in GLOBAL_POWER_TO_IDX: continue
+            p_idx = GLOBAL_POWER_TO_IDX[p]
+            for u in units:
+                loc_base = u.split()[1].split('/')[0]
+                prov_to_power_idx[loc_base] = p_idx
+                
+        prev_centers = prev_state_dict.get('centers', {})
+        for p, scs in prev_centers.items():
+            if p not in GLOBAL_POWER_TO_IDX: continue
+            p_idx = GLOBAL_POWER_TO_IDX[p]
+            for sc in scs:
+                if sc not in prov_to_power_idx:
+                    prov_to_power_idx[sc] = p_idx
+                
+        for agent in self.agents:
+            agent_idx = GLOBAL_POWER_TO_IDX[agent]
+            text_orders = self.game.get_orders(agent) 
+            
+            for order in text_orders:
+                try:
+                    if ' S ' in order or ' C ' in order:
+                        target_str = order.replace(' S ', '|').replace(' C ', '|').split('|')[1]
+                        parts = target_str.strip().split()
+                        
+                        if len(parts) >= 2:
+                            target_loc = parts[1].split('/')[0]
+                        elif len(parts) == 1:
+                            target_loc = parts[0].split('/')[0]
+                        else:
+                            continue
+                            
+                        target_owner_idx = prov_to_power_idx.get(target_loc)
+                        if target_owner_idx is not None and target_owner_idx != agent_idx:
+                            delta_H[agent_idx, target_owner_idx] += 0.5
+                            
+                    elif ' - ' in order:
+                        target_loc = order.split(' - ')[1].strip().split()[0].split('/')[0]
+                        
+                        target_owner_idx = prov_to_power_idx.get(target_loc)
+                        if target_owner_idx is not None and target_owner_idx != agent_idx:
+                            delta_H[agent_idx, target_owner_idx] -= 1.0
+                            delta_H[target_owner_idx, agent_idx] -= 1.0
+                except Exception as e:
+                    print(f"\n[PARSER WARNING] Ignored malformed order: '{order}' | Error: {e}")
+                    continue
+                        
+        delta_H = torch.clamp(delta_H, -1.0, 1.0)
+        self.tracker.update(delta_H)
+
         self.game.process()
         
+        current_state_dict = self.game.get_state()
+        current_phase = self.game.get_current_phase()
+        bounces = [loc for loc, msg in self.game.get_order_status().items() if 'bounced' in msg or 'fails' in msg]
+
         observations = {}
         for a in self.agents:
-            agent_obs = parse_state_to_tensor({'name': self.game.get_current_phase(), 'state': self.game.get_state()}, observing_agent=a)
+            agent_obs = parse_state_to_tensor(
+                turn_data={'name': current_phase, 'state': current_state_dict}, 
+                observing_agent=a,
+                prev_state=prev_state_dict,
+                bounces=bounces,
+                H_matrix=self.tracker.H 
+            )
             self._update_history(a, agent_obs)
             observations[a] = self.state_history[a].copy()
         
@@ -649,8 +831,11 @@ class DiplomacyTransformerEnv(ParallelEnv):
             elif is_done: 
                 truncations[agent] = True
 
-        infos = {a: {'action_mask': get_sparse_action_mask(self.game, a, self.provinces, self.order_to_idx), 'legality_metrics': legality_metrics[a]} for a in self.agents}
+        infos = {a: {
+            'action_mask': get_sparse_action_mask(self.game, a, self.provinces, self.order_to_idx), 
+            'legality_metrics': legality_metrics[a],
+            'H_matrix': self.tracker.H.cpu().numpy()
+        } for a in self.agents}
         
         self.agents = [a for a in self.agents if not terminations[a] and not truncations[a]]
-
         return observations, rewards, terminations, truncations, infos

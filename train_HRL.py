@@ -214,16 +214,16 @@ def evaluate_against_baseline(live_net, baseline_net, device, update_num, live_p
                 S_mu_encoded = net.worker.encoder_transformer(x_emb)
                 S_M = net.pooler(S_mu_encoded)
 
-                dummy_H = torch.zeros((B, 7, 7), dtype=torch.float32, device=net_device)
+                real_H = torch.stack([torch.tensor(infos[a]['H_matrix'], dtype=torch.float32) for a in agents]).to(net_device)
                 dummy_z_prev = torch.zeros((B, 256), dtype=torch.bfloat16, device=net_device)
-
-                z_eval = net.manager(S_M, dummy_H, dummy_z_prev)
+                
+                z_eval = net.manager(S_M, real_H, dummy_z_prev)
 
                 logits, _ = net.worker(obs_tensor, z_eval, net.D)
                 
                 logits = torch.nan_to_num(logits, nan=-1e8, posinf=1e8, neginf=-1e8)
                 
-                logits = logits.float().masked_fill(~dense_mask, -1e9)
+                logits = logits.float().masked_fill(~dense_mask, -1e20)
                 
                 final_actions = torch.argmax(logits, dim=-1)
                 
@@ -362,6 +362,9 @@ def rollout_worker(local_rank, device, args, buffers, actor_net, bc_baseline_net
                             a_idx = agent_to_idx[a]
                             obs_tensor = torch.tensor(obs_dict[a][0], dtype=torch.bfloat16, device=device)
                             sparse_tensor = torch.tensor(infos_dict[a]['action_mask'], dtype=torch.int32)
+
+                            if 'H_matrix' in infos_dict[a]:
+                                batch_H[i, a_idx] = torch.tensor(infos_dict[a]['H_matrix'], dtype=torch.float32, device=device)
                             
                             if learning_assignment[i, a_idx]:
                                 buf['masks'][step, i, a_idx] = True
@@ -421,7 +424,7 @@ def rollout_worker(local_rank, device, args, buffers, actor_net, bc_baseline_net
                         
                         # Extract only active logits to bypass the massive (B, 82, V) allocation
                         active_logits = torch.gather(logits, 1, padded_indices.unsqueeze(-1).expand(-1, -1, VOCAB_SIZE))
-                        active_logits = active_logits.float().masked_fill(~packed_masks, -1e9)
+                        active_logits = active_logits.float().masked_fill(~packed_masks, -1e20)
                         
                         # Sample actions only for active units
                         dist_cat = Categorical(logits=active_logits)
@@ -467,7 +470,7 @@ def rollout_worker(local_rank, device, args, buffers, actor_net, bc_baseline_net
                             dense_mask_bc[valid_global_indices_bc.long()] = True
                             dense_mask_bc = dense_mask_bc.view(bc_obs_tensor.size(0), MAP_PROVINCES, VOCAB_SIZE)
 
-                            bc_logits = bc_logits.float().masked_fill(~dense_mask_bc, -1e9)
+                            bc_logits = bc_logits.float().masked_fill(~dense_mask_bc, -1e20)
                             bc_final_actions = torch.argmax(bc_logits, dim=-1) # Greedy sample for BC proxy
 
                         for idx, (env_idx, agent_name) in enumerate(baseline_metadata):
@@ -633,7 +636,7 @@ def main():
     def create_buffer():
         """Creates a memory-pinned tensor buffer for experience collection."""
         return {
-            'obs': torch.zeros((args.num_steps, args.num_envs, NUM_AGENTS, 82, 46), dtype=torch.bfloat16, device=device),
+            'obs': torch.zeros((args.num_steps, args.num_envs, NUM_AGENTS, 82, 61), dtype=torch.bfloat16, device=device),
             'actions': torch.zeros((args.num_steps, args.num_envs, NUM_AGENTS, 82), dtype=torch.long, device=device),
             'logprobs': torch.zeros((args.num_steps, args.num_envs, NUM_AGENTS, 82), dtype=torch.float32, device=device),
             'rewards': torch.zeros((args.num_steps, args.num_envs, NUM_AGENTS), dtype=torch.float32, device=device),
@@ -726,7 +729,7 @@ def main():
         inference_stream.wait_stream(torch.cuda.current_stream())
         
         valid = buf['masks'].view(-1)
-        flat_obs = buf['obs'].view(-1, MAP_PROVINCES, 46)[valid] 
+        flat_obs = buf['obs'].view(-1, MAP_PROVINCES, 61)[valid] 
         flat_act = buf['actions'].view(-1, MAP_PROVINCES)[valid]
         flat_logprobs = buf['logprobs'].view(-1, MAP_PROVINCES)[valid]
         flat_adv = buf['advantages'].view(-1)[valid]
@@ -926,7 +929,7 @@ def main():
                             bc_logits = torch.nan_to_num(bc_logits, nan=-1e8, posinf=1e8, neginf=-1e8)
                             
                             active_bc_logits = torch.gather(bc_logits, 1, padded_indices.unsqueeze(-1).expand(-1, -1, VOCAB_SIZE))
-                            active_bc_logits = active_bc_logits.float().masked_fill(~packed_masks, -1e9)
+                            active_bc_logits = active_bc_logits.float().masked_fill(~packed_masks, -1e20)
                             bc_log_probs_active = torch.log_softmax(active_bc_logits, dim=-1)
                             
                         live_log_probs_active = torch.log_softmax(active_logits, dim=-1)
