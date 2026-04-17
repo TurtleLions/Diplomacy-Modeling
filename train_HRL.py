@@ -832,21 +832,15 @@ def main():
                 with my_context:
                     with torch.autocast(device_type='cuda', dtype=torch.bfloat16):
                         
-                        # ==========================================================
-                        # --- A. FEUDAL MANAGER & INVERSE MODEL (Calculate Reality)
-                        # ==========================================================
                         z_achieved = net.module.inverse_model(mb_S_M, mb_S_M_next)
                         predicted_z = net.module.manager(mb_S_M, mb_H, mb_prev_z)
 
-                        # Force L2 Normalization
                         z_achieved = F.normalize(z_achieved.float(), p=2, dim=-1)
                         predicted_z = F.normalize(predicted_z.float(), p=2, dim=-1)
                         mb_z_float = mb_z.float()
 
-                        # Manager Penalty (Did it ask for something impossible?)
                         distance_penalty = (z_achieved - mb_z_float).pow(2).sum(dim=-1)
 
-                        # Manager's Extrinsic Advantage
                         current_beta = 2.0 
                         feudal_adv = mb_ret - (current_beta * distance_penalty)
                         
@@ -855,7 +849,6 @@ def main():
                         else:
                             manager_adv = feudal_adv - feudal_adv.mean()
                             
-                        # Manager Loss (L2 distance to achieved state if failed, otherwise follow predicted)
                         dynamic_threshold = torch.quantile(distance_penalty, 0.80) 
                         failed_mask = distance_penalty > dynamic_threshold
 
@@ -864,20 +857,13 @@ def main():
                         manager_loss = F.mse_loss(predicted_z, manager_z_target.detach())
                         inv_loss = F.mse_loss(z_achieved, mb_z_float.detach())
 
-                        # ==========================================================
-                        # --- B. HINDSIGHT EXPERIENCE REPLAY (HER) RELABELING
-                        # ==========================================================
                         worker_z_target = mb_z_float.clone()
                         
-                        # 50% chance to apply HER to failed transitions
                         her_prob = torch.rand(worker_z_target.size(0), device=device) < 0.5
                         relabel_mask = failed_mask & her_prob
                         
-                        # RELABEL: "You missed the goal, but let's pretend you were aiming for what you hit."
                         worker_z_target[relabel_mask] = z_achieved[relabel_mask].detach()
                         
-                        # Worker's Intrinsic Reward (Negative L2 distance to the HER relabeled target)
-                        # If HER was applied, distance is 0.0 (Max Intrinsic Reward)
                         intrinsic_reward = -1.0 * (z_achieved.detach() - worker_z_target).pow(2).sum(dim=-1)
 
                         epoch_intrinsic_reward_sum += intrinsic_reward.mean().item() # <--- ADD THIS
@@ -887,10 +873,6 @@ def main():
                         else:
                             intrinsic_adv = intrinsic_reward - intrinsic_reward.mean()
 
-                        # ==========================================================
-                        # --- C. ONE-SHOT WORKER INFERENCE (Using Relabeled Goal)
-                        # ==========================================================
-                        # Notice we pass `worker_z_target` instead of `mb_z`!
                         logits, _ = net.module.worker(mb_obs, worker_z_target.to(torch.bfloat16), net.module.D)
                         logits = torch.nan_to_num(logits, nan=-1e8, posinf=1e8, neginf=-1e8)
                         
@@ -909,9 +891,6 @@ def main():
                         new_logprobs = dist_cat.log_prob(mb_act)
                         entropy_seq = dist_cat.entropy()
 
-                        # ==========================================================
-                        # --- D. WORKER PPO SURROGATE LOSS (Using Intrinsic Adv)
-                        # ==========================================================
                         is_active_mask_f = (mb_act != NONE_IDX).float()
                         total_valid_units = is_active_mask_f.sum().clamp(min=1)
                         
@@ -920,7 +899,6 @@ def main():
                         unit_old_logprobs = mb_logprobs * is_active_mask_f
                         unit_ratios = torch.exp(unit_new_logprobs - unit_old_logprobs)
                         
-                        # Expand Intrinsic Advantage across the 82 provinces
                         adv_expanded = intrinsic_adv.unsqueeze(1).expand_as(unit_ratios)
                         unit_specific_adv = adv_expanded * is_active_mask_f
                         
@@ -933,9 +911,6 @@ def main():
                         log_ratio = torch.clamp(unit_new_logprobs - unit_old_logprobs, min=-20.0, max=20.0) * is_active_mask_f
                         kl_divergence = ((torch.exp(log_ratio) - 1.0 - log_ratio) * is_active_mask_f).sum() / total_valid_units
 
-                        # ==========================================================
-                        # --- E. BEHAVIORAL CLONING KL PENALTY
-                        # ==========================================================
                         with torch.no_grad():
                             bc_logits, _ = bc_baseline_net.worker(mb_obs, worker_z_target.to(torch.bfloat16), bc_baseline_net.D)
                             bc_logits = torch.nan_to_num(bc_logits, nan=-1e8, posinf=1e8, neginf=-1e8)
@@ -955,9 +930,6 @@ def main():
                         unit_bc_kl = torch.nan_to_num(unit_bc_kl, nan=0.0) * is_active_mask_f
                         bc_kl_penalty = unit_bc_kl.sum() / total_valid_units
 
-                        # ==========================================================
-                        # --- F. COMBINED LOSS & BACKPROP (With Value Head)
-                        # ==========================================================
                         values_pred = net.module.value_head(mb_S_M.view(mb_S_M.size(0), -1)).squeeze(-1).float()
                         v_loss = F.mse_loss(values_pred, mb_ret.float())
                         
