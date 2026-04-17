@@ -8,6 +8,7 @@ import time
 import datetime
 import argparse
 import threading
+import queue
 import contextlib
 import torch.multiprocessing as mp  
 import multiprocessing.connection
@@ -302,7 +303,7 @@ def parse_args():
     return parser.parse_args()
 
 def rollout_worker(local_rank, device, args, buffers, actor_net, bc_baseline_net, 
-                   update_complete_event, rollout_complete_event, worker_stats, 
+                   free_buffers_queue, ready_buffers_queue, worker_stats, 
                    NUM_AGENTS, MAP_PROVINCES, VOCAB_SIZE, NONE_IDX, possible_agents, agent_to_idx):
     """Background process responsible for filling the experience buffer asynchronously."""
     torch.cuda.set_device(device) 
@@ -320,8 +321,7 @@ def rollout_worker(local_rank, device, args, buffers, actor_net, bc_baseline_net
     batch_S_M = torch.zeros((args.num_envs, NUM_AGENTS, 8, 256), dtype=torch.bfloat16, device=device)
 
     for update in range(1, args.num_updates + 1):
-        update_complete_event.wait()
-        update_complete_event.clear()
+        buffer_idx = free_buffers_queue.get()
 
         num_learning = 3
         learning_assignment = torch.zeros((args.num_envs, NUM_AGENTS), dtype=torch.bool, device=device)
@@ -341,7 +341,6 @@ def rollout_worker(local_rank, device, args, buffers, actor_net, bc_baseline_net
             local_ep_reward_sum, local_ep_count = 0.0, 0
         
             for step in range(args.num_steps):
-                buf['dones'][step] = next_done
                 actions_to_send = [{} for _ in range(args.num_envs)]
                 
                 baseline_obs_list = []
@@ -354,10 +353,6 @@ def rollout_worker(local_rank, device, args, buffers, actor_net, bc_baseline_net
                             obs_dict, infos_dict, active_agents = next_env_results[i]
                         else:
                             obs_dict, step_rewards, terms, truncs, infos_dict, active_agents = next_env_results[i]
-                            for a in possible_agents:
-                                if learning_assignment[i, agent_to_idx[a]]:
-                                    buf['rewards'][step, i, agent_to_idx[a]] = step_rewards.get(a, 0.0)
-                                    next_done[i, agent_to_idx[a]] = float(terms.get(a, False))
 
                         if '__terminal_observation' in infos_dict and 'episode_reward' in infos_dict:
                             for r in infos_dict['episode_reward'].values():
@@ -490,6 +485,22 @@ def rollout_worker(local_rank, device, args, buffers, actor_net, bc_baseline_net
                 next_env_results = vec_env.step(actions_to_send, progress_to_send)
                 env_step_time += (time.time() - t_env_start)
 
+                with torch.no_grad():
+                    for i in range(args.num_envs):
+                        if len(next_env_results[i]) > 3:
+                            obs_dict, step_rewards, terms, truncs, infos_dict, active_agents = next_env_results[i]
+
+                            if '__terminal_observation' in infos_dict:
+                                batch_z[i].zero_()
+                                batch_prev_z[i].zero_()
+                                batch_S_M[i].zero_()
+                            
+                            for a in possible_agents:
+                                if learning_assignment[i, agent_to_idx[a]]:
+                                    buf['rewards'][step, i, agent_to_idx[a]] = step_rewards.get(a, 0.0)
+                                    buf['dones'][step, i, agent_to_idx[a]] = float(terms.get(a, False))
+                                    next_done[i, agent_to_idx[a]] = float(terms.get(a, False))
+
         # Calculate GAE Advantages
         with torch.no_grad():
             next_value = torch.zeros((args.num_envs, NUM_AGENTS), device=device)
@@ -524,7 +535,7 @@ def rollout_worker(local_rank, device, args, buffers, actor_net, bc_baseline_net
                 nextnonterminal = 1.0 - next_done
                 nextvalues = next_value
             else:
-                nextnonterminal = 1.0 - buf['dones'][t + 1]
+                nextnonterminal = 1.0 - buf['dones'][t]
                 nextvalues = buf['values'][t + 1]
             delta = buf['rewards'][t] + args.gamma * nextvalues * nextnonterminal - buf['values'][t]
             buf['advantages'][t] = lastgaelam = delta + args.gamma * args.gae_lambda * nextnonterminal * lastgaelam
@@ -539,8 +550,7 @@ def rollout_worker(local_rank, device, args, buffers, actor_net, bc_baseline_net
         worker_stats[4] = local_ep_reward_sum
         worker_stats[5] = local_ep_count
     
-        rollout_complete_event.set()
-        buffer_idx = 1 - buffer_idx
+        ready_buffers_queue.put(buffer_idx)
 
 def main():
     mp.set_start_method('spawn', force=True)
@@ -664,9 +674,11 @@ def main():
     # Double-buffering architecture masks CPU environment latency behind GPU backpropagation
     buffers = {0: create_buffer(), 1: create_buffer()}
     
-    rollout_complete_event = threading.Event()
-    update_complete_event = threading.Event()
-    update_complete_event.set() 
+    free_buffers_queue = queue.Queue()
+    ready_buffers_queue = queue.Queue()
+    
+    free_buffers_queue.put(0)
+    free_buffers_queue.put(1)
 
     thread_stats = {"env_time": 0.0, "gpu_fwd_time": 0.0, "proposed": 0, "dropped": 0}
 
@@ -681,7 +693,7 @@ def main():
 
     rollout_process = threading.Thread(target=rollout_worker, args=(
         local_rank, device, args, buffers, actor_net, bc_baseline_net,
-        update_complete_event, rollout_complete_event, worker_stats,
+        free_buffers_queue, ready_buffers_queue, worker_stats,
         NUM_AGENTS, MAP_PROVINCES, VOCAB_SIZE, NONE_IDX, possible_agents, agent_to_idx
     ))
     rollout_process.start()
@@ -712,13 +724,10 @@ def main():
 
     dist.barrier()
 
-    buffer_idx = 0
     for update in range(1, args.num_updates + 1):
         start_time = time.time()
         
-        # Await experience buffer completion
-        rollout_complete_event.wait()
-        rollout_complete_event.clear()
+        buffer_idx = ready_buffers_queue.get()
         
         with torch.no_grad():
             for param, actor_param in zip(net.module.parameters(), actor_net.parameters()):
@@ -731,8 +740,7 @@ def main():
         proposed_actions = int(worker_stats[2].item())
         illegal_dropped = int(worker_stats[3].item())
 
-        # Signal background thread to begin filling the alternate buffer
-        update_complete_event.set()
+        free_buffers_queue.put(buffer_idx)
         inference_stream.wait_stream(torch.cuda.current_stream())
         
         valid = buf['masks'].view(-1)
@@ -1031,7 +1039,6 @@ def main():
             last_avg_ep_reward = global_ep_reward_sum / global_ep_count
 
         update_time = time.time() - t_update_start
-        buffer_idx = 1 - buffer_idx
         
         if global_rank == 0:
             total_time = time.time() - start_time
