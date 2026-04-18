@@ -412,6 +412,7 @@ def rollout_worker(local_rank, device, args, buffers, actor_net, bc_baseline_net
                         buf['z'][step][buf['masks'][step]] = new_z
                         buf['h'][step][buf['masks'][step]] = new_h
                         buf['prev_h'][step][buf['masks'][step]] = active_h
+                        buf['H'][step][buf['masks'][step]] = active_H
 
                         active_sparse = buf['sparse_masks'][step][buf['masks'][step]]
                         
@@ -805,6 +806,7 @@ def main():
         flat_z = buf['z'].view(-1, 8, 256)[valid]
         flat_h = buf['h'].view(-1, 8, 256)[valid]
         flat_prev_h = buf['prev_h'].view(-1, 8, 256)[valid]
+        flat_H = buf['H'].view(-1, 7, 7)[valid]
 
         b_size = flat_obs.shape[0]
         

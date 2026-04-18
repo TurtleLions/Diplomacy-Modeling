@@ -24,7 +24,7 @@ from torch.utils.data.distributed import DistributedSampler
 from torch.utils.data import Dataset, DataLoader
 
 from diplomacy import Game
-from HRLhelpers import FeudalDiplomacyAgent, build_global_vocab, parse_state_to_tensor, InteractionMatrixTracker
+from HRLhelpers import FeudalDiplomacyAgent, build_global_vocab, parse_state_to_tensor, InteractionMatrixTracker, build_distance_matrix
 
 # --- GLOBAL CONSTANTS ---
 FEATURE_DIM = 61
@@ -50,42 +50,6 @@ GLOBAL_HSCS = {
     'RUSSIA': ['MOS', 'SEV', 'WAR', 'STP'],
     'TURKEY': ['ANK', 'CON', 'SMY']
 }
-
-# --- OFFLINE GRAPH BUILDER ---
-
-def build_distance_matrix(provinces):
-    game = Game()
-    G = nx.Graph()
-    
-    is_callable = callable(game.map.abut_list)
-    if not is_callable:
-        abut_dict = game.map.abut_list
-    
-    for loc in game.map.locs:
-        if is_callable:
-            borders = game.map.abut_list(loc)
-        else:
-            borders = abut_dict.get(loc, [])
-            
-        loc_base = loc.split('/')[0].upper() 
-        
-        for border in borders:
-            border_base = border.split('/')[0].upper()
-            if loc_base in provinces and border_base in provinces:
-                G.add_edge(loc_base, border_base)
-                
-    num_provs = len(provinces)
-    D = torch.zeros((num_provs, num_provs), dtype=torch.long)
-    lengths = dict(nx.all_pairs_shortest_path_length(G))
-    
-    for i, p1 in enumerate(provinces):
-        for j, p2 in enumerate(provinces):
-            if p1 in lengths and p2 in lengths[p1]:
-                D[i, j] = min(lengths[p1][p2], 19) 
-            else:
-                D[i, j] = 19 
-                
-    return D
 
 # --- DATA GENERATION & MEMMAP BUILDER ---
 

@@ -510,16 +510,13 @@ class FeudalDiplomacyAgent(nn.Module):
         logits, _ = self.worker(S_mu_raw, z_zero, self.D)
         return logits
 
-    def forward(self, mb_obs, mb_H=None, mb_prev_z=None, worker_z_target=None, bc_mode=False):
+    def forward(self, mb_obs, mb_H=None, mb_prev_h=None, worker_z_target=None, bc_mode=False):
         if bc_mode:
             B = mb_obs.size(0)
             z_zero = torch.zeros((B, 8, self.worker.d_model), device=mb_obs.device, dtype=mb_obs.dtype)
             logits, _ = self.worker(mb_obs, z_zero, self.D)
             return logits
 
-        x_emb = self.worker.feature_projection(mb_obs)
-        S_mu_encoded = self.worker.encoder_transformer(x_emb)
-        S_M = self.pooler(S_mu_encoded)
         x_emb = self.worker.feature_projection(mb_obs)
         S_mu_encoded = self.worker.encoder_transformer(x_emb)
         S_M = self.pooler(S_mu_encoded)
