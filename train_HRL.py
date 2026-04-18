@@ -31,6 +31,8 @@ from gymnasium.vector import AsyncVectorEnv
 
 from HRLhelpers import FeudalDiplomacyAgent, DiplomacyTransformerEnv, build_global_vocab, build_distance_matrix, InteractionMatrixTracker
 
+C_INT = 0.5
+
 def rebuild_packed_masks(sparse_masks, num_provs, vocab_size, none_idx, device):
     """
     Directly builds the dynamically sized `packed_masks` and `is_active_mask` 
@@ -109,7 +111,7 @@ def worker(remote, parent_remote):
                 
                 if env_is_done:
                     terminal_obs = obs
-                    obs, infos_reset = env.reset()
+                    obs, infos = env.reset()
                     
                     infos['__terminal_observation'] = terminal_obs
                     infos['episode_reward'] = episode_rewards.copy()
@@ -426,16 +428,16 @@ def rollout_worker(local_rank, device, args, buffers, actor_net, bc_baseline_net
                         active_logits = logits[b_idx, padded_idx, :].float()
                         active_logits = active_logits.masked_fill(~packed_masks, -1e20)
                         
-                        # Sample actions only for active units
+                        seq_lens = is_active_mask.sum(dim=1)
+                        valid_pack_mask = torch.arange(max_act, device=device).unsqueeze(0) < seq_lens.unsqueeze(1)
+                        active_logits = active_logits.masked_fill(~valid_pack_mask.unsqueeze(-1), 0.0)
+                        
                         dist_cat = Categorical(logits=active_logits)
                         packed_actions = dist_cat.sample()
                         packed_logprobs = dist_cat.log_prob(packed_actions)
                         
                         final_actions = torch.full((flat_obs.size(0), MAP_PROVINCES), NONE_IDX, dtype=torch.long, device=device)
                         final_logprobs = torch.zeros((flat_obs.size(0), MAP_PROVINCES), dtype=torch.float32, device=device)
-
-                        seq_lens = is_active_mask.sum(dim=1)
-                        valid_pack_mask = torch.arange(max_act, device=device).unsqueeze(0) < seq_lens.unsqueeze(1)
                         
                         valid_b, valid_seq = torch.where(valid_pack_mask)
                         valid_p = padded_idx[valid_b, valid_seq]
@@ -909,11 +911,13 @@ def main():
                 
                 with my_context:
                     with torch.autocast(device_type='cuda', dtype=torch.bfloat16):
-                        live_S_M, predicted_z, predicted_h, logits, values_pred = net(
-                            mb_obs, mb_H, mb_prev_h, mb_z.to(torch.bfloat16), bc_mode=False
+                        live_S_M, predicted_z, predicted_h, logits, values_pred, z_achieved_raw = net(
+                            mb_obs, mb_H, mb_prev_h, mb_z.to(torch.bfloat16), bc_mode=False, mb_S_M_next=mb_S_M_next
                         )
-                        z_achieved_raw = net.module.inverse_model(live_S_M, mb_S_M_next)
                         z_achieved = F.normalize(z_achieved_raw.float(), p=2, dim=-1)
+
+                        intrinsic_reward = F.cosine_similarity(z_achieved.detach(), mb_z.detach(), dim=-1)
+                        epoch_intrinsic_reward_sum += intrinsic_reward.mean().item()
                         
                         manager_loss = F.mse_loss(predicted_z, z_achieved.detach())
                         
@@ -931,16 +935,16 @@ def main():
                         active_logits = logits[b_idx_live, padded_idx, :].float()
                         active_logits = active_logits.masked_fill(~packed_masks, -1e20)
                         
+                        seq_lens = is_active.sum(dim=1)
+                        valid_pack_mask = torch.arange(max_act_live, device=device).unsqueeze(0) < seq_lens.unsqueeze(1)
+                        active_logits = active_logits.masked_fill(~valid_pack_mask.unsqueeze(-1), 0.0)
+                        
                         dist_cat = Categorical(logits=active_logits)
                         packed_actions = torch.gather(mb_act, 1, padded_idx)
                         new_logprobs = dist_cat.log_prob(packed_actions)
                         
                         old_logprobs_packed = torch.gather(mb_logprobs, 1, padded_idx)
-                        
                         ratio = torch.exp(new_logprobs - old_logprobs_packed)
-                        
-                        seq_lens = is_active.sum(dim=1)
-                        valid_pack_mask = torch.arange(max_act, device=device).unsqueeze(0) < seq_lens.unsqueeze(1)
                         
                         valid_ratio_mask = (packed_actions != NONE_IDX) & valid_pack_mask
                         surr1 = ratio * mb_adv.unsqueeze(1)
@@ -951,7 +955,8 @@ def main():
                         entropy = dist_cat.entropy()[valid_ratio_mask].mean()
                         manager_loss = F.mse_loss(predicted_z, z_achieved.detach())
                         
-                        distance_penalty = torch.tensor(0.0, device=device)
+                        distance_penalty = F.mse_loss(mb_z.detach(), z_achieved.detach())
+                        epoch_feasibility_error_sum += distance_penalty.item()
                         
                         with torch.no_grad():
                             bc_z = torch.zeros_like(mb_z)
@@ -976,7 +981,8 @@ def main():
                                          + manager_loss 
                                          + inverse_model_loss # Added
                                          + (args.bc_kl_coef * bc_kl_penalty) 
-                                         + (args.v_coef * v_loss))
+                                         + (args.v_coef * v_loss)
+                                         - (C_INT * intrinsic_reward.mean()))
 
                         epoch_pg_loss_sum += pg_loss.item()
                         epoch_manager_loss_sum += manager_loss.item()
