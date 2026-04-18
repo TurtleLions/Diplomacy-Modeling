@@ -304,7 +304,8 @@ def parse_args():
 
 def rollout_worker(local_rank, device, args, buffers, actor_net, bc_baseline_net, 
                    free_buffers_queue, ready_buffers_queue, worker_stats, 
-                   NUM_AGENTS, MAP_PROVINCES, VOCAB_SIZE, NONE_IDX, possible_agents, agent_to_idx):
+                   NUM_AGENTS, MAP_PROVINCES, VOCAB_SIZE, NONE_IDX, possible_agents, agent_to_idx,
+                   actor_weights_lock):
     """Background process responsible for filling the experience buffer asynchronously."""
     torch.cuda.set_device(device) 
     inference_stream = torch.cuda.Stream(device=device)
@@ -392,20 +393,21 @@ def rollout_worker(local_rank, device, args, buffers, actor_net, bc_baseline_net
                         active_z = batch_z[buf['masks'][step]]
                         active_prev_z = batch_prev_z[buf['masks'][step]]
                         
-                        with torch.autocast(device_type='cuda', dtype=torch.bfloat16):
-                            x_emb = actor_net.worker.feature_projection(flat_obs)
-                            S_mu_encoded = actor_net.worker.encoder_transformer(x_emb)
-                            active_S_M = actor_net.pooler(S_mu_encoded)
-                            
-                            # Mamba Manager (Strategy generation)
-                            new_z = actor_net.manager(active_S_M, active_H, active_z)
-                            new_z = F.normalize(new_z.float(), p=2, dim=-1).to(torch.bfloat16)
-                            
-                            # Worker Decoder (One-Shot action generation)
-                            logits, _ = actor_net.worker(flat_obs, new_z, actor_net.D)
-                            
-                            pooled_S_M = active_S_M.mean(dim=1)
-                            values = actor_net.value_head(pooled_S_M).squeeze(-1).float()
+                        with actor_weights_lock:
+                            with torch.autocast(device_type='cuda', dtype=torch.bfloat16):
+                                x_emb = actor_net.worker.feature_projection(flat_obs)
+                                S_mu_encoded = actor_net.worker.encoder_transformer(x_emb)
+                                active_S_M = actor_net.pooler(S_mu_encoded)
+                                
+                                # Mamba Manager (Strategy generation)
+                                new_z = actor_net.manager(active_S_M, active_H, active_z)
+                                new_z = F.normalize(new_z.float(), p=2, dim=-1).to(torch.bfloat16)
+                                
+                                # Worker Decoder (One-Shot action generation)
+                                logits, _ = actor_net.worker(flat_obs, new_z, actor_net.D)
+                                
+                                pooled_S_M = active_S_M.mean(dim=1)
+                                values = actor_net.value_head(pooled_S_M).squeeze(-1).float()
                         
                         # Update persistent tensors
                         batch_S_M[buf['masks'][step]] = active_S_M
@@ -499,6 +501,7 @@ def rollout_worker(local_rank, device, args, buffers, actor_net, bc_baseline_net
                                 if learning_assignment[i, agent_to_idx[a]]:
                                     buf['rewards'][step, i, agent_to_idx[a]] = step_rewards.get(a, 0.0)
                                     buf['dones'][step, i, agent_to_idx[a]] = float(terms.get(a, False))
+                                    buf['truncations'][step, i, agent_to_idx[a]] = float(truncs.get(a, False))
                                     next_done[i, agent_to_idx[a]] = float(terms.get(a, False))
 
         # Calculate GAE Advantages
@@ -523,16 +526,18 @@ def rollout_worker(local_rank, device, args, buffers, actor_net, bc_baseline_net
                         indices_to_update.append((i, agent_to_idx[a]))
                     
             if obs_to_encode:
-                obs_tensor = torch.stack(obs_to_encode)
-                with torch.autocast(device_type='cuda', dtype=torch.bfloat16):
-                    x_emb = actor_net.worker.feature_projection(obs_tensor)
-                    S_mu_enc = actor_net.worker.encoder_transformer(x_emb)
-                    S_M_next = actor_net.pooler(S_mu_enc)
-                    pooled_S_M_next = S_M_next.mean(dim=1)
-                    next_v = actor_net.value_head(pooled_S_M_next).float()
-                
-                for list_idx, (env_idx, agent_idx) in enumerate(indices_to_update):
-                    next_value[env_idx, agent_idx] = next_v[list_idx].float().squeeze(-1)
+            obs_tensor = torch.stack(obs_to_encode)
+            with torch.autocast(device_type='cuda', dtype=torch.bfloat16):
+                x_emb = actor_net.worker.feature_projection(obs_tensor)
+                S_mu_enc = actor_net.worker.encoder_transformer(x_emb)
+                S_M_next = actor_net.pooler(S_mu_enc)
+                pooled_S_M_next = S_M_next.mean(dim=1)
+                next_v = actor_net.value_head(pooled_S_M_next).float()
+            
+            for list_idx, (env_idx, agent_idx) in enumerate(indices_to_update):
+                val = next_v[list_idx].float().squeeze(-1)
+                next_value[env_idx, agent_idx] = val
+                buf['terminal_values'][step, env_idx, agent_idx] = val
             
         lastgaelam = 0
         for t in reversed(range(args.num_steps)):
@@ -541,7 +546,9 @@ def rollout_worker(local_rank, device, args, buffers, actor_net, bc_baseline_net
                 nextvalues = next_value
             else:
                 nextnonterminal = 1.0 - buf['dones'][t]
-                nextvalues = buf['values'][t + 1]
+                is_trunc = buf['truncations'][t] == 1.0
+                nextvalues = torch.where(is_trunc, buf['terminal_values'][t], buf['values'][t + 1])
+                
             delta = buf['rewards'][t] + args.gamma * nextvalues * nextnonterminal - buf['values'][t]
             buf['advantages'][t] = lastgaelam = delta + args.gamma * args.gae_lambda * nextnonterminal * lastgaelam
         buf['returns'] = buf['advantages'] + buf['values']
@@ -655,7 +662,7 @@ def main():
         if global_rank == 0:
             print(f"Successfully resumed RL training from checkpoint: {args.resume_weights}")
 
-    net = DDP(net, device_ids=[local_rank])
+    net = DDP(net, device_ids=[local_rank], find_unused_parameters=True)
     
     optimizer = optim.Adam(net.parameters(), lr=args.lr, eps=1e-5)
     
@@ -674,6 +681,8 @@ def main():
             'dones': torch.zeros((args.num_steps, args.num_envs, NUM_AGENTS), dtype=torch.float32, device=device),
             'values': torch.zeros((args.num_steps, args.num_envs, NUM_AGENTS), dtype=torch.float32, device=device),
             'masks': torch.zeros((args.num_steps, args.num_envs, NUM_AGENTS), dtype=torch.bool, device=device),
+            'truncations': torch.zeros((args.num_steps, args.num_envs, NUM_AGENTS), dtype=torch.float32, device=device),
+            'terminal_values': torch.zeros((args.num_steps, args.num_envs, NUM_AGENTS), dtype=torch.float32, device=device),
             'sparse_masks': torch.full((args.num_steps, args.num_envs, NUM_AGENTS, 4000), -1, dtype=torch.int32, device=device),
             'advantages': torch.zeros((args.num_steps, args.num_envs, NUM_AGENTS), dtype=torch.float32, device=device),
             'returns': torch.zeros((args.num_steps, args.num_envs, NUM_AGENTS), dtype=torch.float32, device=device),
@@ -704,11 +713,12 @@ def main():
     agent_to_idx = {a: i for i, a in enumerate(possible_agents)}
 
     inference_stream = torch.cuda.Stream(device=device)
-
+    actor_weights_lock = threading.Lock()
     rollout_process = threading.Thread(target=rollout_worker, args=(
         local_rank, device, args, buffers, actor_net, bc_baseline_net,
         free_buffers_queue, ready_buffers_queue, worker_stats,
-        NUM_AGENTS, MAP_PROVINCES, VOCAB_SIZE, NONE_IDX, possible_agents, agent_to_idx
+        NUM_AGENTS, MAP_PROVINCES, VOCAB_SIZE, NONE_IDX, possible_agents, agent_to_idx,
+        actor_weights_lock
     ))
     rollout_process.start()
 
@@ -743,9 +753,10 @@ def main():
         
         buffer_idx = ready_buffers_queue.get()
         
-        with torch.no_grad():
-            for param, actor_param in zip(net.module.parameters(), actor_net.parameters()):
-                actor_param.data.copy_(param)
+        with actor_weights_lock:
+            with torch.no_grad():
+                for param, actor_param in zip(net.module.parameters(), actor_net.parameters()):
+                    actor_param.data.copy_(param)
         torch.cuda.current_stream().synchronize()
 
         buf = buffers[buffer_idx]
@@ -869,136 +880,10 @@ def main():
                 
                 with my_context:
                     with torch.autocast(device_type='cuda', dtype=torch.bfloat16):
-                        x_emb_live = net.module.worker.feature_projection(mb_obs)
-                        S_mu_enc_live = net.module.worker.encoder_transformer(x_emb_live)
-                        live_S_M = net.module.pooler(S_mu_enc_live)
-                        
-                        z_achieved = F.normalize((mb_S_M_next - live_S_M).float(), p=2, dim=-1)
-                        
-                        predicted_z = net.module.manager(live_S_M, mb_H, mb_prev_z)
-
-                        z_achieved = F.normalize(z_achieved.float(), p=2, dim=-1)
-                        predicted_z = F.normalize(predicted_z.float(), p=2, dim=-1)
-                        mb_z_float = mb_z.float()
-
-                        distance_penalty = (z_achieved.detach() - mb_z_float).pow(2).sum(dim=-1)
-
-                        current_beta = 2.0 
-                        feudal_adv = mb_adv - (current_beta * distance_penalty)
-                        
-                        dynamic_threshold = torch.quantile(distance_penalty, 0.80) 
-                        failed_mask = distance_penalty > dynamic_threshold
-
-                        manager_z_target = z_achieved.detach()
-                        raw_manager_loss = F.mse_loss(predicted_z, manager_z_target, reduction='none').mean(dim=-1)
-                        
-                        if feudal_adv.shape[0] > 1:
-                            manager_adv = (feudal_adv - feudal_adv.mean()) / (feudal_adv.std() + 1e-8)
-                        else:
-                            manager_adv = feudal_adv - feudal_adv.mean()
-
-                        manager_loss = (raw_manager_loss * -manager_adv.detach()).mean()
-
-                        worker_z_target = mb_z_float.clone()
-                        
-                        her_prob = torch.rand(worker_z_target.size(0), device=device) < 0.5
-                        relabel_mask = failed_mask & her_prob
-                        
-                        worker_z_target[relabel_mask] = z_achieved[relabel_mask].detach()
-                        
-                        intrinsic_reward = -1.0 * (z_achieved.detach() - worker_z_target).pow(2).sum(dim=-1)
-
-                        epoch_intrinsic_reward_sum += intrinsic_reward.mean().item() # <--- ADD THIS
-                        
-                        if intrinsic_reward.shape[0] > 1:
-                            intrinsic_adv = (intrinsic_reward - intrinsic_reward.mean()) / (intrinsic_reward.std(unbiased=False) + 1e-5)
-                        else:
-                            intrinsic_adv = intrinsic_reward - intrinsic_reward.mean()
-
-                        logits, _ = net.module.worker(mb_obs, worker_z_target.to(torch.bfloat16), net.module.D)
-                        logits = torch.nan_to_num(logits, nan=-1e8, posinf=1e8, neginf=-1e8)
-                        
-                        is_active_mask, packed_masks, padded_indices, max_active = rebuild_packed_masks(
-                            mb_sparse_gpu, MAP_PROVINCES, VOCAB_SIZE, NONE_IDX, device
+                        live_S_M, predicted_z, logits, values_pred = net(
+                            mb_obs, mb_H, mb_prev_z, worker_z_target.to(torch.bfloat16)
                         )
-                        
-                        active_logits = torch.gather(logits, 1, padded_indices.unsqueeze(-1).expand(-1, -1, VOCAB_SIZE))
-                        active_logits = active_logits.float().masked_fill(~packed_masks, -1e9)
-                        
-                        dist_cat = Categorical(logits=active_logits)
-                        mb_act_active = torch.gather(mb_act, 1, padded_indices)
-                        new_logprobs_active = dist_cat.log_prob(mb_act_active)
-                        entropy_seq_active = dist_cat.entropy()
-                        
-                        # Scatter back to full (B, 82) shape
-                        new_logprobs = torch.zeros_like(mb_logprobs)
-                        new_logprobs.scatter_(1, padded_indices, new_logprobs_active)
-                        
-                        entropy_seq = torch.zeros_like(mb_logprobs)
-                        entropy_seq.scatter_(1, padded_indices, entropy_seq_active)
-
-                        is_active_mask_f = is_active_mask.float()
-                        total_valid_units = is_active_mask_f.sum().clamp(min=1)
-                        
-                        with torch.no_grad():
-                            old_logits_her, _ = net.module.worker(mb_obs, worker_z_target.to(torch.bfloat16), net.module.D)
-                            active_old_logits = torch.gather(old_logits_her, 1, padded_indices.unsqueeze(-1).expand(-1, -1, VOCAB_SIZE))
-                            active_old_logits = active_old_logits.float().masked_fill(~packed_masks, -1e9)
-                            
-                            old_dist_her = Categorical(logits=active_old_logits)
-                            mb_act_active = torch.gather(mb_act, 1, padded_indices)
-                            recalc_old_logprobs_active = old_dist_her.log_prob(mb_act_active)
-                            
-                            recalculated_old_logprobs = torch.zeros_like(mb_logprobs)
-                            recalculated_old_logprobs.scatter_(1, padded_indices, recalc_old_logprobs_active)
-                        
-                        new_logprobs = torch.nan_to_num(new_logprobs, nan=0.0)
-                        recalculated_old_logprobs = torch.nan_to_num(recalculated_old_logprobs, nan=0.0)
-                        
-                        unit_new_logprobs = new_logprobs * is_active_mask_f
-                        unit_old_logprobs = recalculated_old_logprobs * is_active_mask_f
-                        
-                        unit_ratios = torch.exp(unit_new_logprobs - unit_old_logprobs)
-                        
-                        adv_expanded = intrinsic_adv.unsqueeze(1).expand_as(unit_ratios)
-                        unit_specific_adv = adv_expanded * is_active_mask_f
-                        
-                        pg_loss1 = -unit_specific_adv * unit_ratios
-                        pg_loss2 = -unit_specific_adv * torch.clamp(unit_ratios, 1 - args.clip_coef, 1 + args.clip_coef)
-                        
-                        pg_loss = (torch.max(pg_loss1, pg_loss2) * is_active_mask_f).sum() / total_valid_units
-                        entropy = (entropy_seq * is_active_mask_f).sum() / total_valid_units
-                        
-                        log_ratio = torch.clamp(unit_new_logprobs - unit_old_logprobs, min=-20.0, max=20.0) * is_active_mask_f
-                        kl_divergence = ((torch.exp(log_ratio) - 1.0 - log_ratio) * is_active_mask_f).sum() / total_valid_units
-
-                        with torch.no_grad():
-                            bc_logits, _ = bc_baseline_net.worker(mb_obs, worker_z_target.to(torch.bfloat16), bc_baseline_net.D)
-                            bc_logits = torch.nan_to_num(bc_logits, nan=-1e8, posinf=1e8, neginf=-1e8)
-                            
-                            active_bc_logits = torch.gather(bc_logits, 1, padded_indices.unsqueeze(-1).expand(-1, -1, VOCAB_SIZE))
-                            active_bc_logits = active_bc_logits.float().masked_fill(~packed_masks, -1e20)
-                            bc_log_probs_active = torch.log_softmax(active_bc_logits, dim=-1)
-                            
-                        live_log_probs_active = torch.log_softmax(active_logits, dim=-1)
-                        live_probs_active = torch.exp(live_log_probs_active)
-                        
-                        live_log_probs_active = torch.nan_to_num(live_log_probs_active, nan=0.0, posinf=0.0, neginf=-100.0)
-                        bc_log_probs_active = torch.nan_to_num(bc_log_probs_active, nan=0.0, posinf=0.0, neginf=-100.0)
-                        live_probs_active = torch.nan_to_num(live_probs_active, nan=0.0)
-                        
-                        bc_log_ratio_active = torch.clamp(live_log_probs_active - bc_log_probs_active, min=-20.0, max=20.0)
-                        
-                        # Calculate KL natively in packed state, scatter, then mask out any edge cases
-                        unit_bc_kl_active = (live_probs_active * bc_log_ratio_active).sum(dim=-1) 
-                        unit_bc_kl_active = torch.nan_to_num(unit_bc_kl_active, nan=0.0)
-                        
-                        unit_bc_kl = torch.zeros_like(mb_logprobs)
-                        unit_bc_kl.scatter_(1, padded_indices, unit_bc_kl_active)
-                        unit_bc_kl = unit_bc_kl * is_active_mask_f
-                        bc_kl_penalty = unit_bc_kl.sum() / total_valid_units
-
-                        values_pred = net.module.value_head(live_S_M.mean(dim=1)).squeeze(-1).float()
+                        z_achieved = F.normalize((mb_S_M_next - live_S_M).float(), p=2, dim=-1)
                         v_loss = F.mse_loss(values_pred, mb_ret.float())
                         
                         unscaled_loss = pg_loss - (args.ent_coef * entropy) + manager_loss + (args.bc_kl_coef * bc_kl_penalty) + (args.v_coef * v_loss)
