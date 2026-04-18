@@ -962,11 +962,15 @@ def main():
                             bc_z = torch.zeros_like(mb_z)
                             bc_logits, _ = bc_baseline_net.worker(mb_obs, bc_z, bc_baseline_net.D)
                             
+                            bc_logits = torch.nan_to_num(bc_logits, nan=-1e8, posinf=1e8, neginf=-1e8)
+                            
                             B_bc, max_act_bc = padded_idx.shape
                             b_idx_bc = torch.arange(B_bc, device=device).view(B_bc, 1).expand(B_bc, max_act_bc)
                             
                             bc_active_logits = bc_logits[b_idx_bc, padded_idx, :].float()
                             bc_active_logits = bc_active_logits.masked_fill(~packed_masks, -1e20)
+                            
+                            bc_active_logits = bc_active_logits.masked_fill(~valid_pack_mask.unsqueeze(-1), 0.0)
                             
                             bc_dist = Categorical(logits=bc_active_logits)
                             bc_logprobs = bc_dist.log_prob(packed_actions)
