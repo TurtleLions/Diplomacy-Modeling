@@ -782,7 +782,7 @@ class DiplomacyTransformerEnv(ParallelEnv):
             # Supply Center Deltas
             sc_delta = current_sc_count - prev_sc_counts.get(agent, 0)
             if sc_delta != 0:
-                rewards[agent] += (sc_delta * 5.0) * anneal_factor
+                rewards[agent] += (sc_delta * 5.0)
                         
             occupied_unowned_scs = 0
             for unit_str in agent_units:

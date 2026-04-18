@@ -413,7 +413,9 @@ def train_worker(rank, world_size, paths_and_metadata, args):
             
             b_idx = torch.arange(batch_size, device=rank).view(-1, 1).expand(-1, num_provs)
             p_idx = torch.arange(num_provs, device=rank).view(1, -1).expand(batch_size, -1)
-            dense_mask[b_idx, p_idx, targets] = True
+
+            valid_targets = dense_mask[b_idx, p_idx, targets]
+            targets[~valid_targets] = none_idx
 
             optimizer.zero_grad()
             

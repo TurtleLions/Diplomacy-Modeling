@@ -889,17 +889,15 @@ def main():
                         dynamic_threshold = torch.quantile(distance_penalty, 0.80) 
                         failed_mask = distance_penalty > dynamic_threshold
 
-                        manager_z_target = mb_z_float.clone()
-                        manager_z_target[failed_mask] = z_achieved[failed_mask]
-
-                        raw_manager_loss = F.mse_loss(predicted_z, manager_z_target.detach(), reduction='none').mean(dim=-1)
+                        manager_z_target = z_achieved.detach()
+                        raw_manager_loss = F.mse_loss(predicted_z, manager_z_target, reduction='none').mean(dim=-1)
                         
                         if feudal_adv.shape[0] > 1:
                             manager_adv = (feudal_adv - feudal_adv.mean()) / (feudal_adv.std() + 1e-8)
                         else:
                             manager_adv = feudal_adv - feudal_adv.mean()
 
-                        manager_loss = (raw_manager_loss * manager_adv.detach()).mean()
+                        manager_loss = (raw_manager_loss * -manager_adv.detach()).mean()
 
                         worker_z_target = mb_z_float.clone()
                         
@@ -942,9 +940,24 @@ def main():
                         is_active_mask_f = is_active_mask.float()
                         total_valid_units = is_active_mask_f.sum().clamp(min=1)
                         
+                        with torch.no_grad():
+                            old_logits_her, _ = net.module.worker(mb_obs, worker_z_target.to(torch.bfloat16), net.module.D)
+                            active_old_logits = torch.gather(old_logits_her, 1, padded_indices.unsqueeze(-1).expand(-1, -1, VOCAB_SIZE))
+                            active_old_logits = active_old_logits.float().masked_fill(~packed_masks, -1e9)
+                            
+                            old_dist_her = Categorical(logits=active_old_logits)
+                            mb_act_active = torch.gather(mb_act, 1, padded_indices)
+                            recalc_old_logprobs_active = old_dist_her.log_prob(mb_act_active)
+                            
+                            recalculated_old_logprobs = torch.zeros_like(mb_logprobs)
+                            recalculated_old_logprobs.scatter_(1, padded_indices, recalc_old_logprobs_active)
+                        
                         new_logprobs = torch.nan_to_num(new_logprobs, nan=0.0)
+                        recalculated_old_logprobs = torch.nan_to_num(recalculated_old_logprobs, nan=0.0)
+                        
                         unit_new_logprobs = new_logprobs * is_active_mask_f
-                        unit_old_logprobs = mb_logprobs * is_active_mask_f
+                        unit_old_logprobs = recalculated_old_logprobs * is_active_mask_f
+                        
                         unit_ratios = torch.exp(unit_new_logprobs - unit_old_logprobs)
                         
                         adv_expanded = intrinsic_adv.unsqueeze(1).expand_as(unit_ratios)
