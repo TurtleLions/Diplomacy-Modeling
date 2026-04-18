@@ -8,6 +8,7 @@ import json
 import signal
 import argparse
 import multiprocessing as smp
+import math
 
 import psutil
 import numpy as np
@@ -16,6 +17,7 @@ import networkx as nx
 import torch
 import torch.nn as nn
 import torch.optim as optim
+from torch.utils.data import Sampler
 import torch.distributed as dist
 import torch.nn.functional as F
 import torch.multiprocessing as mp
@@ -308,6 +310,55 @@ def process_and_save_to_disk(json_path, cache_dir, max_games=None):
 
 # --- DATASET & TRAINING ---
 
+class ChunkedDistributedSampler(Sampler):
+    def __init__(self, dataset, num_replicas=None, rank=None, chunk_size=100000):
+        if num_replicas is None:
+            num_replicas = dist.get_world_size()
+        if rank is None:
+            rank = dist.get_rank()
+            
+        self.dataset = dataset
+        self.num_replicas = num_replicas
+        self.rank = rank
+        self.epoch = 0
+        self.chunk_size = chunk_size
+        
+        self.num_samples = math.ceil(len(self.dataset) / self.num_replicas)
+        self.total_size = self.num_samples * self.num_replicas
+
+    def __iter__(self):
+        g = torch.Generator()
+        g.manual_seed(self.epoch)
+        
+        indices = []
+        n = len(self.dataset)
+        num_chunks = math.ceil(n / self.chunk_size)
+        
+        chunk_order = torch.randperm(num_chunks, generator=g).tolist()
+        
+        for chunk_idx in chunk_order:
+            start = chunk_idx * self.chunk_size
+            end = min(start + self.chunk_size, n)
+            
+            chunk_indices = (torch.randperm(end - start, generator=g) + start).tolist()
+            indices.extend(chunk_indices)
+
+        padding_size = self.total_size - len(indices)
+        if padding_size <= len(indices):
+            indices += indices[:padding_size]
+        else:
+            indices += (indices * math.ceil(padding_size / len(indices)))[:padding_size]
+
+        indices = indices[self.rank:self.total_size:self.num_replicas]
+
+        return iter(indices)
+        
+    def __len__(self):
+        return self.num_samples
+        
+    def set_epoch(self, epoch):
+        self.epoch = epoch
+
 class DiplomacyMemmapDataset(Dataset):
     def __init__(self, history_path, mask_sparse_path, targets_path, total_samples, num_provs, vocab_size, derived_mask_len):
         self.history_path = history_path
@@ -349,11 +400,22 @@ def train_worker(rank, world_size, paths_and_metadata, args):
     torch.cuda.set_device(rank)
     
     dataset = DiplomacyMemmapDataset(history_path, mask_sparse_path, targets_path, total_samples, num_provs, vocab_size, derived_mask_len)
-    sampler = DistributedSampler(dataset, num_replicas=world_size, rank=rank, shuffle=True)
+    sampler = ChunkedDistributedSampler(
+        dataset, 
+        num_replicas=world_size, 
+        rank=rank, 
+        chunk_size=250000
+    )
     
     dataloader = DataLoader(
-        dataset, batch_size=args.batch_size, shuffle=False, sampler=sampler,
-        num_workers=6, pin_memory=True, prefetch_factor=2, persistent_workers=True
+        dataset, 
+        batch_size=args.batch_size, 
+        shuffle=False,
+        sampler=sampler,
+        num_workers=48, 
+        pin_memory=True, 
+        prefetch_factor=4, 
+        persistent_workers=True
     )
     
     agent = FeudalDiplomacyAgent(d_model=256, vocab_size=vocab_size).to(rank)
