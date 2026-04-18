@@ -140,6 +140,24 @@ def get_sparse_action_mask(game, power, provinces, order_to_idx, max_len=MAX_SPA
     sparse_mask[:num_valid] = valid_indices
     return sparse_mask
 
+# --- OPTIMIZED CACHING FOR PARSER ---
+_STATIC_BASE_TENSOR = np.zeros((len(GLOBAL_PROV_TO_IDX), FEATURE_DIM), dtype=np.float32)
+
+for prov, p_idx in GLOBAL_PROV_TO_IDX.items():
+    ptype = GLOBAL_PROV_TYPES.get(prov, 'LAND')
+    if ptype in ['LAND', 'SHUT']: _STATIC_BASE_TENSOR[p_idx, 46] = 1.0
+    elif ptype in ['COAST', 'PORT']: _STATIC_BASE_TENSOR[p_idx, 47] = 1.0
+    elif ptype == 'WATER': _STATIC_BASE_TENSOR[p_idx, 48] = 1.0
+
+for power, hsc_list in GLOBAL_HSCS.items():
+    power_idx = GLOBAL_POWER_TO_IDX[power]
+    for hsc in hsc_list:
+        if hsc in GLOBAL_PROV_TO_IDX:
+            _STATIC_BASE_TENSOR[GLOBAL_PROV_TO_IDX[hsc], 32 + power_idx] = 1.0
+
+_COAST_MAP = {'NC': 16, 'SC': 17, 'EC': 18}
+_UNIT_MAP = {'A': 7, 'F': 8}
+
 def parse_state_to_tensor(turn_data, observing_agent=None, prev_state=None, bounces=None, H_matrix=None):
     """
     Parses a single game phase into a standardized geometric feature tensor.
@@ -161,122 +179,82 @@ def parse_state_to_tensor(turn_data, observing_agent=None, prev_state=None, boun
       [51-57] : Previous SC ownership (One-hot mapped to powers)
       [58-60] : Relative Diplomatic Stance (Occupied by: Self, Ally, Enemy)
     """
-    state_tensor = np.zeros((len(GLOBAL_PROV_TO_IDX), FEATURE_DIM), dtype=np.float32)
+    state_tensor = _STATIC_BASE_TENSOR.copy()
+    
     state_info = turn_data.get('state', {})
     phase_name = turn_data.get('name', 'S1901M')
     
-    is_m, is_r, is_a, is_spring, is_fall_winter = 1.0, 0.0, 0.0, 1.0, 0.0
-    
     if len(phase_name) >= 6:
-        season = phase_name[0].upper()
-        p_type = phase_name[-1].upper()
-        
-        is_m = 1.0 if p_type == 'M' else 0.0
-        is_r = 1.0 if p_type == 'R' else 0.0
-        is_a = 1.0 if p_type == 'A' else 0.0
-        is_spring = 1.0 if season == 'S' else 0.0
-        is_fall_winter = 1.0 if season in ['F', 'W'] else 0.0
-            
-    state_tensor[:, 19] = is_m
-    state_tensor[:, 20] = is_r
-    state_tensor[:, 21] = is_a
-    state_tensor[:, 22] = is_spring
-    state_tensor[:, 23] = is_fall_winter
-
-    for prov, p_idx in GLOBAL_PROV_TO_IDX.items():
-        ptype = GLOBAL_PROV_TYPES.get(prov, 'LAND')
-        if ptype in ['LAND', 'SHUT']: 
-            state_tensor[p_idx, 46] = 1.0
-        elif ptype in ['COAST', 'PORT']: 
-            state_tensor[p_idx, 47] = 1.0
-        elif ptype == 'WATER': 
-            state_tensor[p_idx, 48] = 1.0
-
-    for power, hsc_list in GLOBAL_HSCS.items():
-        power_idx = GLOBAL_POWER_TO_IDX[power]
-        for hsc in hsc_list:
-            if hsc in GLOBAL_PROV_TO_IDX:
-                p_idx = GLOBAL_PROV_TO_IDX[hsc]
-                state_tensor[p_idx, 32 + power_idx] = 1.0
+        season, p_type = phase_name[0].upper(), phase_name[-1].upper()
+        state_tensor[:, 19] = 1.0 if p_type == 'M' else 0.0
+        state_tensor[:, 20] = 1.0 if p_type == 'R' else 0.0
+        state_tensor[:, 21] = 1.0 if p_type == 'A' else 0.0
+        state_tensor[:, 22] = 1.0 if season == 'S' else 0.0
+        state_tensor[:, 23] = 1.0 if season in ('F', 'W') else 0.0
 
     units = state_info.get('units', {})
     centers = state_info.get('centers', {})
     dislodged = state_info.get('dislodged', {})
 
     occupied_bases = set()
+    
+    obs_idx = GLOBAL_POWER_TO_IDX.get(observing_agent.upper()) if observing_agent else None
+    check_diplomacy = (obs_idx is not None and H_matrix is not None)
 
     for power, unit_list in units.items():
         power_upper = power.upper()
         if power_upper not in GLOBAL_POWER_TO_IDX: continue
         power_idx = GLOBAL_POWER_TO_IDX[power_upper] 
         
+        stance_idx = None
+        if check_diplomacy:
+            if power_idx == obs_idx: stance_idx = 58
+            elif H_matrix[obs_idx, power_idx].item() > 0.5: stance_idx = 59
+            elif H_matrix[obs_idx, power_idx].item() < -0.5: stance_idx = 60
+        
         for unit_str in unit_list:
             clean_str = unit_str.replace('*', '').upper()
-            parts = clean_str.split()
+            parts = clean_str.split(maxsplit=1)
+            
             if len(parts) >= 2:
-                u_type = parts[0]
+                u_type = _UNIT_MAP.get(parts[0])
                 loc_full = parts[1]
-                loc_base = loc_full.split('/')[0]
-                coast = loc_full.split('/')[1] if len(loc_full.split('/')) > 1 else None
+                loc_split = loc_full.split('/')
+                loc_base = loc_split[0]
+                coast = loc_split[1] if len(loc_split) > 1 else None
                 
                 occupied_bases.add(loc_base)
 
                 if loc_full in GLOBAL_PROV_TO_IDX:
                     p_idx = GLOBAL_PROV_TO_IDX[loc_full]
                     state_tensor[p_idx, power_idx] = 1.0
-                    if u_type == 'A': state_tensor[p_idx, 7] = 1.0
-                    elif u_type == 'F': state_tensor[p_idx, 8] = 1.0
-                    
-                    if coast == 'NC': state_tensor[p_idx, 16] = 1.0
-                    elif coast == 'SC': state_tensor[p_idx, 17] = 1.0
-                    elif coast == 'EC': state_tensor[p_idx, 18] = 1.0
-                    
-                    if observing_agent and H_matrix is not None:
-                        obs_idx = GLOBAL_POWER_TO_IDX[observing_agent.upper()]
-                        if power_idx == obs_idx:
-                            state_tensor[p_idx, 58] = 1.0 # Self
-                        elif H_matrix[obs_idx, power_idx].item() > 0.5:
-                            state_tensor[p_idx, 59] = 1.0 # Ally
-                        elif H_matrix[obs_idx, power_idx].item() < -0.5:
-                            state_tensor[p_idx, 60] = 1.0 # Enemy
+                    if u_type: state_tensor[p_idx, u_type] = 1.0
+                    if coast in _COAST_MAP: state_tensor[p_idx, _COAST_MAP[coast]] = 1.0
+                    if stance_idx: state_tensor[p_idx, stance_idx] = 1.0
 
                 if loc_base != loc_full and loc_base in GLOBAL_PROV_TO_IDX:
                     base_idx = GLOBAL_PROV_TO_IDX[loc_base]
                     state_tensor[base_idx, power_idx] = 1.0
-                    if u_type == 'A': state_tensor[base_idx, 7] = 1.0
-                    elif u_type == 'F': state_tensor[base_idx, 8] = 1.0
-                    
-                    if observing_agent and H_matrix is not None:
-                        obs_idx = GLOBAL_POWER_TO_IDX[observing_agent.upper()]
-                        if power_idx == obs_idx:
-                            state_tensor[base_idx, 58] = 1.0
-                        elif H_matrix[obs_idx, power_idx].item() > 0.5:
-                            state_tensor[base_idx, 59] = 1.0
-                        elif H_matrix[obs_idx, power_idx].item() < -0.5:
-                            state_tensor[base_idx, 60] = 1.0
+                    if u_type: state_tensor[base_idx, u_type] = 1.0
+                    if stance_idx: state_tensor[base_idx, stance_idx] = 1.0
 
     for power_upper, power_idx in GLOBAL_POWER_TO_IDX.items():
         power_scs = len(centers.get(power_upper, []))
         power_units = len(units.get(power_upper, []))
-        deficit = float(power_scs - power_units)
-        state_tensor[:, 25 + power_idx] = deficit
+        state_tensor[:, 25 + power_idx] = float(power_scs - power_units)
 
     for power, unit_list in dislodged.items():
         power_upper = power.upper()
         if power_upper not in GLOBAL_POWER_TO_IDX: continue
         power_idx = GLOBAL_POWER_TO_IDX[power_upper]
         for unit_str in unit_list:
-            clean_str = unit_str.replace('*', '').upper()
-            parts = clean_str.split()
-            if len(parts) >= 2:
-                loc_full = parts[1]
-                if loc_full in GLOBAL_PROV_TO_IDX:
-                    p_idx = GLOBAL_PROV_TO_IDX[loc_full]
-                    u_type = parts[0]
-                    state_tensor[p_idx, power_idx] = 1.0
-                    if u_type == 'A': state_tensor[p_idx, 7] = 1.0
-                    elif u_type == 'F': state_tensor[p_idx, 8] = 1.0
-                    state_tensor[p_idx, 24] = 1.0
+            parts = unit_str.replace('*', '').upper().split(maxsplit=1)
+            if len(parts) >= 2 and parts[1] in GLOBAL_PROV_TO_IDX:
+                p_idx = GLOBAL_PROV_TO_IDX[parts[1]]
+                state_tensor[p_idx, power_idx] = 1.0
+                state_tensor[p_idx, 24] = 1.0
+                u_type = _UNIT_MAP.get(parts[0])
+                if u_type: state_tensor[p_idx, u_type] = 1.0
 
     for power, sc_list in centers.items():
         power_upper = power.upper()
@@ -285,18 +263,14 @@ def parse_state_to_tensor(turn_data, observing_agent=None, prev_state=None, boun
         for sc in sc_list:
             sc_upper = sc.upper()
             if sc_upper in GLOBAL_PROV_TO_IDX:
-                p_idx = GLOBAL_PROV_TO_IDX[sc_upper]
-                state_tensor[p_idx, 9 + power_idx] = 1.0
+                state_tensor[GLOBAL_PROV_TO_IDX[sc_upper], 9 + power_idx] = 1.0
     
-    if observing_agent is not None:
-        agent_upper = observing_agent.upper()
-        if agent_upper in GLOBAL_POWER_TO_IDX:
-            power_idx = GLOBAL_POWER_TO_IDX[agent_upper]
-            state_tensor[:, 39 + power_idx] = 1.0
-            my_scs = centers.get(agent_upper, [])
-            for hsc in GLOBAL_HSCS.get(agent_upper, []):
-                if hsc in my_scs and hsc not in occupied_bases and hsc in GLOBAL_PROV_TO_IDX:
-                    state_tensor[GLOBAL_PROV_TO_IDX[hsc], 49] = 1.0
+    if obs_idx is not None:
+        state_tensor[:, 39 + obs_idx] = 1.0
+        my_scs = centers.get(observing_agent.upper(), [])
+        for hsc in GLOBAL_HSCS.get(observing_agent.upper(), []):
+            if hsc in my_scs and hsc not in occupied_bases and hsc in GLOBAL_PROV_TO_IDX:
+                state_tensor[GLOBAL_PROV_TO_IDX[hsc], 49] = 1.0
 
     if bounces is not None:
         for b_loc in bounces:
@@ -305,8 +279,7 @@ def parse_state_to_tensor(turn_data, observing_agent=None, prev_state=None, boun
                 state_tensor[GLOBAL_PROV_TO_IDX[b_loc_upper], 50] = 1.0
 
     if prev_state is not None:
-        prev_centers = prev_state.get('centers', {})
-        for prev_power, prev_sc_list in prev_centers.items():
+        for prev_power, prev_sc_list in prev_state.get('centers', {}).items():
             prev_power_upper = prev_power.upper()
             if prev_power_upper in GLOBAL_POWER_TO_IDX:
                 prev_p_idx = GLOBAL_POWER_TO_IDX[prev_power_upper]
