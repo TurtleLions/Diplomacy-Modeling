@@ -344,9 +344,9 @@ def rollout_worker(local_rank, device, args, buffers, actor_net, bc_baseline_net
             for step in range(args.num_steps):
                 actions_to_send = [{} for _ in range(args.num_envs)]
                 
-                baseline_obs_list = []
-                baseline_sparse_list = []
-                baseline_metadata = []
+                active_obs_list, active_sparse_list, active_indices = [], [], []
+                baseline_obs_list, baseline_sparse_list, baseline_metadata = [], [], []
+                h_matrix_list, h_indices = [], []
                 
                 with torch.no_grad():
                     for i in range(args.num_envs):
@@ -362,16 +362,16 @@ def rollout_worker(local_rank, device, args, buffers, actor_net, bc_baseline_net
 
                         for a in active_agents:
                             a_idx = agent_to_idx[a]
-                            obs_tensor = torch.tensor(obs_dict[a][0], dtype=torch.bfloat16, device=device)
-                            sparse_tensor = torch.tensor(infos_dict[a]['action_mask'], dtype=torch.int32)
 
                             if 'H_matrix' in infos_dict[a]:
-                                batch_H[i, a_idx] = torch.tensor(infos_dict[a]['H_matrix'], dtype=torch.float32, device=device)
+                                h_matrix_list.append(infos_dict[a]['H_matrix'])
+                                h_indices.append((i, a_idx))
                             
                             if learning_assignment[i, a_idx]:
                                 buf['masks'][step, i, a_idx] = True
-                                buf['obs'][step, i, a_idx] = obs_tensor
-                                buf['sparse_masks'][step, i, a_idx] = sparse_tensor
+                                active_obs_list.append(obs_dict[a][0])
+                                active_sparse_list.append(infos_dict[a]['action_mask'])
+                                active_indices.append((i, a_idx))
 
                                 if 'legality_metrics' in infos_dict[a]:
                                     bad_indices = infos_dict[a]['legality_metrics'].get('illegal_prov_indices', [])
@@ -380,9 +380,24 @@ def rollout_worker(local_rank, device, args, buffers, actor_net, bc_baseline_net
                                     local_proposed += infos_dict[a]['legality_metrics'].get('proposed', 0)
                                     local_dropped += infos_dict[a]['legality_metrics'].get('illegal_dropped', 0)
                             else:
-                                baseline_obs_list.append(obs_tensor)
-                                baseline_sparse_list.append(sparse_tensor)
+                                baseline_obs_list.append(obs_dict[a][0])
+                                baseline_sparse_list.append(infos_dict[a]['action_mask'])
                                 baseline_metadata.append((i, a))
+
+                    if h_matrix_list:
+                        h_env_idx = [idx[0] for idx in h_indices]
+                        h_agt_idx = [idx[1] for idx in h_indices]
+                        batch_H[h_env_idx, h_agt_idx] = torch.tensor(np.stack(h_matrix_list), dtype=torch.float32, device=device)
+
+                    if active_obs_list:
+                        act_env_idx = [idx[0] for idx in active_indices]
+                        act_agt_idx = [idx[1] for idx in active_indices]
+                        
+                        batched_active_obs = torch.tensor(np.stack(active_obs_list), dtype=torch.bfloat16, device=device)
+                        batched_active_sparse = torch.tensor(np.stack(active_sparse_list), dtype=torch.int32, device=device)
+                        
+                        buf['obs'][step, act_env_idx, act_agt_idx] = batched_active_obs
+                        buf['sparse_masks'][step, act_env_idx, act_agt_idx] = batched_active_sparse
 
                     t_gpu_start = time.time()
 
@@ -458,8 +473,8 @@ def rollout_worker(local_rank, device, args, buffers, actor_net, bc_baseline_net
                                     idx_counter += 1
                                     
                     if baseline_obs_list:
-                        bc_obs_tensor = torch.stack(baseline_obs_list)
-                        bc_sparse_tensor = torch.stack(baseline_sparse_list).to(device)
+                        bc_obs_tensor = torch.tensor(np.stack(baseline_obs_list), dtype=torch.bfloat16, device=device)
+                        bc_sparse_tensor = torch.tensor(np.stack(baseline_sparse_list), dtype=torch.int32, device=device)
                         
                         with torch.no_grad():
                             with torch.autocast(device_type='cuda', dtype=torch.bfloat16):
@@ -502,7 +517,7 @@ def rollout_worker(local_rank, device, args, buffers, actor_net, bc_baseline_net
                                 term_obs_dict = infos_dict['__terminal_observation']
                                 for a in possible_agents:
                                     if a in term_obs_dict and learning_assignment[i, agent_to_idx[a]]:
-                                        terminal_obs_to_encode.append(torch.tensor(term_obs_dict[a][0], dtype=torch.bfloat16, device=device))
+                                        terminal_obs_to_encode.append(term_obs_dict[a][0])
                                         terminal_indices.append((i, agent_to_idx[a]))
                                         
                                 batch_h[i].zero_()
@@ -517,7 +532,7 @@ def rollout_worker(local_rank, device, args, buffers, actor_net, bc_baseline_net
                                     next_done[i, agent_to_idx[a]] = float(terms.get(a, False))
 
                     if terminal_obs_to_encode:
-                        term_tensor = torch.stack(terminal_obs_to_encode)
+                        term_tensor = torch.tensor(np.stack(terminal_obs_to_encode), dtype=torch.bfloat16, device=device)
                         with torch.autocast(device_type='cuda', dtype=torch.bfloat16):
                             x_emb_t = actor_net.worker.feature_projection(term_tensor)
                             S_M_t = actor_net.pooler(actor_net.worker.encoder_transformer(x_emb_t))
@@ -544,11 +559,11 @@ def rollout_worker(local_rank, device, args, buffers, actor_net, bc_baseline_net
                 
                 for a in active_agents_list:
                     if a in obs_dict:
-                        obs_to_encode.append(torch.tensor(obs_dict[a][0], dtype=torch.bfloat16, device=device))
+                        obs_to_encode.append(obs_dict[a][0])
                         indices_to_update.append((i, agent_to_idx[a]))
                     
             if obs_to_encode:
-                obs_tensor = torch.stack(obs_to_encode)
+                obs_tensor = torch.tensor(np.stack(obs_to_encode), dtype=torch.bfloat16, device=device)
                 with torch.autocast(device_type='cuda', dtype=torch.bfloat16):
                     x_emb = actor_net.worker.feature_projection(obs_tensor)
                     S_mu_enc = actor_net.worker.encoder_transformer(x_emb)
