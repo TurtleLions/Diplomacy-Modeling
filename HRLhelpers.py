@@ -252,49 +252,11 @@ def parse_state_to_tensor(turn_data, observing_agent=None, prev_state=None, boun
                         elif H_matrix[obs_idx, power_idx].item() < -0.5:
                             state_tensor[base_idx, 60] = 1.0
 
-    for power, hsc_list in GLOBAL_HSCS.items():
-        power_idx = GLOBAL_POWER_TO_IDX[power]
-        for hsc in hsc_list:
-            if hsc in GLOBAL_PROV_TO_IDX:
-                p_idx = GLOBAL_PROV_TO_IDX[hsc]
-                state_tensor[p_idx, 32 + power_idx] = 1.0
-
     for power_upper, power_idx in GLOBAL_POWER_TO_IDX.items():
         power_scs = len(centers.get(power_upper, []))
         power_units = len(units.get(power_upper, []))
         deficit = float(power_scs - power_units)
         state_tensor[:, 25 + power_idx] = deficit
-
-    for power, unit_list in units.items():
-        power_upper = power.upper()
-        if power_upper not in GLOBAL_POWER_TO_IDX: continue
-        power_idx = GLOBAL_POWER_TO_IDX[power_upper] 
-        for unit_str in unit_list:
-            clean_str = unit_str.replace('*', '').upper()
-            parts = clean_str.split()
-            if len(parts) >= 2:
-                u_type = parts[0]
-                loc_full = parts[1]
-                
-                loc_parts = loc_full.split('/')
-                loc_base = loc_parts[0] 
-                coast = loc_parts[1] if len(loc_parts) > 1 else None
-
-                if loc_full in GLOBAL_PROV_TO_IDX:
-                    p_idx = GLOBAL_PROV_TO_IDX[loc_full]
-                    state_tensor[p_idx, power_idx] = 1.0
-                    if u_type == 'A': state_tensor[p_idx, 7] = 1.0
-                    elif u_type == 'F': state_tensor[p_idx, 8] = 1.0
-                    
-                    if coast == 'NC': state_tensor[p_idx, 16] = 1.0
-                    elif coast == 'SC': state_tensor[p_idx, 17] = 1.0
-                    elif coast == 'EC': state_tensor[p_idx, 18] = 1.0
-
-                if loc_base != loc_full and loc_base in GLOBAL_PROV_TO_IDX:
-                    base_idx = GLOBAL_PROV_TO_IDX[loc_base]
-                    state_tensor[base_idx, power_idx] = 1.0
-                    if u_type == 'A': state_tensor[base_idx, 7] = 1.0
-                    elif u_type == 'F': state_tensor[base_idx, 8] = 1.0
 
     for power, unit_list in dislodged.items():
         power_upper = power.upper()
