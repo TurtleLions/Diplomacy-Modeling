@@ -612,8 +612,6 @@ def main():
 
     if global_rank == 0:
         print(f"Environment Initialized: {MAP_PROVINCES} Provinces | Action Space: {VOCAB_SIZE}")
-
-    vec_env = SubprocVecDiplomacy(num_envs=args.num_envs)
     
     # Model Initialization
     net = FeudalDiplomacyAgent(d_model=256, vocab_size=VOCAB_SIZE).to(device)
@@ -881,7 +879,7 @@ def main():
                 with my_context:
                     with torch.autocast(device_type='cuda', dtype=torch.bfloat16):
                         live_S_M, predicted_z, logits, values_pred = net(
-                            mb_obs, mb_H, mb_prev_z, mb_z.to(torch.bfloat16)
+                            mb_obs, mb_H, mb_prev_z, mb_z.to(torch.bfloat16), bc_mode=False
                         )
                         z_achieved = F.normalize((mb_S_M_next - live_S_M).float(), p=2, dim=-1)
                         v_loss = F.mse_loss(values_pred, mb_ret.float())
@@ -1089,8 +1087,7 @@ def main():
                     wandb.log({f"Eval/{power}_SCs": local_eval_scs[i].item()}, step=update)
                     
             torch.cuda.empty_cache()
-        
-    vec_env.close()
+
     rollout_process.join()
     if global_rank == 0:
         writer.close()

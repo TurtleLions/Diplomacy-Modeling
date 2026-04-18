@@ -512,18 +512,19 @@ class FeudalDiplomacyAgent(nn.Module):
         logits, _ = self.worker(S_mu_raw, z_zero, self.D)
         return logits
 
-    def forward(self, mb_obs, mb_H, mb_prev_z, worker_z_target):
-        """Unified forward pass to trigger DDP gradient hooks."""
+    def forward(self, mb_obs, mb_H=None, mb_prev_z=None, worker_z_target=None, bc_mode=False):
+        if bc_mode:
+            B = mb_obs.size(0)
+            z_zero = torch.zeros((B, 8, self.worker.d_model), device=mb_obs.device, dtype=mb_obs.dtype)
+            logits, _ = self.worker(mb_obs, z_zero, self.D)
+            return logits
+
         x_emb = self.worker.feature_projection(mb_obs)
         S_mu_encoded = self.worker.encoder_transformer(x_emb)
         S_M = self.pooler(S_mu_encoded)
-        
         predicted_z = self.manager(S_M, mb_H, mb_prev_z)
-        
         logits, _ = self.worker(mb_obs, worker_z_target, self.D)
-        
         values_pred = self.value_head(S_M.mean(dim=1)).squeeze(-1).float()
-        
         return S_M, predicted_z, logits, values_pred
 
     def step(self, S_mu_raw, H_t, z_prev):

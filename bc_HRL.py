@@ -364,12 +364,12 @@ def train_worker(rank, world_size, paths_and_metadata, args):
     dist.init_process_group("nccl", rank=rank, world_size=world_size)
     
     core_start = rank * 6
-    os.sched_setaffinity(0, list(range(core_start, core_start + 6)))
+    os.sched_setaffinity(os.getpid(), list(range(core_start, core_start + 6)))
     torch.set_num_threads(6)
     torch.cuda.set_device(rank)
     
     dataset = DiplomacyMemmapDataset(history_path, mask_sparse_path, targets_path, total_samples, num_provs, vocab_size, derived_mask_len)
-    sampler = DistributedSampler(dataset, num_replicas=world_size, rank=rank, shuffle=False)
+    sampler = DistributedSampler(dataset, num_replicas=world_size, rank=rank, shuffle=True)
     
     dataloader = DataLoader(
         dataset, batch_size=args.batch_size, shuffle=False, sampler=sampler,
@@ -420,7 +420,7 @@ def train_worker(rank, world_size, paths_and_metadata, args):
             optimizer.zero_grad()
             
             with torch.autocast(device_type='cuda', dtype=torch.bfloat16):
-                logits = agent.module.forward_phase_2_bc(S_mu)
+                logits = agent(S_mu, bc_mode=True)
                 logits_masked = logits.masked_fill(~dense_mask, -1e20).float()
                 
                 logits_flat = logits_masked.view(-1, vocab_size)
