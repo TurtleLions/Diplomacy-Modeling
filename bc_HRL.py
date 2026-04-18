@@ -132,7 +132,7 @@ def _process_single_line(line):
         
     game_engine = Game()
     tracker = InteractionMatrixTracker(num_agents=7, gamma=0.9)
-    provinces = list(game_engine.map.locs)
+    provinces = sorted([p.upper() for p in list(game_engine.map.locs)])
     
     agent_histories = {p: np.zeros((3, worker_num_provs, FEATURE_DIM), dtype=np.int8) for p in GLOBAL_POWERS}
     g_histories, g_masks, g_targets = [], [], []

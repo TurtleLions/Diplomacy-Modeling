@@ -524,7 +524,12 @@ def rollout_worker(local_rank, device, args, buffers, actor_net, bc_baseline_net
                     
             if obs_to_encode:
                 obs_tensor = torch.stack(obs_to_encode)
-                next_v = torch.zeros(obs_tensor.size(0), 1, dtype=torch.float32, device=device)
+                with torch.autocast(device_type='cuda', dtype=torch.bfloat16):
+                    x_emb = actor_net.worker.feature_projection(obs_tensor)
+                    S_mu_enc = actor_net.worker.encoder_transformer(x_emb)
+                    S_M_next = actor_net.pooler(S_mu_enc)
+                    pooled_S_M_next = S_M_next.mean(dim=1)
+                    next_v = actor_net.value_head(pooled_S_M_next).float()
                 
                 for list_idx, (env_idx, agent_idx) in enumerate(indices_to_update):
                     next_value[env_idx, agent_idx] = next_v[list_idx].float().squeeze(-1)
@@ -541,6 +546,15 @@ def rollout_worker(local_rank, device, args, buffers, actor_net, bc_baseline_net
             buf['advantages'][t] = lastgaelam = delta + args.gamma * args.gae_lambda * nextnonterminal * lastgaelam
         buf['returns'] = buf['advantages'] + buf['values']
         
+        buf['S_M_next'][:-1] = buf['S_M'][1:]
+        
+        if obs_to_encode:
+            with torch.autocast(device_type='cuda', dtype=torch.bfloat16):
+                x_emb_next = actor_net.worker.feature_projection(obs_tensor)
+                S_M_terminal = actor_net.pooler(actor_net.worker.encoder_transformer(x_emb_next))
+            for list_idx, (env_idx, agent_idx) in enumerate(indices_to_update):
+                buf['S_M_next'][-1, env_idx, agent_idx] = S_M_terminal[list_idx]
+
         inference_stream.synchronize()
 
         worker_stats[0] = env_step_time
@@ -805,7 +819,7 @@ def main():
 
         epoch_pg_loss_sum = 0.0
         epoch_manager_loss_sum = 0.0
-        epoch_inv_loss_sum = 0.0
+        epoch_feasibility_error_sum = 0.0
         epoch_bc_kl_sum = 0.0
         epoch_entropy_sum = 0.0
         epoch_total_loss_sum = 0.0
@@ -855,9 +869,13 @@ def main():
                 
                 with my_context:
                     with torch.autocast(device_type='cuda', dtype=torch.bfloat16):
+                        x_emb_live = net.module.worker.feature_projection(mb_obs)
+                        S_mu_enc_live = net.module.worker.encoder_transformer(x_emb_live)
+                        live_S_M = net.module.pooler(S_mu_enc_live)
                         
-                        z_achieved = net.module.inverse_model(mb_S_M, mb_S_M_next)
-                        predicted_z = net.module.manager(mb_S_M, mb_H, mb_prev_z)
+                        z_achieved = F.normalize((mb_S_M_next - live_S_M).float(), p=2, dim=-1)
+                        
+                        predicted_z = net.module.manager(live_S_M, mb_H, mb_prev_z)
 
                         z_achieved = F.normalize(z_achieved.float(), p=2, dim=-1)
                         predicted_z = F.normalize(predicted_z.float(), p=2, dim=-1)
@@ -866,7 +884,7 @@ def main():
                         distance_penalty = (z_achieved.detach() - mb_z_float).pow(2).sum(dim=-1)
 
                         current_beta = 2.0 
-                        feudal_adv = mb_ret - (current_beta * distance_penalty)
+                        feudal_adv = mb_adv - (current_beta * distance_penalty)
                         
                         dynamic_threshold = torch.quantile(distance_penalty, 0.80) 
                         failed_mask = distance_penalty > dynamic_threshold
@@ -882,7 +900,6 @@ def main():
                             manager_adv = feudal_adv - feudal_adv.mean()
 
                         manager_loss = (raw_manager_loss * manager_adv.detach()).mean()
-                        inv_loss = F.mse_loss(z_achieved, mb_z_float.detach())
 
                         worker_z_target = mb_z_float.clone()
                         
@@ -922,7 +939,7 @@ def main():
                         entropy_seq = torch.zeros_like(mb_logprobs)
                         entropy_seq.scatter_(1, padded_indices, entropy_seq_active)
 
-                        is_active_mask_f = (mb_act != NONE_IDX).float()
+                        is_active_mask_f = is_active_mask.float()
                         total_valid_units = is_active_mask_f.sum().clamp(min=1)
                         
                         new_logprobs = torch.nan_to_num(new_logprobs, nan=0.0)
@@ -968,14 +985,14 @@ def main():
                         unit_bc_kl = unit_bc_kl * is_active_mask_f
                         bc_kl_penalty = unit_bc_kl.sum() / total_valid_units
 
-                        values_pred = net.module.value_head(mb_S_M.view(mb_S_M.size(0), -1)).squeeze(-1).float()
+                        values_pred = net.module.value_head(live_S_M.mean(dim=1)).squeeze(-1).float()
                         v_loss = F.mse_loss(values_pred, mb_ret.float())
                         
-                        unscaled_loss = pg_loss - (args.ent_coef * entropy) + manager_loss + inv_loss + (args.bc_kl_coef * bc_kl_penalty) + (args.v_coef * v_loss)
+                        unscaled_loss = pg_loss - (args.ent_coef * entropy) + manager_loss + (args.bc_kl_coef * bc_kl_penalty) + (args.v_coef * v_loss)
 
                         epoch_pg_loss_sum += pg_loss.item()
                         epoch_manager_loss_sum += manager_loss.item()
-                        epoch_inv_loss_sum += inv_loss.item()
+                        epoch_feasibility_error_sum += distance_penalty.mean().item()
                         epoch_bc_kl_sum += bc_kl_penalty.item() 
                         epoch_entropy_sum += entropy.item()
                         epoch_total_loss_sum += unscaled_loss.item()
@@ -1013,7 +1030,7 @@ def main():
         local_metrics = torch.tensor([
             epoch_pg_loss_sum / max(1, track_steps),
             epoch_manager_loss_sum / max(1, track_steps),
-            epoch_inv_loss_sum / max(1, track_steps),
+            epoch_feasibility_error_sum / max(1, track_steps),
             epoch_bc_kl_sum / max(1, track_steps),
             epoch_entropy_sum / max(1, track_steps),
             epoch_total_loss_sum / max(1, track_steps),
@@ -1027,7 +1044,7 @@ def main():
 
         avg_pg_loss = global_metrics[0].item()
         avg_manager_loss = global_metrics[1].item()
-        avg_inv_loss = global_metrics[2].item()
+        avg_feasibility_error = global_metrics[2].item()
         avg_bc_kl = global_metrics[3].item()
         avg_entropy = global_metrics[4].item()
         avg_total_loss = global_metrics[5].item()
@@ -1054,7 +1071,7 @@ def main():
             
             print(f"Update {update}/{args.num_updates} | SPS: {sps} | Ext. Reward (Manager): {avg_step_reward:.2f} | Int. Reward (Worker): {avg_intrinsic_reward:.4f}")
             print(f"  CPU Time: {env_step_time:.2f}s | GPU Fwd: {gpu_forward_time:.2f}s | Bwd: {update_time:.2f}s")
-            print(f"  Components -> Total Loss: {avg_total_loss:.4f} | PG: {avg_pg_loss:.4f} | Manager: {avg_manager_loss:.4f} | Inv: {avg_inv_loss:.4f} | BC_KL: {avg_bc_kl:.4f}")
+            print(f"  Components -> Total Loss: {avg_total_loss:.4f} | PG: {avg_pg_loss:.4f} | Manager: {avg_manager_loss:.4f} | Feasibility Err: {avg_feasibility_error:.4f} | BC_KL: {avg_bc_kl:.4f}")
             print(f"  Legality Audit: {proposed_actions - illegal_dropped}/{proposed_actions} legal actions ({illegal_rate:.1f}% illegal)")
             print(f"  Avg Episode Return: {last_avg_ep_reward:.2f} (Completed {int(global_ep_count)} episodes this update)")
 
@@ -1065,7 +1082,7 @@ def main():
             writer.add_scalar("Loss/Total_Loss", avg_total_loss, update)
             writer.add_scalar("Loss/PG_Surrogate", avg_pg_loss, update)
             writer.add_scalar("Loss/Manager_MSE", avg_manager_loss, update)
-            writer.add_scalar("Loss/Inverse_MSE", avg_inv_loss, update)
+            writer.add_scalar("Metrics/Manager_Feasibility_Error", avg_feasibility_error, update)
             writer.add_scalar("Loss/BC_KL_Penalty", avg_bc_kl, update)
             writer.add_scalar("Loss/Entropy", avg_entropy, update)
             writer.add_scalar("Metrics/Illegal_Action_Rate", illegal_rate, update)
@@ -1078,7 +1095,7 @@ def main():
                 "Loss/Total_Loss": avg_total_loss,
                 "Loss/PG_Surrogate": avg_pg_loss,
                 "Loss/Manager_MSE": avg_manager_loss,
-                "Loss/Inverse_MSE": avg_inv_loss,
+                "Metrics/Manager_Feasibility_Error": avg_feasibility_error,
                 "Loss/BC_KL_Penalty": avg_bc_kl,
                 "Loss/Entropy": avg_entropy,
                 "Loss/KL_Div": global_avg_kl,
