@@ -526,13 +526,13 @@ def rollout_worker(local_rank, device, args, buffers, actor_net, bc_baseline_net
                         indices_to_update.append((i, agent_to_idx[a]))
                     
             if obs_to_encode:
-            obs_tensor = torch.stack(obs_to_encode)
-            with torch.autocast(device_type='cuda', dtype=torch.bfloat16):
-                x_emb = actor_net.worker.feature_projection(obs_tensor)
-                S_mu_enc = actor_net.worker.encoder_transformer(x_emb)
-                S_M_next = actor_net.pooler(S_mu_enc)
-                pooled_S_M_next = S_M_next.mean(dim=1)
-                next_v = actor_net.value_head(pooled_S_M_next).float()
+                obs_tensor = torch.stack(obs_to_encode)
+                with torch.autocast(device_type='cuda', dtype=torch.bfloat16):
+                    x_emb = actor_net.worker.feature_projection(obs_tensor)
+                    S_mu_enc = actor_net.worker.encoder_transformer(x_emb)
+                    S_M_next = actor_net.pooler(S_mu_enc)
+                    pooled_S_M_next = S_M_next.mean(dim=1)
+                    next_v = actor_net.value_head(pooled_S_M_next).float()
             
             for list_idx, (env_idx, agent_idx) in enumerate(indices_to_update):
                 val = next_v[list_idx].float().squeeze(-1)
@@ -881,11 +881,41 @@ def main():
                 with my_context:
                     with torch.autocast(device_type='cuda', dtype=torch.bfloat16):
                         live_S_M, predicted_z, logits, values_pred = net(
-                            mb_obs, mb_H, mb_prev_z, worker_z_target.to(torch.bfloat16)
+                            mb_obs, mb_H, mb_prev_z, mb_z.to(torch.bfloat16)
                         )
                         z_achieved = F.normalize((mb_S_M_next - live_S_M).float(), p=2, dim=-1)
                         v_loss = F.mse_loss(values_pred, mb_ret.float())
                         
+                        is_active, packed_masks, padded_idx, max_act = rebuild_packed_masks(
+                            mb_sparse_gpu, MAP_PROVINCES, VOCAB_SIZE, NONE_IDX, device
+                        )
+                        
+                        active_logits = torch.gather(logits, 1, padded_idx.unsqueeze(-1).expand(-1, -1, VOCAB_SIZE))
+                        active_logits = active_logits.float().masked_fill(~packed_masks, -1e20)
+                        
+                        dist_cat = Categorical(logits=active_logits)
+                        packed_actions = torch.gather(mb_act, 1, padded_idx)
+                        new_logprobs = dist_cat.log_prob(packed_actions)
+                        
+                        old_logprobs_packed = torch.gather(mb_logprobs, 1, padded_idx)
+                        
+                        ratio = torch.exp(new_logprobs - old_logprobs_packed)
+                        
+                        valid_ratio_mask = packed_actions != NONE_IDX
+                        surr1 = ratio * mb_adv.unsqueeze(1)
+                        surr2 = torch.clamp(ratio, 1.0 - args.clip_coef, 1.0 + args.clip_coef) * mb_adv.unsqueeze(1)
+                        
+                        pg_loss = -torch.min(surr1, surr2)[valid_ratio_mask].mean()
+                        
+                        entropy = dist_cat.entropy()[valid_ratio_mask].mean()
+                        manager_loss = F.mse_loss(predicted_z, z_achieved.detach())
+                        
+                        bc_kl_penalty = torch.tensor(0.0, device=device) 
+                        distance_penalty = torch.tensor(0.0, device=device)
+                        
+                        with torch.no_grad():
+                            kl_divergence = ((ratio - 1.0) - torch.log(ratio))[valid_ratio_mask].mean()
+
                         unscaled_loss = pg_loss - (args.ent_coef * entropy) + manager_loss + (args.bc_kl_coef * bc_kl_penalty) + (args.v_coef * v_loss)
 
                         epoch_pg_loss_sum += pg_loss.item()
