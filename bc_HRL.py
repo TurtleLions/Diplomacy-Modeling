@@ -167,14 +167,30 @@ def _process_single_line(line):
             mask = get_global_action_mask(game_engine, power_upper, provinces, worker_order_to_idx)
             targets = np.full(worker_num_provs, worker_none_idx, dtype=np.int64)
             
+            ordered_locs = set()
+            
             for order_str in text_orders:
                 clean_order = order_str.replace('*', '').upper()
                 parts = clean_order.split()
                 if len(parts) >= 2:
                     loc_full = parts[1]
+                    ordered_locs.add(loc_full)
                     if loc_full in worker_prov_to_idx and clean_order in worker_order_to_idx:
                         p_idx = worker_prov_to_idx[loc_full]
                         targets[p_idx] = worker_order_to_idx[clean_order]
+                        
+            active_units = current_state_dict['units'].get(power_upper, [])
+            for unit_str in active_units:
+                clean_unit = unit_str.replace('*', '').upper()
+                parts = clean_unit.split()
+                if len(parts) >= 2:
+                    u_type = parts[0]
+                    loc_full = parts[1]
+                    if loc_full not in ordered_locs and loc_full in worker_prov_to_idx:
+                        hold_order = f"{u_type} {loc_full} H"
+                        if hold_order in worker_order_to_idx:
+                            p_idx = worker_prov_to_idx[loc_full]
+                            targets[p_idx] = worker_order_to_idx[hold_order]
             
             flat_mask = mask.flatten()
             valid_indices = np.where(flat_mask)[0].astype(np.int32)

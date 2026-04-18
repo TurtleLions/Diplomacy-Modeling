@@ -65,11 +65,14 @@ def build_distance_matrix(provinces):
     lengths = dict(nx.all_pairs_shortest_path_length(G))
     
     for i, p1 in enumerate(provinces):
+        p1_base = p1.split('/')[0]
         for j, p2 in enumerate(provinces):
-            if p1 in lengths and p2 in lengths[p1]:
-                D[i, j] = min(lengths[p1][p2], 19) 
+            p2_base = p2.split('/')[0]
+            
+            if p1_base in lengths and p2_base in lengths[p1_base]:
+                D[i, j] = min(lengths[p1_base][p2_base], 19) 
             else:
-                D[i, j] = 19 
+                D[i, j] = 19
     return D
 
 def build_global_vocab(json_path="/data/restanislao/datasets/standard_no_press.jsonl", cache_path="vocab.txt"):
@@ -463,27 +466,22 @@ class MacroManager(nn.Module):
         nn.init.zeros_(self.z_out.weight)
         nn.init.zeros_(self.z_out.bias)
 
-    def forward(self, S_M_t, H_t, z_prev):
+    def forward(self, S_M_t, H_t, h_prev):
         B = S_M_t.size(0)
-        H_emb = self.H_proj(H_t.view(B, -1)).unsqueeze(1) # Shape: (B, 1, d_model)
-        
-        # Broadcast H_emb across the 8 theaters
-        query = z_prev + H_emb.expand(-1, 8, -1) 
+        H_emb = self.H_proj(H_t.view(B, -1)).unsqueeze(1)
+        query = h_prev + H_emb.expand(-1, 8, -1) 
         
         attn_out, _ = self.cross_attn(query=query, key=S_M_t, value=S_M_t)
         attn_out = self.attn_norm(attn_out + query)
         
-        # Flatten Batch and Theaters to process all 8 regions independently and simultaneously
         attn_out_flat = attn_out.view(B * 8, -1)
-        z_prev_flat = z_prev.view(B * 8, -1)
         
-        z_t_flat = self.gru_cell(attn_out_flat, z_prev_flat)
+        h_t_flat = self.gru_cell(attn_out_flat, h_prev.view(B * 8, -1))
+        h_t = h_t_flat.view(B, 8, -1)
         
-        # Unflatten back to sequence
-        z_t = z_t_flat.view(B, 8, -1)
-        
-        z_t = torch.tanh(self.z_out(self.z_norm(z_t)))
-        return z_t # Shape: (B, 8, 256)
+        z_t = torch.tanh(self.z_out(self.z_norm(h_t)))
+
+        return z_t, h_t
 
 # --- THE FEUDAL ENVELOPE ---
 
@@ -522,18 +520,22 @@ class FeudalDiplomacyAgent(nn.Module):
         x_emb = self.worker.feature_projection(mb_obs)
         S_mu_encoded = self.worker.encoder_transformer(x_emb)
         S_M = self.pooler(S_mu_encoded)
-        predicted_z = self.manager(S_M, mb_H, mb_prev_z)
+        x_emb = self.worker.feature_projection(mb_obs)
+        S_mu_encoded = self.worker.encoder_transformer(x_emb)
+        S_M = self.pooler(S_mu_encoded)
+        
+        predicted_z, predicted_h = self.manager(S_M, mb_H, mb_prev_h)
         logits, _ = self.worker(mb_obs, worker_z_target, self.D)
         values_pred = self.value_head(S_M.mean(dim=1)).squeeze(-1).float()
-        return S_M, predicted_z, logits, values_pred
+        
+        return S_M, predicted_z, predicted_h, logits, values_pred
 
-    def step(self, S_mu_raw, H_t, z_prev):
-        """Inference Step (Phase 4)."""
+    def step(self, S_mu_raw, H_t, h_prev):
         x_emb = self.worker.feature_projection(S_mu_raw)
         S_mu_encoded = self.worker.encoder_transformer(x_emb)
         S_M_t = self.pooler(S_mu_encoded)
-        z_t = self.manager(S_M_t, H_t, z_prev)
-        return z_t, S_M_t
+        z_t, h_t = self.manager(S_M_t, H_t, h_prev)
+        return z_t, h_t, S_M_t
 
 class DiplomacyTransformerEnv(ParallelEnv):
     """
