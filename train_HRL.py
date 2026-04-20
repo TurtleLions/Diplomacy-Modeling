@@ -286,17 +286,17 @@ def evaluate_against_baseline(live_net, baseline_net, device, update_num, live_p
 
 def parse_args():
     parser = argparse.ArgumentParser(description="PPO Training for Diplomacy")
-    parser.add_argument("--num_envs", type=int, default=21, help="Number of parallel environments per GPU")
+    parser.add_argument("--num_envs", type=int, default=42, help="Number of parallel environments per GPU")
     parser.add_argument("--num_steps", type=int, default=512, help="Number of steps per rollout")
     parser.add_argument("--num_updates", type=int, default=1000, help="Total number of PPO updates")
     parser.add_argument("--lr", type=float, default=1e-5, help="Learning rate")
     parser.add_argument("--gamma", type=float, default=0.99, help="Discount factor")
     parser.add_argument("--gae_lambda", type=float, default=0.95, help="GAE lambda parameter")
     parser.add_argument("--clip_coef", type=float, default=0.2, help="PPO policy clipping coefficient")
-    parser.add_argument("--ent_coef", type=float, default=0.001, help="Entropy coefficient")
+    parser.add_argument("--ent_coef", type=float, default=0.01, help="Entropy coefficient")
     parser.add_argument("--v_coef", type=float, default=0.1, help="Value function loss coefficient")
-    parser.add_argument("--kl_coef", type=float, default=0.05, help="KL divergence penalty coefficient")
-    parser.add_argument("--update_epochs", type=int, default=4, help="Number of epochs per PPO update")
+    parser.add_argument("--kl_coef", type=float, default=0.01, help="KL divergence penalty coefficient")
+    parser.add_argument("--update_epochs", type=int, default=8, help="Number of epochs per PPO update")
     parser.add_argument("--bc_weights", type=str, default="feudal_agent_bc.pth", help="Path to pre-trained Behavioral Cloning weights")
     parser.add_argument("--resume_weights", type=str, default=None, help="Path to RL checkpoint to resume training from")
     parser.add_argument("--bc_kl_coef", type=float, default=0.05, help="KL divergence penalty coefficient for behavioral cloning")
@@ -868,7 +868,7 @@ def main():
         t_update_start = time.time()
         net.train()
         
-        mb_size = 256
+        mb_size = 512
         accum_steps = 16
         optimizer.zero_grad() 
 
@@ -929,6 +929,7 @@ def main():
                         live_S_M, predicted_z, predicted_h, logits, values_pred, z_achieved_raw = net(
                             mb_obs, mb_H, mb_prev_h, mb_z.to(torch.bfloat16), bc_mode=False, mb_S_M_next=mb_S_M_next
                         )
+                        logits = torch.nan_to_num(logits, nan=-1e8, posinf=1e8, neginf=-1e8)
                         z_achieved = F.normalize(z_achieved_raw.float(), p=2, dim=-1)
 
                         intrinsic_reward = F.cosine_similarity(z_achieved.detach(), mb_z.detach(), dim=-1)
@@ -989,6 +990,7 @@ def main():
                             
                             bc_dist = Categorical(logits=bc_active_logits)
                             bc_logprobs = bc_dist.log_prob(packed_actions)
+                            bc_logprobs = torch.clamp(bc_logprobs, min=-20.0)
                             
                             kl_divergence = ((ratio - 1.0) - torch.log(ratio))[valid_ratio_mask].mean()
 
@@ -1128,7 +1130,7 @@ def main():
                     print(f"  -> Saved checkpoint to {ckpt_path}")
                     torch.save(checkpoint, ckpt_path)
             
-        EVAL_FREQ = 1
+        EVAL_FREQ = 10
         
         if update % EVAL_FREQ == 0:
             eval_start_time = time.time()
@@ -1140,33 +1142,65 @@ def main():
             local_eval_scs = torch.zeros(NUM_AGENTS, dtype=torch.float32, device=device)
             
             net.eval()
+            GAMES_PER_POWER = 3
+            total_eval_games = 7 * GAMES_PER_POWER
+            
+            # Calculate Categorical Outcomes
+            solos, survivals, eliminations = 0, 0, 0
+
             for power in my_powers:
-                sc = evaluate_against_baseline(
-                    live_net=net.module,
-                    baseline_net=bc_baseline_net,
-                    device=device, 
-                    update_num=update, 
-                    live_power=power, 
-                    game_index=1, 
-                    save_dir=eval_dir
-                )
-                local_eval_scs[agent_to_idx[power]] = float(sc)
+                power_sc_sum = 0
+                for game_idx in range(GAMES_PER_POWER):
+                    sc = evaluate_against_baseline(
+                        live_net=net.module,
+                        baseline_net=bc_baseline_net,
+                        device=device, 
+                        update_num=update, 
+                        live_power=power, 
+                        game_index=game_idx + 1, 
+                        save_dir=eval_dir
+                    )
+                    power_sc_sum += float(sc)
+                    
+                    if sc >= 18:
+                        solos += 1
+                    elif sc > 0:
+                        survivals += 1
+                    else:
+                        eliminations += 1
+                        
+                local_eval_scs[agent_to_idx[power]] = power_sc_sum / GAMES_PER_POWER
             net.train()
 
             dist.all_reduce(local_eval_scs, op=dist.ReduceOp.SUM)
             
+            local_outcomes = torch.tensor([solos, survivals, eliminations], dtype=torch.float32, device=device)
+            dist.all_reduce(local_outcomes, op=dist.ReduceOp.SUM)
+            
             if global_rank == 0:
                 avg_eval_sc = local_eval_scs.mean().item()
                 eval_duration = time.time() - eval_start_time
+
+                total_solos, total_survivals, total_elims = local_outcomes.tolist()
+                total_games = float(NUM_AGENTS * GAMES_PER_POWER)
+                        
+                solo_rate = (total_solos / total_games) * 100.0
+                survival_rate = (total_survivals / total_games) * 100.0
+                elimination_rate = (total_elims / total_games) * 100.0
+
                 print(f"\n--- Evaluation Results (Update {update}) ---")
                 for i, power in enumerate(possible_agents):
-                    print(f"  {power}: {local_eval_scs[i].item()} SCs")
-                print(f"  Average SCs: {avg_eval_sc:.2f}\n")
+                    print(f"  {power}: {local_eval_scs[i].item():.1f} SCs")
+                print(f"  Average SCs: {avg_eval_sc:.2f}")
+                print(f"  Outcomes -> Solo: {solo_rate:.1f}% | Survive: {survival_rate:.1f}% | Eliminated: {elimination_rate:.1f}%")
                 print(f"  Eval Duration: {eval_duration:.2f}s\n")
                 
                 wandb.log({
                     "Eval/Avg_SCs": avg_eval_sc,
-                    "Perf/Eval_Time_s": eval_duration, # Log it
+                    "Eval_Metrics/Solo_Rate_Pct": solo_rate,
+                    "Eval_Metrics/Survival_Rate_Pct": survival_rate,
+                    "Eval_Metrics/Elimination_Rate_Pct": elimination_rate,
+                    "Perf/Eval_Time_s": eval_duration,
                     "global_step": update * global_steps
                 }, step=update)
                 

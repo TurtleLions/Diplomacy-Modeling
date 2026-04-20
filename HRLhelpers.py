@@ -495,7 +495,7 @@ class FeudalDiplomacyAgent(nn.Module):
         S_M = self.pooler(S_mu_encoded)
         
         predicted_z, predicted_h = self.manager(S_M, mb_H, mb_prev_h)
-        logits, _ = self.worker(mb_obs, worker_z_target, self.D)
+        logits, _ = self.worker(mb_obs, predicted_z, self.D)
         values_pred = self.value_head(S_M.mean(dim=1)).squeeze(-1).float()
 
         if mb_S_M_next is not None:
@@ -735,19 +735,12 @@ class DiplomacyTransformerEnv(ParallelEnv):
             # Supply Center Deltas
             sc_delta = current_sc_count - prev_sc_counts.get(agent, 0)
             if sc_delta != 0:
-                rewards[agent] += (sc_delta * 5.0)
-                        
-            occupied_unowned_scs = 0
-            for unit_str in agent_units:
-                prov_base = unit_str.split()[1].split('/')[0] 
-                if prov_base in all_map_scs and prov_base not in current_scs:
-                    occupied_unowned_scs += 1
-            rewards[agent] += (occupied_unowned_scs * 0.2) * anneal_factor
+                rewards[agent] += (sc_delta * 2.0)
                 
             # Dislodgement Penalty
             current_dislodged = current_state_dict.get('dislodged', {}).get(agent, [])
             if len(current_dislodged) > 0:
-                rewards[agent] -= (len(current_dislodged) * 0.5) * anneal_factor
+                rewards[agent] -= (len(current_dislodged) * 0.25) * anneal_factor
                 
         # Terminal States & Truncation Multipliers
         if is_done:
@@ -760,6 +753,9 @@ class DiplomacyTransformerEnv(ParallelEnv):
             if solo_winner:
                 rewards[solo_winner] += 150.0
             else:
+                surviving_agents = [a for a in self.agents if len(self.game.get_centers(a)) > 0]
+                num_survivors = len(surviving_agents)
+
                 # Sum of Squares Draw Scoring
                 total_sq_scs = sum(len(self.game.get_centers(a)) ** 2 for a in self.agents)
                 if total_sq_scs > 0:
@@ -767,13 +763,14 @@ class DiplomacyTransformerEnv(ParallelEnv):
                         agent_scs = len(self.game.get_centers(agent))
                         if agent_scs > 0:
                             sos_share = ((agent_scs ** 2) / total_sq_scs) * 100.0
+                            draw_tax = (num_survivors - 1) * 2.0
                             rewards[agent] += sos_share
 
-        for agent in self.agents:
-            current_scs = self.game.get_centers(agent)
-            agent_units = current_state_dict.get('units', {}).get(agent, [])
-            if len(current_scs) == 0 and len(agent_units) == 0:
-                rewards[agent] -= 50.0
+        # for agent in self.agents:
+        #     current_scs = self.game.get_centers(agent)
+        #     agent_units = current_state_dict.get('units', {}).get(agent, [])
+        #     if len(current_scs) == 0 and len(agent_units) == 0:
+        #         rewards[agent] -= 50.0
 
         terminations = {a: False for a in self.agents}
         truncations = {a: False for a in self.agents}
