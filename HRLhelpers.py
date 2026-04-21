@@ -420,6 +420,8 @@ class MacroManager(nn.Module):
     """
     def __init__(self, d_model=256, num_theaters=8):
         super().__init__()
+
+        self.theater_embed = nn.Parameter(torch.randn(1, num_theaters, d_model))
         
         self.H_proj = nn.Sequential(
             nn.Linear(7 * 7, 128),
@@ -436,13 +438,13 @@ class MacroManager(nn.Module):
         self.z_norm = nn.LayerNorm(d_model)
 
         self.z_out = nn.Linear(d_model, d_model)
-        nn.init.zeros_(self.z_out.weight)
+        nn.init.normal_(self.z_out.weight, std=1e-4)
         nn.init.zeros_(self.z_out.bias)
 
     def forward(self, S_M_t, H_t, h_prev):
         B = S_M_t.size(0)
         H_emb = self.H_proj(H_t.view(B, -1)).unsqueeze(1)
-        query = h_prev + H_emb.expand(-1, 8, -1) 
+        query = h_prev + H_emb.expand(-1, 8, -1) + self.theater_embed
         
         attn_out, _ = self.cross_attn(query=query, key=S_M_t, value=S_M_t)
         attn_out = self.attn_norm(attn_out + query)
