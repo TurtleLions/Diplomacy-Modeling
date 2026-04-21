@@ -498,7 +498,7 @@ class FeudalDiplomacyAgent(nn.Module):
         
         predicted_z, predicted_h = self.manager(S_M, mb_H, mb_prev_h)
         logits, _ = self.worker(mb_obs, predicted_z, self.D)
-        values_pred = self.value_head(S_M.mean(dim=1)).squeeze(-1).float()
+        values_pred = self.value_head(S_M.detach().mean(dim=1)).squeeze(-1).float()
 
         if mb_S_M_next is not None:
             z_achieved_raw = self.inverse_model(S_M, mb_S_M_next)
@@ -766,7 +766,7 @@ class DiplomacyTransformerEnv(ParallelEnv):
                         if agent_scs > 0:
                             sos_share = ((agent_scs ** 2) / total_sq_scs) * 100.0
                             draw_tax = (num_survivors - 1) * 2.0
-                            rewards[agent] += sos_share
+                            rewards[agent] += (sos_share - draw_tax)
 
         # for agent in self.agents:
         #     current_scs = self.game.get_centers(agent)
@@ -791,6 +791,10 @@ class DiplomacyTransformerEnv(ParallelEnv):
             'legality_metrics': legality_metrics[a],
             'H_matrix': self.tracker.H.cpu().numpy()
         } for a in self.agents}
+
+        for agent in self.agents:
+            if terminations[agent] or truncations[agent]:
+                infos[agent]['__terminal_observation'] = observations[agent]
         
         self.agents = [a for a in self.agents if not terminations[a] and not truncations[a]]
         return observations, rewards, terminations, truncations, infos

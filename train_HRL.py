@@ -517,16 +517,15 @@ def rollout_worker(local_rank, device, args, buffers, actor_net, bc_baseline_net
                         if len(next_env_results[i]) > 3:
                             obs_dict, step_rewards, terms, truncs, infos_dict, active_agents = next_env_results[i]
 
-                            if '__terminal_observation' in infos_dict:
-                                term_obs_dict = infos_dict['__terminal_observation']
-                                for a in possible_agents:
-                                    if a in term_obs_dict and learning_assignment[i, agent_to_idx[a]]:
-                                        terminal_obs_to_encode.append(term_obs_dict[a][0])
+                            for a in possible_agents:
+                                if a in infos_dict and '__terminal_observation' in infos_dict[a]:
+                                    if learning_assignment[i, agent_to_idx[a]]:
+                                        terminal_obs_to_encode.append(infos_dict[a]['__terminal_observation'][0])
                                         terminal_indices.append((i, agent_to_idx[a]))
                                         
-                                batch_h[i].zero_()
-                                batch_prev_h[i].zero_()
-                                batch_S_M[i].zero_()
+                                        batch_h[i, agent_to_idx[a]].zero_()
+                                        batch_prev_h[i, agent_to_idx[a]].zero_()
+                                        batch_S_M[i, agent_to_idx[a]].zero_()
                             
                             for a in possible_agents:
                                 if learning_assignment[i, agent_to_idx[a]]:
@@ -553,16 +552,14 @@ def rollout_worker(local_rank, device, args, buffers, actor_net, bc_baseline_net
             
             for i in range(args.num_envs):
                 infos_dict = next_env_results[i][4]
+                obs_dict = next_env_results[i][0]
+                active_agents_list = next_env_results[i][5]
                 
-                if '__terminal_observation' in infos_dict:
-                    obs_dict = infos_dict['__terminal_observation']
-                    active_agents_list = [a for a in possible_agents if a in obs_dict]
-                else:
-                    obs_dict = next_env_results[i][0]
-                    active_agents_list = next_env_results[i][5]
-                
-                for a in active_agents_list:
-                    if a in obs_dict:
+                for a in possible_agents:
+                    if a in infos_dict and '__terminal_observation' in infos_dict[a]:
+                        obs_to_encode.append(infos_dict[a]['__terminal_observation'][0])
+                        indices_to_update.append((i, agent_to_idx[a]))
+                    elif a in active_agents_list and a in obs_dict:
                         obs_to_encode.append(obs_dict[a][0])
                         indices_to_update.append((i, agent_to_idx[a]))
                     
@@ -803,12 +800,17 @@ def main():
 
     dist.barrier()
 
+    for param in net.module.worker.parameters():
+            param.requires_grad = False
+
     for update in range(1, args.num_updates + 1):
         start_time = time.time()
 
-        is_warmup = update <= 10
-        for param in net.module.worker.parameters():
-            param.requires_grad = not is_warmup
+        if update == 11:
+            for param in net.module.worker.parameters():
+                param.requires_grad = True
+            if global_rank == 0:
+                print("Warmup complete: TacticalWorker parameters unfrozen.")
         
         buffer_idx = ready_buffers_queue.get()
         
@@ -823,9 +825,6 @@ def main():
         gpu_forward_time = worker_stats[1].item()
         proposed_actions = int(worker_stats[2].item())
         illegal_dropped = int(worker_stats[3].item())
-
-        free_buffers_queue.put(buffer_idx)
-        inference_stream.wait_stream(torch.cuda.current_stream())
         
         valid = buf['masks'].view(-1)
         flat_obs = buf['obs'].view(-1, MAP_PROVINCES, 61)[valid] 
@@ -841,6 +840,9 @@ def main():
         flat_h = buf['h'].view(-1, 8, 256)[valid]
         flat_prev_h = buf['prev_h'].view(-1, 8, 256)[valid]
         flat_H = buf['H'].view(-1, 7, 7)[valid]
+
+        free_buffers_queue.put(buffer_idx)
+        inference_stream.wait_stream(torch.cuda.current_stream())
 
         b_size = flat_obs.shape[0]
         
@@ -953,24 +955,28 @@ def main():
                         logits = torch.nan_to_num(logits, nan=-1e8, posinf=1e8, neginf=-1e8)
                         z_achieved = z_achieved_raw.float()
 
-                        intrinsic_reward = F.cosine_similarity(z_achieved, mb_z.detach(), dim=-1)
+                        intrinsic_reward = F.cosine_similarity(z_achieved, mb_z.detach().float(), dim=-1)
                         epoch_intrinsic_reward_sum += intrinsic_reward.detach().mean().item()
+
+                        flat_mb_z = mb_z.view(-1, 256).float()
+                        flat_z_achieved = z_achieved_raw.view(-1, 256).float()
+                        flat_predicted_z = predicted_z.view(-1, 256).float()
+
+                        flat_mb_z_det = flat_mb_z.detach()
+                        flat_z_achieved_det = flat_z_achieved.detach()
                         
-                        # Flatten and L2 Normalize for contrastive learning (B * 8, 256)
-                        flat_mb_z_det = F.normalize(mb_z.view(-1, 256).detach().float(), dim=-1)
-                        flat_z_achieved_det = F.normalize(z_achieved.view(-1, 256).detach().float(), dim=-1)
+                        inv_loss_mgr = F.mse_loss(flat_predicted_z, flat_z_achieved_det)
+                        inv_loss_inv = F.mse_loss(flat_z_achieved, flat_mb_z_det)
                         
-                        flat_z_achieved = F.normalize(z_achieved_raw.view(-1, 256).float(), dim=-1)
-                        flat_predicted_z = F.normalize(predicted_z.view(-1, 256).float(), dim=-1)
+                        target_std = 1.0
+                        std_z_achieved = torch.sqrt(flat_z_achieved.var(dim=0) + 1e-04)
+                        std_predicted_z = torch.sqrt(flat_predicted_z.var(dim=0) + 1e-04)
                         
-                        tau = 0.1 # Temperature for InfoNCE
-                        labels = torch.arange(flat_z_achieved.size(0), device=device)
+                        var_loss_achieved = torch.mean(F.relu(target_std - std_z_achieved))
+                        var_loss_predicted = torch.mean(F.relu(target_std - std_predicted_z))
                         
-                        manager_logits = torch.matmul(flat_predicted_z, flat_z_achieved_det.T) / tau
-                        manager_loss = F.cross_entropy(manager_logits, labels)
-                        
-                        inv_logits = torch.matmul(flat_z_achieved, flat_mb_z_det.T) / tau
-                        inverse_model_loss = F.cross_entropy(inv_logits, labels)
+                        manager_loss = inv_loss_mgr + (0.1 * var_loss_predicted)
+                        inverse_model_loss = inv_loss_inv + (0.1 * var_loss_achieved)
                         
                         z_variance = z_achieved_raw.var(dim=0).mean().item() if z_achieved_raw.size(0) > 1 else 0.0
 
@@ -1011,8 +1017,13 @@ def main():
                             valid_ratio_mask = (packed_actions != NONE_IDX) & valid_pack_mask
                             
                             if valid_ratio_mask.any():
-                                surr1 = ratio * mb_adv.unsqueeze(1)
-                                surr2 = torch.clamp(ratio, 1.0 - args.clip_coef, 1.0 + args.clip_coef) * mb_adv.unsqueeze(1)
+                                mean_intrinsic = intrinsic_reward.detach().mean(dim=1, keepdim=True)
+                            
+                                # Add the intrinsic bonus directly to the GAE Advantage
+                                worker_adv = mb_adv.unsqueeze(1) + (current_c_int * mean_intrinsic)
+                                
+                                surr1 = ratio * worker_adv
+                                surr2 = torch.clamp(ratio, 1.0 - args.clip_coef, 1.0 + args.clip_coef) * worker_adv
                                 
                                 pg_loss = -torch.min(surr1, surr2)[valid_ratio_mask].mean()
                                 entropy = dist_cat.entropy()[valid_ratio_mask].mean()
@@ -1045,8 +1056,7 @@ def main():
                                          + (0.05 * manager_loss) 
                                          + (0.05 * inverse_model_loss)
                                          + (args.bc_kl_coef * bc_kl_penalty) 
-                                         + (args.v_coef * v_loss)
-                                         - (current_c_int * intrinsic_reward.mean()))
+                                         + (args.v_coef * v_loss))
 
                         epoch_pg_loss_sum += pg_loss.item()
                         epoch_manager_loss_sum += manager_loss.item()
