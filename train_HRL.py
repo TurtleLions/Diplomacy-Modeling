@@ -13,6 +13,8 @@ import contextlib
 import torch.multiprocessing as mp  
 import multiprocessing.connection
 import random
+import matplotlib.pyplot as plt
+import seaborn as sns
 
 import numpy as np
 import torch
@@ -224,6 +226,7 @@ def evaluate_against_baseline(live_net, baseline_net, device, update_num, live_p
                     h_prev = torch.cat([live_h_memory[a] for a in agents], dim=0)
                     
                     z_eval, h_eval = net.manager(S_M, real_H, h_prev)
+                    z_eval = F.normalize(z_eval.float(), p=2, dim=-1).to(torch.bfloat16)
                     
                     for i, a in enumerate(agents):
                             live_h_memory[a] = h_eval[i].unsqueeze(0).detach()
@@ -299,7 +302,7 @@ def parse_args():
     parser.add_argument("--update_epochs", type=int, default=8, help="Number of epochs per PPO update")
     parser.add_argument("--bc_weights", type=str, default="feudal_agent_bc.pth", help="Path to pre-trained Behavioral Cloning weights")
     parser.add_argument("--resume_weights", type=str, default=None, help="Path to RL checkpoint to resume training from")
-    parser.add_argument("--bc_kl_coef", type=float, default=0.05, help="KL divergence penalty coefficient for behavioral cloning")
+    parser.add_argument("--bc_kl_coef", type=float, default=0.005, help="KL divergence penalty coefficient for behavioral cloning")
     return parser.parse_args()
 
 def rollout_worker(local_rank, device, args, buffers, actor_net, bc_baseline_net, 
@@ -787,6 +790,7 @@ def main():
             config=vars(args),
             dir="/data/restanislao/wandb"
         )
+        wandb.watch(net.module, log="all", log_freq=10)
 
     dist.barrier()
 
@@ -932,8 +936,8 @@ def main():
                         logits = torch.nan_to_num(logits, nan=-1e8, posinf=1e8, neginf=-1e8)
                         z_achieved = F.normalize(z_achieved_raw.float(), p=2, dim=-1)
 
-                        intrinsic_reward = F.cosine_similarity(z_achieved.detach(), mb_z.detach(), dim=-1)
-                        epoch_intrinsic_reward_sum += intrinsic_reward.mean().item()
+                        intrinsic_reward = F.cosine_similarity(z_achieved, mb_z.detach(), dim=-1)
+                        epoch_intrinsic_reward_sum += intrinsic_reward.detach().mean().item()
                         
                         manager_loss = F.mse_loss(predicted_z, z_achieved.detach())
                         
@@ -1130,12 +1134,32 @@ def main():
                     print(f"  -> Saved checkpoint to {ckpt_path}")
                     torch.save(checkpoint, ckpt_path)
             
-        EVAL_FREQ = 10
+        EVAL_FREQ = 1
         
         if update % EVAL_FREQ == 0:
             eval_start_time = time.time()
             torch.cuda.empty_cache()
             
+            attention_cache = []
+            worker_attn_cache = []
+            hook_handle = None
+            worker_hook_handle = None
+            if global_rank == 0:
+                def get_attn_hook(module, inp, out):
+                    # MultiheadAttention returns (attn_output, attn_weights)
+                    # We only need to grab the first one to save memory
+                    if len(attention_cache) == 0: 
+                        attention_cache.append(out[1].detach().cpu().numpy())
+                
+                def get_worker_attn_hook(module, inp, out):
+                    if len(worker_attn_cache) == 0:
+                        worker_attn_cache.append(out[1].detach().cpu().numpy())
+                
+                # Attach hook to the MacroManager's cross attention layer
+                hook_handle = net.module.manager.cross_attn.register_forward_hook(get_attn_hook)
+
+                worker_hook_handle = net.module.worker.strategy_cross_attn.register_forward_hook(get_worker_attn_hook)
+
             world_size = dist.get_world_size()
             my_powers = [p for i, p in enumerate(possible_agents) if i % world_size == global_rank]
             
@@ -1206,6 +1230,56 @@ def main():
                 
                 for i, power in enumerate(possible_agents):
                     wandb.log({f"Eval/{power}_SCs": local_eval_scs[i].item()}, step=update)
+                
+                if hook_handle is not None:
+                    hook_handle.remove() 
+                
+                if len(attention_cache) > 0:
+                    attn_matrix = attention_cache[0][0] 
+                    
+                    # Intercept the raw values in the console
+                    print(f"\n[DEBUG] MacroManager Attn - Max: {attn_matrix.max():.4f}, Min: {attn_matrix.min():.4f}")
+                    
+                    plt.figure(figsize=(8, 6))
+                    # REMOVED vmin/vmax to force auto-scaling. ADDED annot=True to see the math.
+                    sns.heatmap(attn_matrix, cmap="viridis", annot=True, fmt=".3f")
+                    plt.title(f"MacroManager Cross-Attention - Update {update}")
+                    plt.xlabel("Key (S_M Theaters)")
+                    plt.ylabel("Query (z_prev + H_t)")
+                    
+                    wandb.log({"Attention/MacroManager_Map": wandb.Image(plt)}, step=update)
+                    plt.close()
+
+                # --- UPDATE 2: TacticalWorker Plot ---
+                if worker_hook_handle is not None:
+                    worker_hook_handle.remove()
+                    
+                if len(worker_attn_cache) > 0:
+                    w_attn_matrix = worker_attn_cache[0][0] 
+                    
+                    # Intercept the raw values in the console
+                    print(f"[DEBUG] TacticalWorker Attn - Max: {w_attn_matrix.max():.4f}, Min: {w_attn_matrix.min():.4f}\n")
+                    
+                    plt.figure(figsize=(6, 12)) 
+                    # REMOVED vmin/vmax. (annot=False left intact because 82 rows of numbers is unreadable)
+                    sns.heatmap(w_attn_matrix, cmap="magma")
+                    plt.title(f"Worker Strategy Execution - Update {update}")
+                    plt.xlabel("Strategy Vectors (z_t)")
+                    plt.ylabel("Provinces (S_mu)")
+                    
+                    wandb.log({"Attention/TacticalWorker_Map": wandb.Image(plt)}, step=update)
+                    plt.close()
+                
+                if flat_H.shape[0] > 0:
+                    sample_H = flat_H[-1].detach().cpu().numpy()
+                    
+                    plt.figure(figsize=(7, 6))
+                    sns.heatmap(sample_H, cmap="RdBu", annot=True, fmt=".1f", vmin=-1.0, vmax=1.0,
+                                xticklabels=possible_agents, yticklabels=possible_agents)
+                    plt.title(f"Sample Diplomatic Belief Matrix (H) - Update {update}")
+                    
+                    wandb.log({"Attention/Diplomatic_Matrix_H": wandb.Image(plt)}, step=update)
+                    plt.close()
                     
             torch.cuda.empty_cache()
 
