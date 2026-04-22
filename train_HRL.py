@@ -722,6 +722,9 @@ def main():
         else:
             net.load_state_dict(checkpoint, strict=False)
             actor_net.load_state_dict(checkpoint, strict=False)
+        
+        if 'scheduler_state_dict' in checkpoint:
+            scheduler.load_state_dict(checkpoint['scheduler_state_dict'])
             
         if global_rank == 0:
             print(f"Successfully resumed RL training from checkpoint: {args.resume_weights}")
@@ -1223,7 +1226,8 @@ def main():
                     checkpoint = {
                         'update': update,
                         'model_state_dict': net.module.state_dict(),
-                        'optimizer_state_dict': optimizer.state_dict()
+                        'optimizer_state_dict': optimizer.state_dict(),
+                        'scheduler_state_dict': scheduler.state_dict()
                     }
                     print(f"  -> Saved checkpoint to {ckpt_path}")
                     torch.save(checkpoint, ckpt_path)
