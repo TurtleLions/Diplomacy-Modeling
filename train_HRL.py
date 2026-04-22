@@ -115,8 +115,11 @@ def worker(remote, parent_remote):
                 if env_is_done:
                     terminal_obs = obs
                     obs, infos = env.reset()
+
+                    for agent, t_obs in terminal_obs.items():
+                        if agent in infos:
+                            infos[agent]['__terminal_observation'] = t_obs
                     
-                    infos['__terminal_observation'] = terminal_obs
                     infos['episode_reward'] = episode_rewards.copy()
                     
                     episode_rewards = {a: 0.0 for a in env.possible_agents}
@@ -309,7 +312,7 @@ def parse_args():
 def rollout_worker(local_rank, device, args, buffers, actor_net, bc_baseline_net, 
                    free_buffers_queue, ready_buffers_queue, worker_stats, 
                    NUM_AGENTS, MAP_PROVINCES, VOCAB_SIZE, NONE_IDX, possible_agents, agent_to_idx,
-                   actor_weights_lock):
+                   actor_weights_lock, start_update=1):
     """Background process responsible for filling the experience buffer asynchronously."""
     torch.cuda.set_device(device) 
     inference_stream = torch.cuda.Stream(device=device)
@@ -325,7 +328,7 @@ def rollout_worker(local_rank, device, args, buffers, actor_net, bc_baseline_net
     batch_prev_h = torch.zeros((args.num_envs, NUM_AGENTS, 8, 256), dtype=torch.bfloat16, device=device)
     batch_S_M = torch.zeros((args.num_envs, NUM_AGENTS, 8, 256), dtype=torch.bfloat16, device=device)
 
-    for update in range(1, args.num_updates + 1):
+    for update in range(start_update, args.num_updates + 1):
         buffer_idx = free_buffers_queue.get()
 
         num_learning = 3
@@ -359,7 +362,7 @@ def rollout_worker(local_rank, device, args, buffers, actor_net, bc_baseline_net
                         else:
                             obs_dict, step_rewards, terms, truncs, infos_dict, active_agents = next_env_results[i]
 
-                        if '__terminal_observation' in infos_dict and 'episode_reward' in infos_dict:
+                        if 'episode_reward' in infos_dict:
                             for r in infos_dict['episode_reward'].values():
                                 local_ep_reward_sum += r
                                 local_ep_count += 1
@@ -577,6 +580,26 @@ def rollout_worker(local_rank, device, args, buffers, actor_net, bc_baseline_net
                 next_value[env_idx, agent_idx] = val
                 buf['terminal_values'][step, env_idx, agent_idx] = val
             
+        with torch.no_grad():
+            with torch.autocast(device_type='cuda', dtype=torch.bfloat16):
+                # Flatten the states to pass through the inverse model
+                flat_S_M = buf['S_M'].view(-1, 8, 256)
+                flat_S_M_next = buf['S_M_next'].view(-1, 8, 256)
+                flat_z = buf['z'].view(-1, 8, 256)
+                
+                # Predict what Z was actually achieved
+                flat_z_achieved = actor_net.inverse_model(flat_S_M, flat_S_M_next)
+                
+                # Calculate cosine similarity and average across the 8 theaters
+                intrinsic_rewards_flat = F.cosine_similarity(flat_z_achieved.float(), flat_z.float(), dim=-1).mean(dim=1)
+                
+                # Reshape back to buffer dimensions
+                intrinsic_rewards = intrinsic_rewards_flat.view(args.num_steps, args.num_envs, NUM_AGENTS)
+                
+                # Add scaled intrinsic reward to the extrinsic reward
+                current_c_int = min(0.5, 0.5 * (update / 200.0))
+                buf['rewards'] += (current_c_int * intrinsic_rewards)
+        
         lastgaelam = 0
         for t in reversed(range(args.num_steps)):
             if t == args.num_steps - 1:
@@ -769,7 +792,7 @@ def main():
         local_rank, device, args, buffers, actor_net, bc_baseline_net,
         free_buffers_queue, ready_buffers_queue, worker_stats,
         NUM_AGENTS, MAP_PROVINCES, VOCAB_SIZE, NONE_IDX, possible_agents, agent_to_idx,
-        actor_weights_lock
+        actor_weights_lock, start_update
     ))
     rollout_process.start()
 
@@ -803,7 +826,13 @@ def main():
     for param in net.module.worker.parameters():
             param.requires_grad = False
 
-    for update in range(1, args.num_updates + 1):
+    if start_update >= 11:
+        for param in net.module.worker.parameters():
+            param.requires_grad = True
+        if global_rank == 0:
+            print("Resuming past warmup: TacticalWorker parameters unfrozen.")
+
+    for update in range(start_update, args.num_updates + 1):
         start_time = time.time()
 
         if update == 11:
@@ -983,7 +1012,7 @@ def main():
                         epoch_inv_loss_sum += inverse_model_loss.item()
                         epoch_z_var_sum += z_variance
                         
-                        v_loss = F.mse_loss(values_pred, mb_ret.float())
+                        v_loss = F.huber_loss(values_pred, mb_ret.float(), delta=10.0)
                         distance_penalty = F.mse_loss(mb_z.detach(), z_achieved.detach())
                         
                         is_active, packed_masks, padded_idx, max_act_live = rebuild_packed_masks(
@@ -1017,10 +1046,7 @@ def main():
                             valid_ratio_mask = (packed_actions != NONE_IDX) & valid_pack_mask
                             
                             if valid_ratio_mask.any():
-                                mean_intrinsic = intrinsic_reward.detach().mean(dim=1, keepdim=True)
-                            
-                                # Add the intrinsic bonus directly to the GAE Advantage
-                                worker_adv = mb_adv.unsqueeze(1) + (current_c_int * mean_intrinsic)
+                                worker_adv = mb_adv.unsqueeze(1)
                                 
                                 surr1 = ratio * worker_adv
                                 surr2 = torch.clamp(ratio, 1.0 - args.clip_coef, 1.0 + args.clip_coef) * worker_adv
@@ -1214,14 +1240,12 @@ def main():
             worker_hook_handle = None
             if global_rank == 0:
                 def get_attn_hook(module, inp, out):
-                    # MultiheadAttention returns (attn_output, attn_weights)
-                    # We only need to grab the first one to save memory
-                    if len(attention_cache) == 0: 
-                        attention_cache.append(out[1].detach().cpu().numpy())
+                    attention_cache.clear()
+                    attention_cache.append(out[1].detach().cpu().numpy())
                 
                 def get_worker_attn_hook(module, inp, out):
-                    if len(worker_attn_cache) == 0:
-                        worker_attn_cache.append(out[1].detach().cpu().numpy())
+                    worker_attn_cache.clear()
+                    worker_attn_cache.append(out[1].detach().cpu().numpy())
                 
                 # Attach hook to the MacroManager's cross attention layer
                 hook_handle = net.module.manager.cross_attn.register_forward_hook(get_attn_hook)

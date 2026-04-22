@@ -158,6 +158,30 @@ for power, hsc_list in GLOBAL_HSCS.items():
 _COAST_MAP = {'NC': 16, 'SC': 17, 'EC': 18}
 _UNIT_MAP = {'A': 7, 'F': 8}
 
+_UNIT_PARSING_CACHE = {}
+
+def _build_unit_cache():
+    """Pre-computes numeric indices for all possible diplomacy unit strings to bypass runtime string manipulation."""
+    for loc_full in GLOBAL_PROVINCES:
+        loc_split = loc_full.split('/')
+        loc_base = loc_split[0]
+        coast = loc_split[1] if len(loc_split) > 1 else None
+        
+        p_idx = GLOBAL_PROV_TO_IDX.get(loc_full)
+        base_idx = GLOBAL_PROV_TO_IDX.get(loc_base)
+        coast_idx = _COAST_MAP.get(coast)
+        
+        for u_str, u_type in _UNIT_MAP.items():
+            # Store tuple: (u_type, p_idx, base_idx, coast_idx, loc_base)
+            cache_tuple = (u_type, p_idx, base_idx, coast_idx, loc_base)
+            
+            # Active unit formats
+            _UNIT_PARSING_CACHE[f"{u_str} {loc_full}"] = cache_tuple
+            # Dislodged unit formats (just in case they appear here)
+            _UNIT_PARSING_CACHE[f"*{u_str} {loc_full}"] = cache_tuple
+
+_build_unit_cache()
+
 def parse_state_to_tensor(turn_data, observing_agent=None, prev_state=None, bounces=None, H_matrix=None):
     """
     Parses a single game phase into a standardized geometric feature tensor.
@@ -213,27 +237,22 @@ def parse_state_to_tensor(turn_data, observing_agent=None, prev_state=None, boun
             elif H_matrix[obs_idx, power_idx].item() < -0.5: stance_idx = 60
         
         for unit_str in unit_list:
-            clean_str = unit_str.replace('*', '').upper()
-            parts = clean_str.split(maxsplit=1)
+            cached_data = _UNIT_PARSING_CACHE.get(unit_str.upper())
             
-            if len(parts) >= 2:
-                u_type = _UNIT_MAP.get(parts[0])
-                loc_full = parts[1]
-                loc_split = loc_full.split('/')
-                loc_base = loc_split[0]
-                coast = loc_split[1] if len(loc_split) > 1 else None
+            if cached_data is not None:
+                u_type, p_idx, base_idx, coast_idx, loc_base = cached_data
                 
                 occupied_bases.add(loc_base)
 
-                if loc_full in GLOBAL_PROV_TO_IDX:
-                    p_idx = GLOBAL_PROV_TO_IDX[loc_full]
+                # Set tensor values for the specific location (e.g., SPA/NC)
+                if p_idx is not None:
                     state_tensor[p_idx, power_idx] = 1.0
                     if u_type: state_tensor[p_idx, u_type] = 1.0
-                    if coast in _COAST_MAP: state_tensor[p_idx, _COAST_MAP[coast]] = 1.0
+                    if coast_idx: state_tensor[p_idx, coast_idx] = 1.0
                     if stance_idx: state_tensor[p_idx, stance_idx] = 1.0
 
-                if loc_base != loc_full and loc_base in GLOBAL_PROV_TO_IDX:
-                    base_idx = GLOBAL_PROV_TO_IDX[loc_base]
+                # Set tensor values for the base province (e.g., SPA) if it differs
+                if base_idx is not None and base_idx != p_idx:
                     state_tensor[base_idx, power_idx] = 1.0
                     if u_type: state_tensor[base_idx, u_type] = 1.0
                     if stance_idx: state_tensor[base_idx, stance_idx] = 1.0
@@ -247,14 +266,15 @@ def parse_state_to_tensor(turn_data, observing_agent=None, prev_state=None, boun
         power_upper = power.upper()
         if power_upper not in GLOBAL_POWER_TO_IDX: continue
         power_idx = GLOBAL_POWER_TO_IDX[power_upper]
+        
         for unit_str in unit_list:
-            parts = unit_str.replace('*', '').upper().split(maxsplit=1)
-            if len(parts) >= 2 and parts[1] in GLOBAL_PROV_TO_IDX:
-                p_idx = GLOBAL_PROV_TO_IDX[parts[1]]
-                state_tensor[p_idx, power_idx] = 1.0
-                state_tensor[p_idx, 24] = 1.0
-                u_type = _UNIT_MAP.get(parts[0])
-                if u_type: state_tensor[p_idx, u_type] = 1.0
+            cached_data = _UNIT_PARSING_CACHE.get(unit_str.upper())
+            if cached_data is not None:
+                u_type, p_idx, _, _, _ = cached_data
+                if p_idx is not None:
+                    state_tensor[p_idx, power_idx] = 1.0
+                    state_tensor[p_idx, 24] = 1.0 # 24 is the Dislodged Flag
+                    if u_type: state_tensor[p_idx, u_type] = 1.0
 
     for power, sc_list in centers.items():
         power_upper = power.upper()
