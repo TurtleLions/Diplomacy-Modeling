@@ -533,6 +533,7 @@ def rollout_worker(local_rank, device, args, buffers, actor_net, bc_baseline_net
                             for a in possible_agents:
                                 if learning_assignment[i, agent_to_idx[a]]:
                                     buf['rewards'][step, i, agent_to_idx[a]] = step_rewards.get(a, 0.0)
+                                    buf['extrinsic_rewards'][step, i, agent_to_idx[a]] = step_rewards.get(a, 0.0)
                                     buf['dones'][step, i, agent_to_idx[a]] = float(terms.get(a, False))
                                     buf['truncations'][step, i, agent_to_idx[a]] = float(truncs.get(a, False))
                                     next_done[i, agent_to_idx[a]] = float(terms.get(a, False))
@@ -753,6 +754,7 @@ def main():
             'actions': torch.zeros((args.num_steps, args.num_envs, NUM_AGENTS, 82), dtype=torch.long, device=device),
             'logprobs': torch.zeros((args.num_steps, args.num_envs, NUM_AGENTS, 82), dtype=torch.float32, device=device),
             'rewards': torch.zeros((args.num_steps, args.num_envs, NUM_AGENTS), dtype=torch.float32, device=device),
+            'extrinsic_rewards': torch.zeros((args.num_steps, args.num_envs, NUM_AGENTS), dtype=torch.float32, device=device),
             'dones': torch.zeros((args.num_steps, args.num_envs, NUM_AGENTS), dtype=torch.float32, device=device),
             'values': torch.zeros((args.num_steps, args.num_envs, NUM_AGENTS), dtype=torch.float32, device=device),
             'masks': torch.zeros((args.num_steps, args.num_envs, NUM_AGENTS), dtype=torch.bool, device=device),
@@ -1170,13 +1172,15 @@ def main():
             sps = int(global_steps / total_time)  
             total_active_steps = buf['masks'].sum().item()
             if total_active_steps > 0:
-                avg_step_reward = buf['rewards'].sum().item() / total_active_steps
+                avg_extrinsic_step_reward = buf['extrinsic_rewards'].sum().item() / total_active_steps
+                avg_total_step_reward = buf['rewards'].sum().item() / total_active_steps
             else:
-                avg_step_reward = 0.0
+                avg_extrinsic_step_reward = 0.0
+                avg_total_step_reward = 0.0
 
             illegal_rate = (illegal_dropped / max(1, proposed_actions)) * 100.0
             
-            print(f"Update {update}/{args.num_updates} | SPS: {sps} | Ext. Reward (Manager): {avg_step_reward:.2f} | Int. Reward (Worker): {avg_intrinsic_reward:.4f}")
+            print(f"Update {update}/{args.num_updates} | SPS: {sps} | Extrinsic Step: {avg_extrinsic_step_reward:.2f} | Total Step (w/ Intrinsic): {avg_total_step_reward:.2f}")
             print(f"  CPU Time: {env_step_time:.2f}s | GPU Fwd: {gpu_forward_time:.2f}s | Bwd: {update_time:.2f}s")
             print(f"  Losses -> Total: {avg_total_loss:.4f} | PG: {avg_pg_loss:.4f} | Mgr(InfoNCE): {avg_manager_loss:.4f} | Inv(InfoNCE): {avg_inv_loss:.4f}")
             print(f"  Metrics -> Feasibility Err: {avg_feasibility_error:.4f} | BC_KL: {avg_bc_kl:.4f} | Z_Var: {avg_z_var:.4f}")
@@ -1184,7 +1188,7 @@ def main():
             print(f"  Avg Episode Return: {last_avg_ep_reward:.2f} (Completed {int(global_ep_count)} episodes this update)")
 
             writer.add_scalar("Perf/SPS", sps, update)
-            writer.add_scalar("Reward/Extrinsic_Manager", avg_step_reward, update)
+            writer.add_scalar("Reward/Extrinsic_Manager", avg_extrinsic_step_reward, update)
             writer.add_scalar("Reward/Avg_Episodic_Return", last_avg_ep_reward, update)
             writer.add_scalar("Reward/Intrinsic_Worker", avg_intrinsic_reward, update)
             writer.add_scalar("Loss/Total_Loss", avg_total_loss, update)
@@ -1201,7 +1205,8 @@ def main():
 
             wandb.log({
                 "Perf/SPS": sps,
-                "Reward/Extrinsic_Manager": avg_step_reward,
+                "Reward/Extrinsic_Manager": avg_extrinsic_step_reward,
+                "Reward/Total_Step_Reward": avg_total_step_reward,
                 "Reward/Avg_Episodic_Return": last_avg_ep_reward,
                 "Reward/Intrinsic_Worker": avg_intrinsic_reward,
                 "Loss/Total_Loss": avg_total_loss,

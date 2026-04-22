@@ -760,9 +760,9 @@ class DiplomacyTransformerEnv(ParallelEnv):
                 rewards[agent] += (sc_delta * 2.0)
                 
             # Dislodgement Penalty
-            current_dislodged = current_state_dict.get('dislodged', {}).get(agent, [])
-            if len(current_dislodged) > 0:
-                rewards[agent] -= (len(current_dislodged) * 0.25) * anneal_factor
+            # current_dislodged = current_state_dict.get('dislodged', {}).get(agent, [])
+            # if len(current_dislodged) > 0:
+            #     rewards[agent] -= (len(current_dislodged) * 0.25) * anneal_factor
                 
         # Terminal States & Truncation Multipliers
         if is_done:
