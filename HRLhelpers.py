@@ -392,7 +392,8 @@ class TacticalWorker(nn.Module):
         self.d_model = d_model
         
         self.feature_projection = nn.Linear(FEATURE_DIM, d_model)
-        self.encoder_transformer = nn.TransformerEncoderLayer(d_model=d_model, nhead=8, batch_first=True)
+        encoder_layer = nn.TransformerEncoderLayer(d_model=d_model, nhead=8, batch_first=True)
+        self.encoder_transformer = nn.TransformerEncoder(encoder_layer, num_layers=4)
         
         self.strategy_cross_attn = nn.MultiheadAttention(embed_dim=d_model, num_heads=8, batch_first=True)
         self.strategy_norm = nn.LayerNorm(d_model)
@@ -424,8 +425,7 @@ class InverseModel(nn.Module):
             nn.Linear(d_val * 2, 512),
             nn.LayerNorm(512),
             nn.GELU(),
-            nn.Linear(512, d_model),
-            nn.Tanh() 
+            nn.Linear(512, d_model)
         )
 
     def forward(self, S_M_t, S_M_t_next):
@@ -474,7 +474,7 @@ class MacroManager(nn.Module):
         h_t_flat = self.gru_cell(attn_out_flat, h_prev.view(B * 8, -1))
         h_t = h_t_flat.view(B, 8, -1)
         
-        z_t = torch.tanh(self.z_out(self.z_norm(h_t)))
+        z_t = self.z_out(self.z_norm(h_t))
 
         return z_t, h_t
 
@@ -758,6 +758,15 @@ class DiplomacyTransformerEnv(ParallelEnv):
             sc_delta = current_sc_count - prev_sc_counts.get(agent, 0)
             if sc_delta != 0:
                 rewards[agent] += (sc_delta * 2.0)
+
+            # Calculate unique provinces occupied this turn vs last turn
+            current_bases = set([u.split()[1].split('/')[0] for u in current_state_dict.get('units', {}).get(agent, [])])
+            prev_bases = set([u.split()[1].split('/')[0] for u in prev_units.get(agent, [])])
+            
+            # Reward for taking new territory (even non-SCs)
+            new_territories = len(current_bases - prev_bases)
+            if new_territories > 0:
+                rewards[agent] += (new_territories * 0.1) * anneal_factor
                 
             # Dislodgement Penalty
             # current_dislodged = current_state_dict.get('dislodged', {}).get(agent, [])

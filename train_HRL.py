@@ -306,7 +306,7 @@ def parse_args():
     parser.add_argument("--update_epochs", type=int, default=6, help="Number of epochs per PPO update")
     parser.add_argument("--bc_weights", type=str, default="feudal_agent_bc.pth", help="Path to pre-trained Behavioral Cloning weights")
     parser.add_argument("--resume_weights", type=str, default=None, help="Path to RL checkpoint to resume training from")
-    parser.add_argument("--bc_kl_coef", type=float, default=0.005, help="KL divergence penalty coefficient for behavioral cloning")
+    parser.add_argument("--bc_kl_coef", type=float, default=0.1, help="KL divergence penalty coefficient for behavioral cloning")
     return parser.parse_args()
 
 def rollout_worker(local_rank, device, args, buffers, actor_net, bc_baseline_net, 
@@ -598,7 +598,7 @@ def rollout_worker(local_rank, device, args, buffers, actor_net, bc_baseline_net
                 intrinsic_rewards = intrinsic_rewards_flat.view(args.num_steps, args.num_envs, NUM_AGENTS)
                 
                 # Add scaled intrinsic reward to the extrinsic reward
-                current_c_int = min(0.5, 0.5 * (update / 200.0))
+                current_c_int = min(0.02, 0.02 * (update / 100.0))
                 buf['rewards'] += (current_c_int * intrinsic_rewards)
         
         lastgaelam = 0
@@ -1003,14 +1003,14 @@ def main():
                         inv_loss_inv = F.mse_loss(flat_z_achieved, flat_mb_z_det)
                         
                         target_std = 1.0
-                        std_z_achieved = torch.sqrt(flat_z_achieved.var(dim=0) + 1e-04)
-                        std_predicted_z = torch.sqrt(flat_predicted_z.var(dim=0) + 1e-04)
+                        std_z_achieved = torch.sqrt(z_achieved_raw.float().var(dim=0) + 1e-04)
+                        std_predicted_z = torch.sqrt(mb_z.float().var(dim=0) + 1e-04)
                         
                         var_loss_achieved = torch.mean(F.relu(target_std - std_z_achieved))
                         var_loss_predicted = torch.mean(F.relu(target_std - std_predicted_z))
                         
-                        manager_loss = inv_loss_mgr + (0.1 * var_loss_predicted)
-                        inverse_model_loss = inv_loss_inv + (0.1 * var_loss_achieved)
+                        manager_loss = inv_loss_mgr + (1.0 * var_loss_predicted)
+                        inverse_model_loss = inv_loss_inv + (1.0 * var_loss_achieved)
                         
                         z_variance = z_achieved_raw.var(dim=0).mean().item() if z_achieved_raw.size(0) > 1 else 0.0
 
