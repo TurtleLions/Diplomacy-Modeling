@@ -412,13 +412,13 @@ def train_worker(rank, world_size, paths_and_metadata, args):
         batch_size=args.batch_size, 
         shuffle=False,
         sampler=sampler,
-        num_workers=48, 
+        num_workers=32, 
         pin_memory=True, 
         prefetch_factor=4, 
         persistent_workers=True
     )
     
-    agent = FeudalDiplomacyAgent(d_model=256, vocab_size=vocab_size).to(rank)
+    agent = FeudalDiplomacyAgent(d_model=512, vocab_size=vocab_size).to(rank)
     
     temp_game = Game()
     provinces = [p.upper() for p in list(temp_game.map.locs)]
@@ -493,7 +493,7 @@ def main():
     parser = argparse.ArgumentParser(description="HRL Behavioral Cloning")
     parser.add_argument("--dataset_path", type=str, default="/data/restanislao/datasets/standard_no_press.jsonl", help="Path to raw JSONL dataset")
     parser.add_argument("--cache_dir", type=str, default="/data/restanislao/diplomacy", help="Directory for binary memmap cache")
-    parser.add_argument("--batch_size", type=int, default=512, help="Batch size per GPU")
+    parser.add_argument("--batch_size", type=int, default=128, help="Batch size per GPU")
     parser.add_argument("--learning_rate", type=float, default=3e-4, help="Learning rate")
     parser.add_argument("--epochs", type=int, default=10, help="Number of training epochs")
     parser.add_argument("--save_path", type=str, default="feudal_agent_bc.pth", help="Path to save the model weights")

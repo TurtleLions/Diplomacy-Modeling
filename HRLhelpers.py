@@ -326,7 +326,7 @@ class InteractionMatrixTracker:
 
 class MacroStatePooler(nn.Module):
     """Generates S_M via Cross-Attention Pooling over the Micro-State."""
-    def __init__(self, d_model=256, num_queries=8, d_val=256):
+    def __init__(self, d_model=512, num_queries=8, d_val=512):
         super().__init__()
         self.d_model = d_model
         self.num_queries = num_queries
@@ -387,27 +387,27 @@ class GraphBiasedAttentionBlock(nn.Module):
 
 class TacticalWorker(nn.Module):
     """T_phi: Executes tactics guided by the latent strategy z_t."""
-    def __init__(self, d_model=256, vocab_size=22231):
+    def __init__(self, d_model=512, vocab_size=22231):
         super().__init__()
         self.d_model = d_model
         
         self.feature_projection = nn.Linear(FEATURE_DIM, d_model)
-        encoder_layer = nn.TransformerEncoderLayer(d_model=d_model, nhead=8, batch_first=True)
-        self.encoder_transformer = nn.TransformerEncoder(encoder_layer, num_layers=4)
+        encoder_layer = nn.TransformerEncoderLayer(d_model=d_model, nhead=16, batch_first=True, norm_first=True)
+        self.encoder_transformer = nn.TransformerEncoder(encoder_layer, num_layers=16, enable_nested_tensor=False)
         
-        self.strategy_cross_attn = nn.MultiheadAttention(embed_dim=d_model, num_heads=8, batch_first=True)
+        self.strategy_cross_attn = nn.MultiheadAttention(embed_dim=d_model, num_heads=16, batch_first=True)
         self.strategy_norm = nn.LayerNorm(d_model)
         
-        self.decoder_layer = GraphBiasedAttentionBlock(d_model, nhead=8)
+        self.decoder_layer = GraphBiasedAttentionBlock(d_model, nhead=16)
         self.action_head = nn.Linear(d_model, vocab_size)
 
     def forward(self, S_mu_raw, z_t, distance_matrix_D):
         B, L, _ = S_mu_raw.size()
         x_emb = self.feature_projection(S_mu_raw)
         
-        S_mu_encoded = self.encoder_transformer(x_emb) # Shape: (B, 82, 256)
+        S_mu_encoded = self.encoder_transformer(x_emb) # Shape: (B, 82, 512)
         
-        # z_t is shape (B, 8, 256)
+        # z_t is shape (B, 8, 512)
         strat_context, _ = self.strategy_cross_attn(query=S_mu_encoded, key=z_t, value=z_t)
         
         S_mu_strat = self.strategy_norm(S_mu_encoded + strat_context)
@@ -419,38 +419,39 @@ class TacticalWorker(nn.Module):
 
 class InverseModel(nn.Module):
     """I_psi: Calculates the achieved z based on state transitions per theater."""
-    def __init__(self, d_val=256, d_model=256):
+    def __init__(self, d_val=512, d_model=512):
         super().__init__()
+        hidden_dim = d_val * 4
         self.mlp = nn.Sequential(
-            nn.Linear(d_val * 2, 512),
-            nn.LayerNorm(512),
+            nn.Linear(d_val * 2, hidden_dim),
+            nn.LayerNorm(hidden_dim),
             nn.GELU(),
-            nn.Linear(512, d_model)
+            nn.Linear(hidden_dim, d_model)
         )
 
     def forward(self, S_M_t, S_M_t_next):
         x = torch.cat([S_M_t, S_M_t_next], dim=-1)
         
-        return self.mlp(x) # Output shape: (B, 8, 256)
+        return self.mlp(x) # Output shape: (B, 8, 512)
 
 class MacroManager(nn.Module):
     """
     M_theta: High-Performance Cross-Attention + GRU Strategist.
     Uses z_prev to query the 8 theaters of war, then formally gates the strategy update.
     """
-    def __init__(self, d_model=256, num_theaters=8):
+    def __init__(self, d_model=512, num_theaters=8):
         super().__init__()
 
         self.theater_embed = nn.Parameter(torch.randn(1, num_theaters, d_model))
         
         self.H_proj = nn.Sequential(
-            nn.Linear(7 * 7, 128),
+            nn.Linear(7 * 7, d_model // 2),
             nn.GELU(),
-            nn.LayerNorm(128),
-            nn.Linear(128, d_model)
+            nn.LayerNorm(d_model // 2),
+            nn.Linear(d_model // 2, d_model)
         )
         
-        self.cross_attn = nn.MultiheadAttention(embed_dim=d_model, num_heads=8, batch_first=True)
+        self.cross_attn = nn.MultiheadAttention(embed_dim=d_model, num_heads=16, batch_first=True)
         self.attn_norm = nn.LayerNorm(d_model)
         
         self.gru_cell = nn.GRUCell(input_size=d_model, hidden_size=d_model)
@@ -481,18 +482,18 @@ class MacroManager(nn.Module):
 # --- THE FEUDAL ENVELOPE ---
 
 class FeudalDiplomacyAgent(nn.Module):
-    def __init__(self, d_model=256, vocab_size=22231):
+    def __init__(self, d_model=512, vocab_size=22231):
         super().__init__()
-        self.pooler = MacroStatePooler(d_model=d_model)
+        self.pooler = MacroStatePooler(d_model=d_model, d_val=d_model)
         self.worker = TacticalWorker(d_model=d_model, vocab_size=vocab_size)
         self.manager = MacroManager(d_model=d_model)
-        self.inverse_model = InverseModel(d_model=d_model)
+        self.inverse_model = InverseModel(d_val=d_model, d_model=d_model)
         
         self.value_head = nn.Sequential(
-            nn.Linear(256, 128),
-            nn.LayerNorm(128),
+            nn.Linear(d_model, d_model // 2),
+            nn.LayerNorm(d_model // 2),
             nn.GELU(),
-            nn.Linear(128, 1)
+            nn.Linear(d_model // 2, 1)
         )
         
         num_provs = len(GLOBAL_PROVINCES)

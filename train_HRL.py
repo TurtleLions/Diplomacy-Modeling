@@ -191,7 +191,7 @@ def evaluate_against_baseline(live_net, baseline_net, device, update_num, live_p
     
     log_path = os.path.join(save_dir, f"eval_update_{update_num}_{live_power}_game_{game_index}.txt")
     
-    live_h_memory = {a: torch.zeros((1, 8, 256), dtype=torch.bfloat16, device=device) for a in env.possible_agents}
+    live_h_memory = {a: torch.zeros((1, 8, 512), dtype=torch.bfloat16, device=device) for a in env.possible_agents}
 
     # Helper function to process inference for a specific subset of agents
     def get_actions(net, agents, net_device, is_baseline=False):
@@ -219,7 +219,7 @@ def evaluate_against_baseline(live_net, baseline_net, device, update_num, live_p
             with torch.autocast(device_type=autocast_device, dtype=torch.bfloat16):
                 
                 if is_baseline:
-                    z_eval = torch.zeros((B, 8, 256), dtype=torch.bfloat16, device=net_device)
+                    z_eval = torch.zeros((B, 8, 512), dtype=torch.bfloat16, device=net_device)
                 else:
                     x_emb = net.worker.feature_projection(obs_tensor)
                     S_mu_encoded = net.worker.encoder_transformer(x_emb)
@@ -303,7 +303,7 @@ def parse_args():
     parser.add_argument("--ent_coef", type=float, default=0.01, help="Entropy coefficient")
     parser.add_argument("--v_coef", type=float, default=0.1, help="Value function loss coefficient")
     parser.add_argument("--kl_coef", type=float, default=0.01, help="KL divergence penalty coefficient")
-    parser.add_argument("--update_epochs", type=int, default=6, help="Number of epochs per PPO update")
+    parser.add_argument("--update_epochs", type=int, default=1, help="Number of epochs per PPO update")
     parser.add_argument("--bc_weights", type=str, default="feudal_agent_bc.pth", help="Path to pre-trained Behavioral Cloning weights")
     parser.add_argument("--resume_weights", type=str, default=None, help="Path to RL checkpoint to resume training from")
     parser.add_argument("--bc_kl_coef", type=float, default=0.1, help="KL divergence penalty coefficient for behavioral cloning")
@@ -324,9 +324,9 @@ def rollout_worker(local_rank, device, args, buffers, actor_net, bc_baseline_net
     next_done = torch.zeros((args.num_envs, NUM_AGENTS), device=device)
     
     batch_H = torch.zeros((args.num_envs, NUM_AGENTS, 7, 7), dtype=torch.float32, device=device)
-    batch_h = torch.zeros((args.num_envs, NUM_AGENTS, 8, 256), dtype=torch.bfloat16, device=device)
-    batch_prev_h = torch.zeros((args.num_envs, NUM_AGENTS, 8, 256), dtype=torch.bfloat16, device=device)
-    batch_S_M = torch.zeros((args.num_envs, NUM_AGENTS, 8, 256), dtype=torch.bfloat16, device=device)
+    batch_h = torch.zeros((args.num_envs, NUM_AGENTS, 8, 512), dtype=torch.bfloat16, device=device)
+    batch_prev_h = torch.zeros((args.num_envs, NUM_AGENTS, 8, 512), dtype=torch.bfloat16, device=device)
+    batch_S_M = torch.zeros((args.num_envs, NUM_AGENTS, 8, 512), dtype=torch.bfloat16, device=device)
 
     for update in range(start_update, args.num_updates + 1):
         buffer_idx = free_buffers_queue.get()
@@ -486,7 +486,7 @@ def rollout_worker(local_rank, device, args, buffers, actor_net, bc_baseline_net
                         with torch.no_grad():
                             with torch.autocast(device_type='cuda', dtype=torch.bfloat16):
                                 # Baseline receives a dummy 0 strategy vector
-                                bc_z = torch.zeros(bc_obs_tensor.size(0), 8, 256, device=device, dtype=torch.bfloat16)
+                                bc_z = torch.zeros(bc_obs_tensor.size(0), 8, 512, device=device, dtype=torch.bfloat16)
                                 bc_logits, _ = bc_baseline_net.worker(bc_obs_tensor, bc_z, bc_baseline_net.D)
 
                             # Fast One-Shot Masking for Baseline
@@ -584,12 +584,18 @@ def rollout_worker(local_rank, device, args, buffers, actor_net, bc_baseline_net
         with torch.no_grad():
             with torch.autocast(device_type='cuda', dtype=torch.bfloat16):
                 # Flatten the states to pass through the inverse model
-                flat_S_M = buf['S_M'].view(-1, 8, 256)
-                flat_S_M_next = buf['S_M_next'].view(-1, 8, 256)
-                flat_z = buf['z'].view(-1, 8, 256)
+                flat_S_M = buf['S_M'].view(-1, 8, 512)
+                flat_S_M_next = buf['S_M_next'].view(-1, 8, 512)
+                flat_z = buf['z'].view(-1, 8, 512)
                 
-                # Predict what Z was actually achieved
-                flat_z_achieved = actor_net.inverse_model(flat_S_M, flat_S_M_next)
+                chunk_size = 4096
+                flat_z_achieved_list = []
+                for idx in range(0, flat_S_M.size(0), chunk_size):
+                    end_idx = idx + chunk_size
+                    z_ach_chunk = actor_net.inverse_model(flat_S_M[idx:end_idx], flat_S_M_next[idx:end_idx])
+                    flat_z_achieved_list.append(z_ach_chunk)
+                
+                flat_z_achieved = torch.cat(flat_z_achieved_list, dim=0)
                 
                 # Calculate cosine similarity and average across the 8 theaters
                 intrinsic_rewards_flat = F.cosine_similarity(flat_z_achieved.float(), flat_z.float(), dim=-1).mean(dim=1)
@@ -681,9 +687,9 @@ def main():
         print(f"Environment Initialized: {MAP_PROVINCES} Provinces | Action Space: {VOCAB_SIZE}")
     
     # Model Initialization
-    net = FeudalDiplomacyAgent(d_model=256, vocab_size=VOCAB_SIZE).to(device)
-    actor_net = FeudalDiplomacyAgent(d_model=256, vocab_size=VOCAB_SIZE).to(device)
-    bc_baseline_net = FeudalDiplomacyAgent(d_model=256, vocab_size=VOCAB_SIZE).to(device)
+    net = FeudalDiplomacyAgent(d_model=512, vocab_size=VOCAB_SIZE).to(device)
+    actor_net = FeudalDiplomacyAgent(d_model=512, vocab_size=VOCAB_SIZE).to(device)
+    bc_baseline_net = FeudalDiplomacyAgent(d_model=512, vocab_size=VOCAB_SIZE).to(device)
 
     
     temp_game = Game()
@@ -763,14 +769,14 @@ def main():
             'sparse_masks': torch.full((args.num_steps, args.num_envs, NUM_AGENTS, 4000), -1, dtype=torch.int32, device=device),
             'advantages': torch.zeros((args.num_steps, args.num_envs, NUM_AGENTS), dtype=torch.float32, device=device),
             'returns': torch.zeros((args.num_steps, args.num_envs, NUM_AGENTS), dtype=torch.float32, device=device),
-            'S_M': torch.zeros((args.num_steps, args.num_envs, NUM_AGENTS, 8, 256), dtype=torch.bfloat16, device=device),
-            'S_M_next': torch.zeros((args.num_steps, args.num_envs, NUM_AGENTS, 8, 256), dtype=torch.bfloat16, device=device),
-            'z': torch.zeros((args.num_steps, args.num_envs, NUM_AGENTS, 8, 256), dtype=torch.bfloat16, device=device),
-            'h': torch.zeros((args.num_steps, args.num_envs, NUM_AGENTS, 8, 256), dtype=torch.bfloat16, device=device),
-            'prev_h': torch.zeros((args.num_steps, args.num_envs, NUM_AGENTS, 8, 256), dtype=torch.bfloat16, device=device),
+            'S_M': torch.zeros((args.num_steps, args.num_envs, NUM_AGENTS, 8, 512), dtype=torch.bfloat16, device=device),
+            'S_M_next': torch.zeros((args.num_steps, args.num_envs, NUM_AGENTS, 8, 512), dtype=torch.bfloat16, device=device),
+            'z': torch.zeros((args.num_steps, args.num_envs, NUM_AGENTS, 8, 512), dtype=torch.bfloat16, device=device),
+            'h': torch.zeros((args.num_steps, args.num_envs, NUM_AGENTS, 8, 512), dtype=torch.bfloat16, device=device),
+            'prev_h': torch.zeros((args.num_steps, args.num_envs, NUM_AGENTS, 8, 512), dtype=torch.bfloat16, device=device),
             'H': torch.zeros((args.num_steps, args.num_envs, NUM_AGENTS, 7, 7), dtype=torch.float32, device=device),
             'unit_penalties': torch.zeros((args.num_steps, args.num_envs, NUM_AGENTS, 82), dtype=torch.float32, device=device),
-            'terminal_S_M': torch.zeros((args.num_steps, args.num_envs, NUM_AGENTS, 8, 256), dtype=torch.bfloat16, device=device),
+            'terminal_S_M': torch.zeros((args.num_steps, args.num_envs, NUM_AGENTS, 8, 512), dtype=torch.bfloat16, device=device),
         }
         
     # Double-buffering architecture masks CPU environment latency behind GPU backpropagation
@@ -868,11 +874,11 @@ def main():
         flat_ret = buf['returns'].view(-1)[valid]
         flat_sparse_masks = buf['sparse_masks'].view(-1, 4000)[valid]
         
-        flat_S_M = buf['S_M'].view(-1, 8, 256)[valid]
-        flat_S_M_next = buf['S_M_next'].view(-1, 8, 256)[valid]
-        flat_z = buf['z'].view(-1, 8, 256)[valid]
-        flat_h = buf['h'].view(-1, 8, 256)[valid]
-        flat_prev_h = buf['prev_h'].view(-1, 8, 256)[valid]
+        flat_S_M = buf['S_M'].view(-1, 8, 512)[valid]
+        flat_S_M_next = buf['S_M_next'].view(-1, 8, 512)[valid]
+        flat_z = buf['z'].view(-1, 8, 512)[valid]
+        flat_h = buf['h'].view(-1, 8, 512)[valid]
+        flat_prev_h = buf['prev_h'].view(-1, 8, 512)[valid]
         flat_H = buf['H'].view(-1, 7, 7)[valid]
 
         free_buffers_queue.put(buffer_idx)
@@ -921,8 +927,8 @@ def main():
         t_update_start = time.time()
         net.train()
         
-        mb_size = 512
-        accum_steps = 16
+        mb_size = 128
+        accum_steps = 64
         optimizer.zero_grad() 
 
         epoch_pg_loss_sum = 0.0
@@ -992,9 +998,9 @@ def main():
                         intrinsic_reward = F.cosine_similarity(z_achieved, mb_z.detach().float(), dim=-1)
                         epoch_intrinsic_reward_sum += intrinsic_reward.detach().mean().item()
 
-                        flat_mb_z = mb_z.view(-1, 256).float()
-                        flat_z_achieved = z_achieved_raw.view(-1, 256).float()
-                        flat_predicted_z = predicted_z.view(-1, 256).float()
+                        flat_mb_z = mb_z.view(-1, 512).float()
+                        flat_z_achieved = z_achieved_raw.view(-1, 512).float()
+                        flat_predicted_z = predicted_z.view(-1, 512).float()
 
                         flat_mb_z_det = flat_mb_z.detach()
                         flat_z_achieved_det = flat_z_achieved.detach()
