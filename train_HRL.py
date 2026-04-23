@@ -927,8 +927,8 @@ def main():
         t_update_start = time.time()
         net.train()
         
-        mb_size = 128
-        accum_steps = 64
+        mb_size = 64
+        accum_steps = 128
         optimizer.zero_grad() 
 
         epoch_pg_loss_sum = 0.0
@@ -1015,8 +1015,8 @@ def main():
                         var_loss_achieved = torch.mean(F.relu(target_std - std_z_achieved))
                         var_loss_predicted = torch.mean(F.relu(target_std - std_predicted_z))
                         
-                        manager_loss = inv_loss_mgr + (1.0 * var_loss_predicted)
-                        inverse_model_loss = inv_loss_inv + (1.0 * var_loss_achieved)
+                        manager_loss = inv_loss_mgr + (10.0 * var_loss_predicted)
+                        inverse_model_loss = inv_loss_inv + (10.0 * var_loss_achieved)
                         
                         z_variance = z_achieved_raw.var(dim=0).mean().item() if z_achieved_raw.size(0) > 1 else 0.0
 
@@ -1169,7 +1169,7 @@ def main():
             last_avg_ep_reward = global_ep_reward_sum / global_ep_count
 
         update_time = time.time() - t_update_start
-        
+        torch.cuda.empty_cache()
         scheduler.step()
 
         if global_rank == 0:
