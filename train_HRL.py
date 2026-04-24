@@ -61,6 +61,12 @@ def rebuild_packed_masks(sparse_masks, num_provs, vocab_size, none_idx, device):
     is_active_mask[active_b, active_p] = True
     
     max_active = is_active_mask.sum(dim=1).max().item()
+
+    bucket_size = 64
+    if max_active > 0:
+        remainder = max_active % bucket_size
+        if remainder != 0:
+            max_active += (bucket_size - remainder)
     
     if max_active == 0:
         packed_masks = torch.zeros((batch_size, 0, vocab_size), dtype=torch.bool, device=device)
@@ -400,7 +406,7 @@ def rollout_worker(local_rank, device, args, buffers, actor_net, bc_baseline_net
                         act_env_idx = [idx[0] for idx in active_indices]
                         act_agt_idx = [idx[1] for idx in active_indices]
                         
-                        batched_active_obs = torch.tensor(np.stack(active_obs_list), dtype=torch.bfloat16, device=device)
+                        batched_active_obs = torch.tensor(np.stack(active_obs_list), dtype=torch.int8, device=device)
                         batched_active_sparse = torch.tensor(np.stack(active_sparse_list), dtype=torch.int32, device=device)
                         
                         buf['obs'][step, act_env_idx, act_agt_idx] = batched_active_obs
@@ -408,7 +414,7 @@ def rollout_worker(local_rank, device, args, buffers, actor_net, bc_baseline_net
 
                     t_gpu_start = time.time()
 
-                    flat_obs = buf['obs'][step][buf['masks'][step]]
+                    flat_obs = buf['obs'][step][buf['masks'][step]].to(torch.bfloat16)
                     if flat_obs.shape[0] > 0:
                         
                         active_H = batch_H[buf['masks'][step]]
@@ -756,7 +762,7 @@ def main():
     def create_buffer():
         """Creates a memory-pinned tensor buffer for experience collection."""
         return {
-            'obs': torch.zeros((args.num_steps, args.num_envs, NUM_AGENTS, 82, 61), dtype=torch.bfloat16, device=device),
+            'obs': torch.zeros((args.num_steps, args.num_envs, NUM_AGENTS, 82, 61), dtype=torch.int8, device=device),
             'actions': torch.zeros((args.num_steps, args.num_envs, NUM_AGENTS, 82), dtype=torch.long, device=device),
             'logprobs': torch.zeros((args.num_steps, args.num_envs, NUM_AGENTS, 82), dtype=torch.float32, device=device),
             'rewards': torch.zeros((args.num_steps, args.num_envs, NUM_AGENTS), dtype=torch.float32, device=device),
@@ -927,8 +933,8 @@ def main():
         t_update_start = time.time()
         net.train()
         
-        mb_size = 64
-        accum_steps = 128
+        mb_size = 256
+        accum_steps = 32
         optimizer.zero_grad() 
 
         epoch_pg_loss_sum = 0.0

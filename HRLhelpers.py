@@ -12,6 +12,7 @@ import torch.distributed as dist
 import torch.nn.functional as F
 import torch.multiprocessing as mp
 from torch.nn.parallel import DistributedDataParallel as DDP
+import torch.utils.checkpoint as checkpoint
 from torch.utils.data.distributed import DistributedSampler
 from torch.utils.data import Dataset, DataLoader
 
@@ -405,7 +406,14 @@ class TacticalWorker(nn.Module):
         B, L, _ = S_mu_raw.size()
         x_emb = self.feature_projection(S_mu_raw)
         
-        S_mu_encoded = self.encoder_transformer(x_emb) # Shape: (B, 82, 512)
+        if x_emb.requires_grad:
+            S_mu_encoded = checkpoint.checkpoint(
+                self.encoder_transformer, 
+                x_emb, 
+                use_reentrant=False
+            )
+        else:
+            S_mu_encoded = self.encoder_transformer(x_emb)
         
         # z_t is shape (B, 8, 512)
         strat_context, _ = self.strategy_cross_attn(query=S_mu_encoded, key=z_t, value=z_t)
