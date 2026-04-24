@@ -237,7 +237,8 @@ def evaluate_against_baseline(live_net, baseline_net, device, update_num, live_p
 
                 logits, _ = net.worker(obs_tensor, z_eval, net.D)
                 
-                logits = torch.nan_to_num(logits, nan=-1e8, posinf=1e8, neginf=-1e8)
+                logits = torch.nan_to_num(logits, nan=0.0, posinf=50.0, neginf=-50.0)
+                logits = torch.clamp(logits, min=-50.0, max=50.0)
                 logits = logits.float().masked_fill(~dense_mask, -1e20)
                 final_actions = torch.argmax(logits, dim=-1)
                 
@@ -425,6 +426,10 @@ def rollout_worker(local_rank, device, args, buffers, actor_net, bc_baseline_net
                             new_z = new_z.to(torch.bfloat16)
                             
                             logits, _ = actor_net.worker(flat_obs, new_z, actor_net.D)
+                            
+                            logits = torch.nan_to_num(logits, nan=0.0, posinf=50.0, neginf=-50.0)
+                            logits = torch.clamp(logits, min=-50.0, max=50.0)
+                            
                             pooled_S_M = active_S_M.mean(dim=1)
                             values = actor_net.value_head(pooled_S_M).squeeze(-1).float()
                         
@@ -733,15 +738,39 @@ def main():
 
     net = DDP(net, device_ids=[local_rank], find_unused_parameters=True, bucket_cap_mb=256)
 
-    optimizer = optim.Adam(net.parameters(), lr=args.lr, eps=1e-5, fused=True)
+    manager_params = []
+    worker_params = []
+    for name, param in net.named_parameters():
+        if 'worker' in name:
+            worker_params.append(param)
+        else:
+            manager_params.append(param)
+
+    optimizer = optim.Adam([
+        {'params': manager_params},
+        {'params': worker_params}
+    ], lr=args.lr, eps=1e-5, fused=True)
     
-    def warmup_schedule(update):
+    def manager_warmup(update):
         warmup_updates = 10
         if update < warmup_updates:
-            return float(update) / float(max(1, warmup_updates))
+            return float(max(1, update)) / float(warmup_updates)
         return 1.0
 
-    scheduler = LambdaLR(optimizer, lr_lambda=warmup_schedule)
+    def worker_warmup(update):
+        unfreeze_update = 11
+        warmup_updates = 10
+        
+        if update < unfreeze_update:
+            return 0.0 
+            
+        active_steps = update - unfreeze_update + 1
+        if active_steps < warmup_updates:
+            return float(active_steps) / float(warmup_updates)
+            
+        return 1.0
+
+    scheduler = LambdaLR(optimizer, lr_lambda=[manager_warmup, worker_warmup])
     
     if loaded_opt_state is not None:
         optimizer.load_state_dict(loaded_opt_state)
@@ -957,7 +986,8 @@ def main():
                         live_S_M, predicted_z, predicted_h, logits, values_pred, z_achieved_raw = net(
                             mb_obs, mb_H, mb_prev_h, mb_z.to(torch.bfloat16), bc_mode=False, mb_S_M_next=mb_S_M_next
                         )
-                        logits = torch.nan_to_num(logits, nan=-1e8, posinf=1e8, neginf=-1e8)
+                        logits = torch.nan_to_num(logits, nan=0.0, posinf=50.0, neginf=-50.0)
+                        logits = torch.clamp(logits, min=-50.0, max=50.0)
                         z_achieved = z_achieved_raw.float()
 
                         intrinsic_reward = F.cosine_similarity(z_achieved, mb_z.detach().float(), dim=-1)
@@ -1015,12 +1045,15 @@ def main():
                             dist_cat = Categorical(logits=active_logits)
                             packed_actions = torch.gather(mb_act, 1, padded_idx)
                             new_logprobs = dist_cat.log_prob(packed_actions)
-                            
-                            old_logprobs_packed = torch.gather(mb_logprobs, 1, padded_idx)
-                            ratio = torch.exp(new_logprobs - old_logprobs_packed)
-                            
+
+                            new_logprobs = torch.clamp(new_logprobs, min=-30.0)
+                            old_logprobs_packed = torch.clamp(torch.gather(mb_logprobs, 1, padded_idx), min=-30.0)
+
+                            log_ratio = new_logprobs - old_logprobs_packed
+                            ratio = torch.exp(log_ratio)
+
                             valid_ratio_mask = (packed_actions != NONE_IDX) & valid_pack_mask
-                            
+
                             if valid_ratio_mask.any():
                                 worker_adv = mb_adv.unsqueeze(1)
                                 
@@ -1033,8 +1066,10 @@ def main():
                                 with torch.no_grad():
                                     bc_z = torch.zeros_like(mb_z)
                                     bc_logits, _ = bc_baseline_net.worker(mb_obs, bc_z, bc_baseline_net.D)
-                                    bc_logits = torch.nan_to_num(bc_logits, nan=-1e8, posinf=1e8, neginf=-1e8)
                                     
+                                    bc_logits = torch.nan_to_num(bc_logits, nan=0.0, posinf=50.0, neginf=-50.0)
+                                    bc_logits = torch.clamp(bc_logits, min=-50.0, max=50.0)
+
                                     bc_active_logits = bc_logits[b_idx_live, padded_idx, :].float()
                                     bc_active_logits = bc_active_logits.masked_fill(~packed_masks, -1e20)
                                     bc_active_logits = bc_active_logits.masked_fill(~valid_pack_mask.unsqueeze(-1), 0.0)
@@ -1043,7 +1078,7 @@ def main():
                                     bc_logprobs = bc_dist.log_prob(packed_actions)
                                     bc_logprobs = torch.clamp(bc_logprobs, min=-20.0)
                                     
-                                kl_divergence = ((ratio - 1.0) - torch.log(ratio))[valid_ratio_mask].mean()
+                                kl_divergence = 0.5 * (log_ratio ** 2)[valid_ratio_mask].mean()
                                 
                                 kl_div_vector = new_logprobs - bc_logprobs
                                 raw_bc_kl = kl_div_vector[valid_ratio_mask].mean()
