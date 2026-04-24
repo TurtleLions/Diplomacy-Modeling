@@ -505,8 +505,9 @@ def rollout_worker(local_rank, device, args, buffers, actor_net, bc_baseline_net
                             dense_mask_bc[valid_global_indices_bc.long()] = True
                             dense_mask_bc = dense_mask_bc.view(bc_obs_tensor.size(0), MAP_PROVINCES, VOCAB_SIZE)
 
-                            bc_logits = bc_logits.float().masked_fill(~dense_mask_bc, -1e20)
+                            bc_logits = bc_logits.masked_fill(~dense_mask_bc, float('-inf'))
                             bc_final_actions = torch.argmax(bc_logits, dim=-1) # Greedy sample for BC proxy
+                            del bc_logits, dense_mask_bc, bc_obs_tensor, bc_sparse_tensor
 
                         for idx, (env_idx, agent_name) in enumerate(baseline_metadata):
                             actions_to_send[env_idx][agent_name] = bc_final_actions[idx].cpu().numpy()
@@ -742,9 +743,9 @@ def main():
         if global_rank == 0:
             print(f"Successfully resumed RL training from checkpoint: {args.resume_weights}")
 
-    net = DDP(net, device_ids=[local_rank], find_unused_parameters=True)
+    net = DDP(net, device_ids=[local_rank], find_unused_parameters=True, bucket_cap_mb=256)
 
-    optimizer = optim.Adam(net.parameters(), lr=args.lr, eps=1e-5)
+    optimizer = optim.Adam(net.parameters(), lr=args.lr, eps=1e-5, fused=True)
     
     def warmup_schedule(update):
         warmup_updates = 10
@@ -859,6 +860,7 @@ def main():
                 print("Warmup complete: TacticalWorker parameters unfrozen.")
         
         buffer_idx = ready_buffers_queue.get()
+        full_update_start = time.time()
         
         with actor_weights_lock:
             with torch.no_grad():
@@ -933,8 +935,8 @@ def main():
         t_update_start = time.time()
         net.train()
         
-        mb_size = 256
-        accum_steps = 32
+        mb_size = 192
+        accum_steps = 43
         optimizer.zero_grad() 
 
         epoch_pg_loss_sum = 0.0
@@ -1180,6 +1182,7 @@ def main():
 
         if global_rank == 0:
             total_time = time.time() - start_time
+            full_update_duration = time.time() - full_update_start
             global_steps = args.num_envs * args.num_steps * NUM_AGENTS * dist.get_world_size()
             sps = int(global_steps / total_time)  
             total_active_steps = buf['masks'].sum().item()
@@ -1193,7 +1196,7 @@ def main():
             illegal_rate = (illegal_dropped / max(1, proposed_actions)) * 100.0
             
             print(f"Update {update}/{args.num_updates} | SPS: {sps} | Extrinsic Step: {avg_extrinsic_step_reward:.2f} | Total Step (w/ Intrinsic): {avg_total_step_reward:.2f}")
-            print(f"  CPU Time: {env_step_time:.2f}s | GPU Fwd: {gpu_forward_time:.2f}s | Bwd: {update_time:.2f}s")
+            print(f"  CPU Time: {env_step_time:.2f}s | GPU Fwd: {gpu_forward_time:.2f}s | Bwd: {update_time:.2f}s | Full Update: {full_update_duration:.2f}s")
             print(f"  Losses -> Total: {avg_total_loss:.4f} | PG: {avg_pg_loss:.4f} | Mgr(InfoNCE): {avg_manager_loss:.4f} | Inv(InfoNCE): {avg_inv_loss:.4f}")
             print(f"  Metrics -> Feasibility Err: {avg_feasibility_error:.4f} | BC_KL: {avg_bc_kl:.4f} | Z_Var: {avg_z_var:.4f}")
             print(f"  Legality Audit: {proposed_actions - illegal_dropped}/{proposed_actions} legal actions ({illegal_rate:.1f}% illegal)")

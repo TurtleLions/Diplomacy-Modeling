@@ -459,7 +459,13 @@ class MacroManager(nn.Module):
             nn.Linear(d_model // 2, d_model)
         )
         
-        self.cross_attn = nn.MultiheadAttention(embed_dim=d_model, num_heads=16, batch_first=True)
+        self.num_heads = 16
+        self.head_dim = d_model // 16
+        
+        self.q_proj = nn.Linear(d_model, d_model)
+        self.k_proj = nn.Linear(d_model, d_model)
+        self.v_proj = nn.Linear(d_model, d_model)
+        self.out_proj = nn.Linear(d_model, d_model)
         self.attn_norm = nn.LayerNorm(d_model)
         
         self.gru_cell = nn.GRUCell(input_size=d_model, hidden_size=d_model)
@@ -475,7 +481,20 @@ class MacroManager(nn.Module):
         H_emb = self.H_proj(H_t.view(B, -1)).unsqueeze(1)
         query = h_prev + H_emb.expand(-1, 8, -1) + self.theater_embed
         
-        attn_out, _ = self.cross_attn(query=query, key=S_M_t, value=S_M_t)
+        B_q, L_q, _ = query.size()
+        
+        # Project and reshape to (Batch, Heads, Seq_Len, Head_Dim)
+        q = self.q_proj(query).view(B_q, L_q, self.num_heads, self.head_dim).transpose(1, 2)
+        k = self.k_proj(S_M_t).view(B_q, L_q, self.num_heads, self.head_dim).transpose(1, 2)
+        v = self.v_proj(S_M_t).view(B_q, L_q, self.num_heads, self.head_dim).transpose(1, 2)
+        
+        # Force the backend to use the most memory-efficient hardware kernels
+        with torch.backends.cuda.sdp_kernel(enable_flash=True, enable_math=True, enable_mem_efficient=True):
+            attn_out = F.scaled_dot_product_attention(q, k, v)
+            
+        # Reshape back to (Batch, Seq_Len, d_model) and apply final projection
+        attn_out = attn_out.transpose(1, 2).contiguous().view(B_q, L_q, -1)
+        attn_out = self.out_proj(attn_out)
         attn_out = self.attn_norm(attn_out + query)
         
         attn_out_flat = attn_out.view(B * 8, -1)
