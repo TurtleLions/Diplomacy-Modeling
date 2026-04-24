@@ -293,7 +293,7 @@ def evaluate_against_baseline(live_net, baseline_net, device, update_num, live_p
 
 def parse_args():
     parser = argparse.ArgumentParser(description="PPO Training for Diplomacy")
-    parser.add_argument("--num_envs", type=int, default=42, help="Number of parallel environments per GPU")
+    parser.add_argument("--num_envs", type=int, default=28, help="Number of parallel environments per GPU")
     parser.add_argument("--num_steps", type=int, default=512, help="Number of steps per rollout")
     parser.add_argument("--num_updates", type=int, default=1000, help="Total number of PPO updates")
     parser.add_argument("--lr", type=float, default=1e-5, help="Learning rate")
@@ -303,7 +303,7 @@ def parse_args():
     parser.add_argument("--ent_coef", type=float, default=0.01, help="Entropy coefficient")
     parser.add_argument("--v_coef", type=float, default=0.1, help="Value function loss coefficient")
     parser.add_argument("--kl_coef", type=float, default=0.01, help="KL divergence penalty coefficient")
-    parser.add_argument("--update_epochs", type=int, default=1, help="Number of epochs per PPO update")
+    parser.add_argument("--update_epochs", type=int, default=2, help="Number of epochs per PPO update")
     parser.add_argument("--bc_weights", type=str, default="feudal_agent_bc.pth", help="Path to pre-trained Behavioral Cloning weights")
     parser.add_argument("--resume_weights", type=str, default=None, help="Path to RL checkpoint to resume training from")
     parser.add_argument("--bc_kl_coef", type=float, default=0.1, help="KL divergence penalty coefficient for behavioral cloning")
@@ -710,6 +710,7 @@ def main():
             print("Successfully loaded pre-trained BC weights for policy initialization.")
 
     loaded_opt_state = None
+    loaded_sched_state = None
     start_update = 1
 
     if args.resume_weights and os.path.exists(args.resume_weights):
@@ -719,14 +720,13 @@ def main():
             net.load_state_dict(checkpoint['model_state_dict'], strict=False)
             actor_net.load_state_dict(checkpoint['model_state_dict'], strict=False)
             loaded_opt_state = checkpoint['optimizer_state_dict']
+            loaded_sched_state = checkpoint.get('scheduler_state_dict') # Extract it here safely
             
             start_update = checkpoint.get('update', 0) + 1 
         else:
             net.load_state_dict(checkpoint, strict=False)
             actor_net.load_state_dict(checkpoint, strict=False)
         
-        if 'scheduler_state_dict' in checkpoint:
-            scheduler.load_state_dict(checkpoint['scheduler_state_dict'])
             
         if global_rank == 0:
             print(f"Successfully resumed RL training from checkpoint: {args.resume_weights}")
@@ -747,6 +747,11 @@ def main():
         optimizer.load_state_dict(loaded_opt_state)
         if global_rank == 0:
             print("Successfully restored Optimizer momentum and variance states.")
+
+    if loaded_sched_state is not None:
+        scheduler.load_state_dict(loaded_sched_state)
+        if global_rank == 0:
+            print("Successfully restored Learning Rate Scheduler state.")
 
     def create_buffer():
         """Creates a memory-pinned tensor buffer for experience collection."""
@@ -1218,16 +1223,10 @@ def main():
             hook_handle = None
             worker_hook_handle = None
             if global_rank == 0:
-                def get_attn_hook(module, inp, out):
-                    attention_cache.clear()
-                    attention_cache.append(out[1].detach().cpu().numpy())
                 
                 def get_worker_attn_hook(module, inp, out):
                     worker_attn_cache.clear()
                     worker_attn_cache.append(out[1].detach().cpu().numpy())
-                
-                # Attach hook to the MacroManager's cross attention layer
-                hook_handle = net.module.manager.cross_attn.register_forward_hook(get_attn_hook)
 
                 worker_hook_handle = net.module.worker.strategy_cross_attn.register_forward_hook(get_worker_attn_hook)
 
@@ -1301,23 +1300,6 @@ def main():
                 
                 for i, power in enumerate(possible_agents):
                     wandb.log({f"Eval/{power}_SCs": local_eval_scs[i].item()}, step=update)
-                
-                if hook_handle is not None:
-                    hook_handle.remove() 
-                
-                if len(attention_cache) > 0:
-                    attn_matrix = attention_cache[0][0] 
-                    
-                    print(f"\n[DEBUG] MacroManager Attn - Max: {attn_matrix.max():.4f}, Min: {attn_matrix.min():.4f}")
-                    
-                    plt.figure(figsize=(8, 6))
-                    sns.heatmap(attn_matrix, cmap="viridis", annot=True, fmt=".3f")
-                    plt.title(f"MacroManager Cross-Attention - Update {update}")
-                    plt.xlabel("Key (S_M Theaters)")
-                    plt.ylabel("Query (z_prev + H_t)")
-                    
-                    wandb.log({"Attention/MacroManager_Map": wandb.Image(plt)}, step=update)
-                    plt.close()
 
                 if worker_hook_handle is not None:
                     worker_hook_handle.remove()
@@ -1336,8 +1318,8 @@ def main():
                     wandb.log({"Attention/TacticalWorker_Map": wandb.Image(plt)}, step=update)
                     plt.close()
                 
-                if flat_H.shape[0] > 0:
-                    sample_H = flat_H[-1].detach().cpu().numpy()
+                if b_size > 0:
+                    sample_H = buf['H'].view(-1, 7, 7)[epoch_indices[-1]].cpu().numpy()
                     
                     plt.figure(figsize=(7, 6))
                     sns.heatmap(sample_H, cmap="RdBu", annot=True, fmt=".1f", vmin=-1.0, vmax=1.0,
