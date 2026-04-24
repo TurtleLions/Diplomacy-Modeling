@@ -322,7 +322,8 @@ class InteractionMatrixTracker:
 
     def update(self, delta_H):
         """delta_H should be a [-1, 1] tensor of shape (7, 7) derived from phase actions"""
-        self.H = self.gamma * self.H + (1 - self.gamma) * delta_H
+        with torch.no_grad():
+            self.H = self.gamma * self.H + (1 - self.gamma) * delta_H.detach()
         return self.H
 
 class MacroStatePooler(nn.Module):
