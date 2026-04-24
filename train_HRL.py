@@ -299,7 +299,7 @@ def evaluate_against_baseline(live_net, baseline_net, device, update_num, live_p
 
 def parse_args():
     parser = argparse.ArgumentParser(description="PPO Training for Diplomacy")
-    parser.add_argument("--num_envs", type=int, default=42, help="Number of parallel environments per GPU")
+    parser.add_argument("--num_envs", type=int, default=48, help="Number of parallel environments per GPU")
     parser.add_argument("--num_steps", type=int, default=512, help="Number of steps per rollout")
     parser.add_argument("--num_updates", type=int, default=1000, help="Total number of PPO updates")
     parser.add_argument("--lr", type=float, default=1e-5, help="Learning rate")
@@ -321,7 +321,7 @@ def rollout_worker(local_rank, device, args, buffers, actor_net, bc_baseline_net
                    actor_weights_lock, start_update=1):
     """Background process responsible for filling the experience buffer asynchronously."""
     torch.cuda.set_device(device) 
-    inference_stream = torch.cuda.Stream(device=device)
+    inference_stream = torch.cuda.Stream(device=device, priority=1)
     
     vec_env = SubprocVecDiplomacy(num_envs=args.num_envs)
     
