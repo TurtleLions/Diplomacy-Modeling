@@ -517,7 +517,13 @@ class FeudalDiplomacyAgent(nn.Module):
         self.manager = MacroManager(d_model=d_model)
         self.inverse_model = InverseModel(d_val=d_model, d_model=d_model)
         
-        self.value_head = nn.Sequential(
+        self.extrinsic_value_head = nn.Sequential(
+            nn.Linear(d_model, d_model // 2),
+            nn.LayerNorm(d_model // 2),
+            nn.GELU(),
+            nn.Linear(d_model // 2, 1)
+        )
+        self.intrinsic_value_head = nn.Sequential(
             nn.Linear(d_model, d_model // 2),
             nn.LayerNorm(d_model // 2),
             nn.GELU(),
@@ -547,13 +553,15 @@ class FeudalDiplomacyAgent(nn.Module):
         
         predicted_z, predicted_h = self.manager(S_M, mb_H, mb_prev_h)
         logits, _ = self.worker(mb_obs, predicted_z, self.D)
-        values_pred = self.value_head(S_M.detach().mean(dim=1)).squeeze(-1).float()
+        pooled_S_M = S_M.detach().mean(dim=1)
+        ext_values_pred = self.extrinsic_value_head(pooled_S_M).squeeze(-1).float()
+        int_values_pred = self.intrinsic_value_head(pooled_S_M).squeeze(-1).float()
 
         if mb_S_M_next is not None:
-            z_achieved_raw = self.inverse_model(S_M.detach(), mb_S_M_next.detach())
-            return S_M, predicted_z, predicted_h, logits, values_pred, z_achieved_raw
+            z_achieved_raw = self.inverse_model(S_M, mb_S_M_next)
+            return S_M, predicted_z, predicted_h, logits, ext_values_pred, int_values_pred, z_achieved_raw
         
-        return S_M, predicted_z, predicted_h, logits, values_pred
+        return S_M, predicted_z, predicted_h, logits, ext_values_pred, int_values_pred
 
     def step(self, S_mu_raw, H_t, h_prev):
         x_emb = self.worker.feature_projection(S_mu_raw)

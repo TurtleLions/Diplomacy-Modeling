@@ -15,7 +15,7 @@ import multiprocessing.connection
 import random
 import matplotlib.pyplot as plt
 import seaborn as sns
-
+import concurrent.futures
 import numpy as np
 import torch
 import torch.nn as nn
@@ -307,7 +307,7 @@ def parse_args():
     parser.add_argument("--update_epochs", type=int, default=2, help="Number of epochs per PPO update")
     parser.add_argument("--bc_weights", type=str, default="feudal_agent_bc.pth", help="Path to pre-trained Behavioral Cloning weights")
     parser.add_argument("--resume_weights", type=str, default=None, help="Path to RL checkpoint to resume training from")
-    parser.add_argument("--bc_kl_coef", type=float, default=0.1, help="KL divergence penalty coefficient for behavioral cloning")
+    parser.add_argument("--bc_kl_coef", type=float, default=0.01, help="KL divergence penalty coefficient for behavioral cloning")
     return parser.parse_args()
 
 def rollout_worker(local_rank, device, args, buffers, actor_net, bc_baseline_net, 
@@ -343,7 +343,8 @@ def rollout_worker(local_rank, device, args, buffers, actor_net, bc_baseline_net
         buf = buffers[buffer_idx]
         with torch.cuda.stream(inference_stream):
             buf['masks'].zero_()
-            buf['rewards'].zero_()
+            buf['extrinsic_rewards'].zero_()
+            buf['intrinsic_rewards'].zero_()
             
             env_step_time, gpu_forward_time = 0.0, 0.0
             local_proposed, local_dropped = 0, 0
@@ -431,7 +432,8 @@ def rollout_worker(local_rank, device, args, buffers, actor_net, bc_baseline_net
                             logits = torch.clamp(logits, min=-50.0, max=50.0)
                             
                             pooled_S_M = active_S_M.mean(dim=1)
-                            values = actor_net.value_head(pooled_S_M).squeeze(-1).float()
+                            ext_values = actor_net.extrinsic_value_head(pooled_S_M).squeeze(-1).float()
+                            int_values = actor_net.intrinsic_value_head(pooled_S_M).squeeze(-1).float()
                         
                         batch_S_M[buf['masks'][step]] = active_S_M
                         batch_prev_h[buf['masks'][step]] = active_h
@@ -471,7 +473,8 @@ def rollout_worker(local_rank, device, args, buffers, actor_net, bc_baseline_net
                         final_actions[valid_b, valid_p] = packed_actions[valid_b, valid_seq]
                         final_logprobs[valid_b, valid_p] = packed_logprobs[valid_b, valid_seq]
                         
-                        buf['values'][step][buf['masks'][step]] = values
+                        buf['ext_values'][step][buf['masks'][step]] = ext_values
+                        buf['int_values'][step][buf['masks'][step]] = int_values
                         buf['logprobs'][step][buf['masks'][step]] = final_logprobs
                         
                         idx_counter = 0
@@ -537,7 +540,6 @@ def rollout_worker(local_rank, device, args, buffers, actor_net, bc_baseline_net
                             
                             for a in possible_agents:
                                 if learning_assignment[i, agent_to_idx[a]]:
-                                    buf['rewards'][step, i, agent_to_idx[a]] = step_rewards.get(a, 0.0)
                                     buf['extrinsic_rewards'][step, i, agent_to_idx[a]] = step_rewards.get(a, 0.0)
                                     buf['dones'][step, i, agent_to_idx[a]] = float(terms.get(a, False))
                                     buf['truncations'][step, i, agent_to_idx[a]] = float(truncs.get(a, False))
@@ -548,14 +550,17 @@ def rollout_worker(local_rank, device, args, buffers, actor_net, bc_baseline_net
                         with torch.autocast(device_type='cuda', dtype=torch.bfloat16):
                             x_emb_t = actor_net.worker.feature_projection(term_tensor)
                             S_M_t = actor_net.pooler(actor_net.worker.encoder_transformer(x_emb_t))
-                            term_v = actor_net.value_head(S_M_t.mean(dim=1)).float().squeeze(-1)
+                            term_v_ext = actor_net.extrinsic_value_head(S_M_t.mean(dim=1)).float().squeeze(-1)
+                            term_v_int = actor_net.intrinsic_value_head(S_M_t.mean(dim=1)).float().squeeze(-1)
                         for list_idx, (env_idx, agent_idx) in enumerate(terminal_indices):
-                            buf['terminal_values'][step, env_idx, agent_idx] = term_v[list_idx]
+                            buf['ext_terminal_values'][step, env_idx, agent_idx] = term_v_ext[list_idx]
+                            buf['int_terminal_values'][step, env_idx, agent_idx] = term_v_int[list_idx]
                             terminal_cache.append((step, env_idx, agent_idx, S_M_t[list_idx]))
 
         # Calculate GAE Advantages
         with torch.no_grad():
-            next_value = torch.zeros((args.num_envs, NUM_AGENTS), device=device)
+            next_ext_value = torch.zeros((args.num_envs, NUM_AGENTS), device=device)
+            next_int_value = torch.zeros((args.num_envs, NUM_AGENTS), device=device)
             obs_to_encode = []
             indices_to_update = []
             
@@ -579,12 +584,14 @@ def rollout_worker(local_rank, device, args, buffers, actor_net, bc_baseline_net
                     S_mu_enc = actor_net.worker.encoder_transformer(x_emb)
                     S_M_next = actor_net.pooler(S_mu_enc)
                     pooled_S_M_next = S_M_next.mean(dim=1)
-                    next_v = actor_net.value_head(pooled_S_M_next).float()
+                    next_ext_v = actor_net.extrinsic_value_head(pooled_S_M_next).float()
+                    next_int_v = actor_net.intrinsic_value_head(pooled_S_M_next).float()
             
             for list_idx, (env_idx, agent_idx) in enumerate(indices_to_update):
-                val = next_v[list_idx].float().squeeze(-1)
-                next_value[env_idx, agent_idx] = val
-                buf['terminal_values'][step, env_idx, agent_idx] = val
+                buf['ext_terminal_values'][step, env_idx, agent_idx] = next_ext_v[list_idx].float().squeeze(-1)
+                buf['int_terminal_values'][step, env_idx, agent_idx] = next_int_v[list_idx].float().squeeze(-1)
+                next_ext_value[env_idx, agent_idx] = next_ext_v[list_idx].float().squeeze(-1)
+                next_int_value[env_idx, agent_idx] = next_int_v[list_idx].float().squeeze(-1)
             
         with torch.no_grad():
             with torch.autocast(device_type='cuda', dtype=torch.bfloat16):
@@ -605,23 +612,28 @@ def rollout_worker(local_rank, device, args, buffers, actor_net, bc_baseline_net
                 # Reshape back to buffer dimensions
                 intrinsic_rewards = intrinsic_rewards_flat.view(args.num_steps, args.num_envs, NUM_AGENTS)
                 
-                # Add scaled intrinsic reward to the extrinsic reward
-                current_c_int = min(0.02, 0.02 * (update / 100.0))
-                buf['rewards'] += (current_c_int * intrinsic_rewards)
-        
-        lastgaelam = 0
+                buf['intrinsic_rewards'] = intrinsic_rewards
+                
+        lastgaelam_ext, lastgaelam_int = 0, 0
         for t in reversed(range(args.num_steps)):
             if t == args.num_steps - 1:
                 nextnonterminal = 1.0 - next_done
-                nextvalues = next_value
+                next_ext_v = torch.zeros((args.num_envs, NUM_AGENTS), device=device)
+                next_int_v = torch.zeros((args.num_envs, NUM_AGENTS), device=device)
             else:
                 nextnonterminal = 1.0 - buf['dones'][t]
                 is_trunc = buf['truncations'][t] == 1.0
-                nextvalues = torch.where(is_trunc, buf['terminal_values'][t], buf['values'][t + 1])
+                next_ext_v = torch.where(is_trunc, buf['ext_terminal_values'][t], buf['ext_values'][t + 1])
+                next_int_v = torch.where(is_trunc, buf['int_terminal_values'][t], buf['int_values'][t + 1])
                 
-            delta = buf['rewards'][t] + args.gamma * nextvalues * nextnonterminal - buf['values'][t]
-            buf['advantages'][t] = lastgaelam = delta + args.gamma * args.gae_lambda * nextnonterminal * lastgaelam
-        buf['returns'] = buf['advantages'] + buf['values']
+            delta_ext = buf['extrinsic_rewards'][t] + args.gamma * next_ext_v * nextnonterminal - buf['ext_values'][t]
+            buf['ext_advantages'][t] = lastgaelam_ext = delta_ext + args.gamma * args.gae_lambda * nextnonterminal * lastgaelam_ext
+            
+            delta_int = buf['intrinsic_rewards'][t] + args.gamma * next_int_v * nextnonterminal - buf['int_values'][t]
+            buf['int_advantages'][t] = lastgaelam_int = delta_int + args.gamma * args.gae_lambda * nextnonterminal * lastgaelam_int
+
+        buf['ext_returns'] = buf['ext_advantages'] + buf['ext_values']
+        buf['int_returns'] = buf['int_advantages'] + buf['int_values']
         
         buf['S_M_next'][:-1] = buf['S_M'][1:]
         
@@ -786,18 +798,22 @@ def main():
         """Creates a memory-pinned tensor buffer for experience collection."""
         return {
             'obs': torch.zeros((args.num_steps, args.num_envs, NUM_AGENTS, 82, 61), dtype=torch.int8, device=device),
-            'actions': torch.zeros((args.num_steps, args.num_envs, NUM_AGENTS, 82), dtype=torch.int16, device=device), # int16 saves 84MB
+            'actions': torch.zeros((args.num_steps, args.num_envs, NUM_AGENTS, 82), dtype=torch.int16, device=device),
             'logprobs': torch.zeros((args.num_steps, args.num_envs, NUM_AGENTS, 82), dtype=torch.float32, device=device),
-            'rewards': torch.zeros((args.num_steps, args.num_envs, NUM_AGENTS), dtype=torch.float32, device=device),
             'extrinsic_rewards': torch.zeros((args.num_steps, args.num_envs, NUM_AGENTS), dtype=torch.float32, device=device),
+            'intrinsic_rewards': torch.zeros((args.num_steps, args.num_envs, NUM_AGENTS), dtype=torch.float32, device=device),
             'dones': torch.zeros((args.num_steps, args.num_envs, NUM_AGENTS), dtype=torch.float32, device=device),
-            'values': torch.zeros((args.num_steps, args.num_envs, NUM_AGENTS), dtype=torch.float32, device=device),
+            'ext_values': torch.zeros((args.num_steps, args.num_envs, NUM_AGENTS), dtype=torch.float32, device=device),
+            'int_values': torch.zeros((args.num_steps, args.num_envs, NUM_AGENTS), dtype=torch.float32, device=device),
             'masks': torch.zeros((args.num_steps, args.num_envs, NUM_AGENTS), dtype=torch.bool, device=device),
             'truncations': torch.zeros((args.num_steps, args.num_envs, NUM_AGENTS), dtype=torch.float32, device=device),
-            'terminal_values': torch.zeros((args.num_steps, args.num_envs, NUM_AGENTS), dtype=torch.float32, device=device),
+            'ext_terminal_values': torch.zeros((args.num_steps, args.num_envs, NUM_AGENTS), dtype=torch.float32, device=device),
+            'int_terminal_values': torch.zeros((args.num_steps, args.num_envs, NUM_AGENTS), dtype=torch.float32, device=device),
             'sparse_masks': torch.full((args.num_steps, args.num_envs, NUM_AGENTS, 4000), -1, dtype=torch.int32, device=device),
-            'advantages': torch.zeros((args.num_steps, args.num_envs, NUM_AGENTS), dtype=torch.float32, device=device),
-            'returns': torch.zeros((args.num_steps, args.num_envs, NUM_AGENTS), dtype=torch.float32, device=device),
+            'ext_advantages': torch.zeros((args.num_steps, args.num_envs, NUM_AGENTS), dtype=torch.float32, device=device),
+            'int_advantages': torch.zeros((args.num_steps, args.num_envs, NUM_AGENTS), dtype=torch.float32, device=device),
+            'ext_returns': torch.zeros((args.num_steps, args.num_envs, NUM_AGENTS), dtype=torch.float32, device=device),
+            'int_returns': torch.zeros((args.num_steps, args.num_envs, NUM_AGENTS), dtype=torch.float32, device=device),
             'S_M': torch.zeros((args.num_steps, args.num_envs, NUM_AGENTS, 8, 512), dtype=torch.bfloat16, device=device),
             'S_M_next': torch.zeros((args.num_steps, args.num_envs, NUM_AGENTS, 8, 512), dtype=torch.bfloat16, device=device),
             'z': torch.zeros((args.num_steps, args.num_envs, NUM_AGENTS, 8, 512), dtype=torch.bfloat16, device=device),
@@ -914,21 +930,34 @@ def main():
         b_size = min_b_size
 
         if b_size > 1:
-            valid_adv = buf['advantages'].view(-1)[epoch_indices]
-            local_sum, local_sq_sum = valid_adv.sum(), (valid_adv ** 2).sum()
+            valid_ext_adv = buf['ext_advantages'].view(-1)[epoch_indices]
+            valid_int_adv = buf['int_advantages'].view(-1)[epoch_indices]
+            
+            local_ext_sum, local_ext_sq_sum = valid_ext_adv.sum(), (valid_ext_adv ** 2).sum()
+            local_int_sum, local_int_sq_sum = valid_int_adv.sum(), (valid_int_adv ** 2).sum()
             local_count = torch.tensor(b_size, dtype=torch.float32, device=device)
         else:
-            local_sum = local_sq_sum = local_count = torch.tensor(0.0, device=device)
+            local_ext_sum = local_ext_sq_sum = torch.tensor(0.0, device=device)
+            local_int_sum = local_int_sq_sum = torch.tensor(0.0, device=device)
+            local_count = torch.tensor(0.0, device=device)
             
-        stats = torch.stack([local_sum, local_sq_sum, local_count])
+        stats = torch.stack([local_ext_sum, local_ext_sq_sum, local_int_sum, local_int_sq_sum, local_count])
         dist.all_reduce(stats, op=dist.ReduceOp.SUM)
 
-        if stats[2] > 1:
-            global_mean = stats[0] / stats[2]
-            global_var = (stats[1] / stats[2]) - (global_mean ** 2)
-            global_std = torch.sqrt(torch.clamp(global_var, min=1e-8))
-            buf['advantages'].view(-1)[epoch_indices] = (valid_adv - global_mean) / (global_std + 1e-8)
-
+        if stats[4] > 1:
+            global_count = stats[4]
+            
+            # Normalize Extrinsic
+            global_ext_mean = stats[0] / global_count
+            global_ext_var = (stats[1] / global_count) - (global_ext_mean ** 2)
+            global_ext_std = torch.sqrt(torch.clamp(global_ext_var, min=1e-8))
+            buf['ext_advantages'].view(-1)[epoch_indices] = (valid_ext_adv - global_ext_mean) / (global_ext_std + 1e-8)
+            
+            # Normalize Intrinsic
+            global_int_mean = stats[2] / global_count
+            global_int_var = (stats[3] / global_count) - (global_int_mean ** 2)
+            global_int_std = torch.sqrt(torch.clamp(global_int_var, min=1e-8))
+            buf['int_advantages'].view(-1)[epoch_indices] = (valid_int_adv - global_int_mean) / (global_int_std + 1e-8)
 
         t_update_start = time.time()
         net.train()
@@ -967,8 +996,10 @@ def main():
                 mb_obs = buf['obs'].view(-1, MAP_PROVINCES, 61)[mb_idx].to(dtype=torch.bfloat16)
                 mb_act = buf['actions'].view(-1, MAP_PROVINCES)[mb_idx].long()
                 mb_logprobs = buf['logprobs'].view(-1, MAP_PROVINCES)[mb_idx]
-                mb_adv = buf['advantages'].view(-1)[mb_idx]
-                mb_ret = buf['returns'].view(-1)[mb_idx]
+                mb_ext_adv = buf['ext_advantages'].view(-1)[mb_idx]
+                mb_int_adv = buf['int_advantages'].view(-1)[mb_idx]
+                mb_ext_ret = buf['ext_returns'].view(-1)[mb_idx]
+                mb_int_ret = buf['int_returns'].view(-1)[mb_idx]
                 mb_sparse_gpu = buf['sparse_masks'].view(-1, 4000)[mb_idx]
                 
                 mb_S_M = buf['S_M'].view(-1, 8, 512)[mb_idx]
@@ -983,7 +1014,7 @@ def main():
                 
                 with my_context:
                     with torch.autocast(device_type='cuda', dtype=torch.bfloat16):
-                        live_S_M, predicted_z, predicted_h, logits, values_pred, z_achieved_raw = net(
+                        live_S_M, predicted_z, predicted_h, logits, ext_values_pred, int_values_pred, z_achieved_raw = net(
                             mb_obs, mb_H, mb_prev_h, mb_z.to(torch.bfloat16), bc_mode=False, mb_S_M_next=mb_S_M_next
                         )
                         logits = torch.nan_to_num(logits, nan=0.0, posinf=50.0, neginf=-50.0)
@@ -1021,7 +1052,7 @@ def main():
                         epoch_inv_loss_sum += inverse_model_loss.detach()
                         epoch_z_var_sum += z_variance
                         
-                        v_loss = F.huber_loss(values_pred, mb_ret.float(), delta=10.0)
+                        v_loss = F.huber_loss(ext_values_pred, mb_ext_ret.float(), delta=10.0) + F.huber_loss(int_values_pred, mb_int_ret.float(), delta=10.0)
                         distance_penalty = F.mse_loss(mb_z.detach(), z_achieved.detach())
                         
                         is_active, packed_masks, padded_idx, max_act_live = rebuild_packed_masks(
@@ -1058,7 +1089,7 @@ def main():
                             valid_ratio_mask = (packed_actions != NONE_IDX) & valid_pack_mask
 
                             if valid_ratio_mask.any():
-                                worker_adv = mb_adv.unsqueeze(1)
+                                worker_adv = (mb_ext_adv + (current_c_int * mb_int_adv)).unsqueeze(1)
                                 
                                 surr1 = ratio * worker_adv
                                 surr2 = torch.clamp(ratio, 1.0 - args.clip_coef, 1.0 + args.clip_coef) * worker_adv
@@ -1126,7 +1157,7 @@ def main():
                 epoch_kl_sum += kl_divergence.detach()
                 epoch_kl_steps += 1
 
-                del logits, values_pred, active_logits, packed_masks, mb_obs, mb_sparse_gpu
+                del logits, ext_values_pred, int_values_pred, active_logits, packed_masks, mb_obs, mb_sparse_gpu
 
             local_epoch_kl = epoch_kl_sum / max(1, epoch_kl_steps)
             epoch_kl_tensor = torch.tensor([local_epoch_kl], device=device)
@@ -1188,14 +1219,16 @@ def main():
             total_active_steps = buf['masks'].sum().item()
             if total_active_steps > 0:
                 avg_extrinsic_step_reward = buf['extrinsic_rewards'].sum().item() / total_active_steps
-                avg_total_step_reward = buf['rewards'].sum().item() / total_active_steps
+                avg_intrinsic_step_reward = buf['intrinsic_rewards'].sum().item() / total_active_steps
+                avg_total_step_reward = (buf['extrinsic_rewards'].sum().item() + buf['intrinsic_rewards'].sum().item()) / total_active_steps
             else:
                 avg_extrinsic_step_reward = 0.0
+                avg_intrinsic_step_reward = 0.0
                 avg_total_step_reward = 0.0
 
             illegal_rate = (illegal_dropped / max(1, proposed_actions)) * 100.0
             
-            print(f"Update {update}/{args.num_updates} | SPS: {sps} | Extrinsic Step: {avg_extrinsic_step_reward:.2f} | Total Step (w/ Intrinsic): {avg_total_step_reward:.2f}")
+            print(f"Update {update}/{args.num_updates} | SPS: {sps} | Extrinsic Step: {avg_extrinsic_step_reward:.2f} | Intrinsic Step: {avg_intrinsic_step_reward:.2f} | Total Step: {avg_total_step_reward:.2f}")
             print(f"  CPU Time: {env_step_time:.2f}s | GPU Fwd: {gpu_forward_time:.2f}s | Bwd: {update_time:.2f}s | Full Update: {full_update_duration:.2f}s")
             print(f"  Losses -> Total: {avg_total_loss:.4f} | PG: {avg_pg_loss:.4f} | Mgr(InfoNCE): {avg_manager_loss:.4f} | Inv(InfoNCE): {avg_inv_loss:.4f}")
             print(f"  Metrics -> Feasibility Err: {avg_feasibility_error:.4f} | BC_KL: {avg_bc_kl:.4f} | Z_Var: {avg_z_var:.4f}")
@@ -1252,7 +1285,7 @@ def main():
                     print(f"  -> Saved checkpoint to {ckpt_path}")
                     torch.save(checkpoint, ckpt_path)
             
-        EVAL_FREQ = 10
+        EVAL_FREQ = 1
         
         if update % EVAL_FREQ == 0:
             eval_start_time = time.time()
@@ -1284,25 +1317,27 @@ def main():
 
             for power in my_powers:
                 power_sc_sum = 0
-                for game_idx in range(GAMES_PER_POWER):
-                    sc = evaluate_against_baseline(
-                        live_net=net.module,
-                        baseline_net=bc_baseline_net,
-                        device=device, 
-                        update_num=update, 
-                        live_power=power, 
-                        game_index=game_idx + 1, 
-                        save_dir=eval_dir
-                    )
-                    power_sc_sum += float(sc)
+                
+                # Execute games for this power concurrently
+                with concurrent.futures.ThreadPoolExecutor(max_workers=GAMES_PER_POWER) as executor:
+                    futures = [
+                        executor.submit(
+                            evaluate_against_baseline,
+                            net.module, bc_baseline_net, device, update, power, game_idx + 1, eval_dir
+                        ) for game_idx in range(GAMES_PER_POWER)
+                    ]
                     
-                    if sc >= 18:
-                        solos += 1
-                    elif sc > 0:
-                        survivals += 1
-                    else:
-                        eliminations += 1
+                    for future in concurrent.futures.as_completed(futures):
+                        sc = future.result()
+                        power_sc_sum += float(sc)
                         
+                        if sc >= 18:
+                            solos += 1
+                        elif sc > 0:
+                            survivals += 1
+                        else:
+                            eliminations += 1
+                            
                 local_eval_scs[agent_to_idx[power]] = power_sc_sum / GAMES_PER_POWER
             net.train()
 
