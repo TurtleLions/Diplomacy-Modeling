@@ -550,7 +550,7 @@ class FeudalDiplomacyAgent(nn.Module):
         values_pred = self.value_head(S_M.detach().mean(dim=1)).squeeze(-1).float()
 
         if mb_S_M_next is not None:
-            z_achieved_raw = self.inverse_model(S_M, mb_S_M_next)
+            z_achieved_raw = self.inverse_model(S_M.detach(), mb_S_M_next.detach())
             return S_M, predicted_z, predicted_h, logits, values_pred, z_achieved_raw
         
         return S_M, predicted_z, predicted_h, logits, values_pred

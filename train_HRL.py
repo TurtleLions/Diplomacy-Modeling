@@ -747,9 +747,9 @@ def main():
             manager_params.append(param)
 
     optimizer = optim.Adam([
-        {'params': manager_params},
-        {'params': worker_params}
-    ], lr=args.lr, eps=1e-5, fused=True)
+        {'params': manager_params, 'lr': args.lr},
+        {'params': worker_params, 'lr': args.lr * 0.05}
+    ], eps=1e-5, fused=True)
     
     def manager_warmup(update):
         warmup_updates = 10
@@ -993,25 +993,28 @@ def main():
                         intrinsic_reward = F.cosine_similarity(z_achieved, mb_z.detach().float(), dim=-1)
                         epoch_intrinsic_reward_sum += intrinsic_reward.detach().mean()
 
-                        flat_mb_z = mb_z.view(-1, 512).float()
+                        flat_mb_z_det = mb_z.view(-1, 512).float().detach()
                         flat_z_achieved = z_achieved_raw.view(-1, 512).float()
                         flat_predicted_z = predicted_z.view(-1, 512).float()
-
-                        flat_mb_z_det = flat_mb_z.detach()
                         flat_z_achieved_det = flat_z_achieved.detach()
+
+                        norm_predicted_z = F.normalize(flat_predicted_z, p=2, dim=1)
+                        norm_z_achieved_det = F.normalize(flat_z_achieved_det, p=2, dim=1)
                         
-                        inv_loss_mgr = F.mse_loss(flat_predicted_z, flat_z_achieved_det)
-                        inv_loss_inv = F.mse_loss(flat_z_achieved, flat_mb_z_det)
+                        norm_z_achieved = F.normalize(flat_z_achieved, p=2, dim=1)
+                        norm_mb_z_det = F.normalize(flat_mb_z_det, p=2, dim=1)
                         
-                        target_std = 1.0
-                        std_z_achieved = torch.sqrt(z_achieved_raw.float().var(dim=0) + 1e-04)
-                        std_predicted_z = torch.sqrt(mb_z.float().var(dim=0) + 1e-04)
+                        temperature = 0.1
                         
-                        var_loss_achieved = torch.mean(F.relu(target_std - std_z_achieved))
-                        var_loss_predicted = torch.mean(F.relu(target_std - std_predicted_z))
+                        logits_mgr = torch.matmul(norm_predicted_z, norm_z_achieved_det.T) / temperature
                         
-                        manager_loss = inv_loss_mgr + (10.0 * var_loss_predicted)
-                        inverse_model_loss = inv_loss_inv + (10.0 * var_loss_achieved)
+                        logits_inv = torch.matmul(norm_z_achieved, norm_mb_z_det.T) / temperature
+                        
+                        N = flat_predicted_z.size(0)
+                        labels = torch.arange(N, dtype=torch.long, device=device)
+                        
+                        manager_loss = F.cross_entropy(logits_mgr, labels)
+                        inverse_model_loss = F.cross_entropy(logits_inv, labels)
                         
                         z_variance = z_achieved_raw.var(dim=0).mean().detach() if z_achieved_raw.size(0) > 1 else torch.tensor(0.0, device=device)
 
@@ -1081,11 +1084,13 @@ def main():
                                 kl_divergence = 0.5 * (log_ratio ** 2)[valid_ratio_mask].mean()
                                 
                                 kl_div_vector = new_logprobs - bc_logprobs
-                                raw_bc_kl = kl_div_vector[valid_ratio_mask].mean()
-                                progress = min(1.0, update / 100.0) 
-                                dynamic_target_kl = 0.02 + (0.48 * progress) 
+                                # raw_bc_kl = kl_div_vector[valid_ratio_mask].mean()
+                                # progress = min(1.0, update / 100.0) 
+                                # dynamic_target_kl = 0.02 + (0.48 * progress) 
                                 
-                                bc_kl_penalty = F.relu(raw_bc_kl - dynamic_target_kl)
+                                # bc_kl_penalty = F.relu(raw_bc_kl - dynamic_target_kl)
+                                raw_bc_kl = kl_div_vector[valid_ratio_mask].mean()
+                                bc_kl_penalty = raw_bc_kl
 
                         # Final loss aggregation
                         unscaled_loss = (pg_loss 
