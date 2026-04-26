@@ -13,8 +13,6 @@ import contextlib
 import torch.multiprocessing as mp  
 import multiprocessing.connection
 import random
-import matplotlib.pyplot as plt
-import seaborn as sns
 import concurrent.futures
 import numpy as np
 import torch
@@ -60,7 +58,14 @@ def rebuild_packed_masks(sparse_masks, num_provs, vocab_size, none_idx, device):
     is_active_mask = torch.zeros((batch_size, num_provs), dtype=torch.bool, device=device)
     is_active_mask[active_b, active_p] = True
     
-    max_active = num_provs
+    # Find the actual maximum number of units in this specific batch
+    max_active = int(is_active_mask.sum(dim=1).max().item())
+    
+    BIN_SIZE = 8
+    if max_active > 0:
+        max_active = ((max_active + BIN_SIZE - 1) // BIN_SIZE) * BIN_SIZE
+        
+    max_active = min(max_active, num_provs)
     
     if max_active == 0:
         packed_masks = torch.zeros((batch_size, 0, vocab_size), dtype=torch.bool, device=device)
@@ -421,23 +426,24 @@ def rollout_worker(local_rank, device, args, buffers, actor_net, bc_baseline_net
                         active_H = batch_H[buf['masks'][step]]
                         active_h = batch_h[buf['masks'][step]]
                         active_prev_h = batch_prev_h[buf['masks'][step]]
-                        
-                        with torch.autocast(device_type='cuda', dtype=torch.bfloat16):
-                            x_emb = actor_net.worker.feature_projection(flat_obs)
-                            S_mu_encoded = actor_net.worker.encoder_transformer(x_emb)
-                            active_S_M = actor_net.pooler(S_mu_encoded)
-                            
-                            new_z, new_h = actor_net.manager(active_S_M, active_H, active_h)
-                            new_z = new_z.to(torch.bfloat16)
-                            
-                            logits, _ = actor_net.worker(flat_obs, new_z, actor_net.D)
-                            
-                            logits = torch.nan_to_num(logits, nan=0.0, posinf=50.0, neginf=-50.0)
-                            logits = torch.clamp(logits, min=-50.0, max=50.0)
-                            
-                            pooled_S_M = active_S_M.mean(dim=1)
-                            ext_values = actor_net.extrinsic_value_head(pooled_S_M).squeeze(-1).float()
-                            int_values = actor_net.intrinsic_value_head(pooled_S_M).squeeze(-1).float()
+
+                        with actor_weights_lock:
+                            with torch.autocast(device_type='cuda', dtype=torch.bfloat16):
+                                x_emb = actor_net.worker.feature_projection(flat_obs)
+                                S_mu_encoded = actor_net.worker.encoder_transformer(x_emb)
+                                active_S_M = actor_net.pooler(S_mu_encoded)
+                                
+                                new_z, new_h = actor_net.manager(active_S_M, active_H, active_h)
+                                new_z = new_z.to(torch.bfloat16)
+                                
+                                logits, _ = actor_net.worker(flat_obs, new_z, actor_net.D)
+                                
+                                logits = torch.nan_to_num(logits, nan=0.0, posinf=50.0, neginf=-50.0)
+                                logits = torch.clamp(logits, min=-50.0, max=50.0)
+                                
+                                pooled_S_M = active_S_M.mean(dim=1)
+                                ext_values = actor_net.extrinsic_value_head(pooled_S_M).squeeze(-1).float()
+                                int_values = actor_net.intrinsic_value_head(pooled_S_M).squeeze(-1).float()
                         
                         batch_S_M[buf['masks'][step]] = active_S_M
                         batch_prev_h[buf['masks'][step]] = active_h
@@ -560,7 +566,7 @@ def rollout_worker(local_rank, device, args, buffers, actor_net, bc_baseline_net
                         for list_idx, (env_idx, agent_idx) in enumerate(terminal_indices):
                             buf['ext_terminal_values'][step, env_idx, agent_idx] = term_v_ext[list_idx]
                             buf['int_terminal_values'][step, env_idx, agent_idx] = term_v_int[list_idx]
-                            terminal_cache.append((step, env_idx, agent_idx, S_M_t[list_idx]))
+                            terminal_cache.append((step, env_idx, agent_idx, S_M_t[list_idx].detach().cpu()))
 
         # Calculate GAE Advantages
         with torch.no_grad():
@@ -604,7 +610,7 @@ def rollout_worker(local_rank, device, args, buffers, actor_net, bc_baseline_net
                     buf['S_M_next'][-1, env_idx, agent_idx] = S_M_next[list_idx]
 
             for t_step, env_idx, agent_idx, term_sm in terminal_cache:
-                buf['S_M_next'][t_step, env_idx, agent_idx] = term_sm
+                buf['S_M_next'][t_step, env_idx, agent_idx] = term_sm.to(device)
                 
         with torch.no_grad():
             with torch.autocast(device_type='cuda', dtype=torch.bfloat16):
@@ -922,9 +928,6 @@ def main():
             avg_extrinsic_step_reward = 0.0
             avg_intrinsic_step_reward = 0.0
             avg_total_step_reward = 0.0
-
-        free_buffers_queue.put(buffer_idx)
-        inference_stream.wait_stream(torch.cuda.current_stream())
         
         valid_indices = torch.nonzero(buf['masks'].view(-1), as_tuple=True)[0]
         b_size = valid_indices.shape[0]
@@ -1193,6 +1196,9 @@ def main():
             
         args.kl_coef = max(0.0001, min(5.0, args.kl_coef))
 
+        free_buffers_queue.put(buffer_idx)
+        inference_stream.wait_stream(torch.cuda.current_stream())
+
         local_metrics = torch.tensor([
             epoch_pg_loss_sum / max(1, track_steps),
             epoch_manager_loss_sum / max(1, track_steps),
@@ -1228,7 +1234,6 @@ def main():
             last_avg_ep_reward = global_ep_reward_sum / global_ep_count
 
         update_time = time.time() - t_update_start
-        torch.cuda.empty_cache()
         scheduler.step()
 
         if global_rank == 0:
@@ -1301,18 +1306,6 @@ def main():
         if update % EVAL_FREQ == 0:
             eval_start_time = time.time()
             torch.cuda.empty_cache()
-            
-            attention_cache = []
-            worker_attn_cache = []
-            hook_handle = None
-            worker_hook_handle = None
-            if global_rank == 0:
-                
-                def get_worker_attn_hook(module, inp, out):
-                    worker_attn_cache.clear()
-                    worker_attn_cache.append(out[1].detach().cpu().numpy())
-
-                worker_hook_handle = net.module.worker.strategy_cross_attn.register_forward_hook(get_worker_attn_hook)
 
             world_size = dist.get_world_size()
             my_powers = [p for i, p in enumerate(possible_agents) if i % world_size == global_rank]
@@ -1386,34 +1379,6 @@ def main():
                 
                 for i, power in enumerate(possible_agents):
                     wandb.log({f"Eval/{power}_SCs": local_eval_scs[i].item()}, step=update)
-
-                if worker_hook_handle is not None:
-                    worker_hook_handle.remove()
-                    
-                if len(worker_attn_cache) > 0:
-                    w_attn_matrix = worker_attn_cache[0][0] 
-                    
-                    print(f"[DEBUG] TacticalWorker Attn - Max: {w_attn_matrix.max():.4f}, Min: {w_attn_matrix.min():.4f}\n")
-                    
-                    plt.figure(figsize=(6, 12)) 
-                    sns.heatmap(w_attn_matrix, cmap="magma")
-                    plt.title(f"Worker Strategy Execution - Update {update}")
-                    plt.xlabel("Strategy Vectors (z_t)")
-                    plt.ylabel("Provinces (S_mu)")
-                    
-                    wandb.log({"Attention/TacticalWorker_Map": wandb.Image(plt)}, step=update)
-                    plt.close()
-                
-                if b_size > 0:
-                    sample_H = buf['H'].view(-1, 7, 7)[epoch_indices[-1]].cpu().numpy()
-                    
-                    plt.figure(figsize=(7, 6))
-                    sns.heatmap(sample_H, cmap="RdBu", annot=True, fmt=".1f", vmin=-1.0, vmax=1.0,
-                                xticklabels=possible_agents, yticklabels=possible_agents)
-                    plt.title(f"Sample Diplomatic Belief Matrix (H) - Update {update}")
-                    
-                    wandb.log({"Attention/Diplomatic_Matrix_H": wandb.Image(plt)}, step=update)
-                    plt.close()
                     
             torch.cuda.empty_cache()
 
