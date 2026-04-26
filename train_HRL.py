@@ -509,6 +509,7 @@ def rollout_worker(local_rank, device, args, buffers, actor_net, bc_baseline_net
                             dense_mask_bc = torch.zeros(bc_obs_tensor.size(0) * MAP_PROVINCES * VOCAB_SIZE, dtype=torch.bool, device=device)
                             dense_mask_bc[valid_global_indices_bc.long()] = True
                             dense_mask_bc = dense_mask_bc.view(bc_obs_tensor.size(0), MAP_PROVINCES, VOCAB_SIZE)
+                            bc_logits = bc_logits.float().masked_fill(~dense_mask_bc, float('-inf'))
 
                             bc_dist = Categorical(logits=bc_logits)
                             bc_final_actions = bc_dist.sample()

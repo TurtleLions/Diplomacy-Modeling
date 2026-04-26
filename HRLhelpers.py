@@ -15,6 +15,7 @@ from torch.nn.parallel import DistributedDataParallel as DDP
 import torch.utils.checkpoint as checkpoint
 from torch.utils.data.distributed import DistributedSampler
 from torch.utils.data import Dataset, DataLoader
+from torch.nn.attention import sdpa_kernel, SDPBackend
 
 from diplomacy import Game
 from pettingzoo import ParallelEnv
@@ -487,8 +488,8 @@ class MacroManager(nn.Module):
         k = self.k_proj(S_M_t).view(B_q, L_q, self.num_heads, self.head_dim).transpose(1, 2)
         v = self.v_proj(S_M_t).view(B_q, L_q, self.num_heads, self.head_dim).transpose(1, 2)
         
-        # Force the backend to use the most memory-efficient hardware kernels
-        with torch.backends.cuda.sdp_kernel(enable_flash=True, enable_math=True, enable_mem_efficient=True):
+        backends = [SDPBackend.FLASH_ATTENTION, SDPBackend.EFFICIENT_ATTENTION, SDPBackend.MATH]
+        with sdpa_kernel(backends):
             attn_out = F.scaled_dot_product_attention(q, k, v)
             
         # Reshape back to (Batch, Seq_Len, d_model) and apply final projection
