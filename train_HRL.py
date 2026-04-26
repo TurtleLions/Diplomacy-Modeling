@@ -240,8 +240,12 @@ def evaluate_against_baseline(live_net, baseline_net, device, update_num, live_p
                 logits = torch.nan_to_num(logits, nan=0.0, posinf=50.0, neginf=-50.0)
                 logits = torch.clamp(logits, min=-50.0, max=50.0)
                 logits = logits.float().masked_fill(~dense_mask, -1e20)
-                final_actions = torch.argmax(logits, dim=-1)
-                
+                if is_baseline:
+                    dist_eval = Categorical(logits=logits)
+                    final_actions = dist_eval.sample()
+                else:
+                    final_actions = torch.argmax(logits, dim=-1)
+            
         return {a: final_actions[i].cpu().numpy() for i, a in enumerate(agents)}
 
     with open(log_path, "w") as f:
@@ -506,8 +510,8 @@ def rollout_worker(local_rank, device, args, buffers, actor_net, bc_baseline_net
                             dense_mask_bc[valid_global_indices_bc.long()] = True
                             dense_mask_bc = dense_mask_bc.view(bc_obs_tensor.size(0), MAP_PROVINCES, VOCAB_SIZE)
 
-                            bc_logits = bc_logits.masked_fill(~dense_mask_bc, float('-inf'))
-                            bc_final_actions = torch.argmax(bc_logits, dim=-1) # Greedy sample for BC proxy
+                            bc_dist = Categorical(logits=bc_logits)
+                            bc_final_actions = bc_dist.sample()
                             del bc_logits, dense_mask_bc, bc_obs_tensor, bc_sparse_tensor
 
                         for idx, (env_idx, agent_name) in enumerate(baseline_metadata):
@@ -592,7 +596,15 @@ def rollout_worker(local_rank, device, args, buffers, actor_net, bc_baseline_net
                 buf['int_terminal_values'][step, env_idx, agent_idx] = next_int_v[list_idx].float().squeeze(-1)
                 next_ext_value[env_idx, agent_idx] = next_ext_v[list_idx].float().squeeze(-1)
                 next_int_value[env_idx, agent_idx] = next_int_v[list_idx].float().squeeze(-1)
+            buf['S_M_next'][:-1] = buf['S_M'][1:]
             
+            if obs_to_encode:
+                for list_idx, (env_idx, agent_idx) in enumerate(indices_to_update):
+                    buf['S_M_next'][-1, env_idx, agent_idx] = S_M_next[list_idx]
+
+            for t_step, env_idx, agent_idx, term_sm in terminal_cache:
+                buf['S_M_next'][t_step, env_idx, agent_idx] = term_sm
+                
         with torch.no_grad():
             with torch.autocast(device_type='cuda', dtype=torch.bfloat16):
                 flat_S_M = buf['S_M'].view(-1, 8, 512)
@@ -611,8 +623,10 @@ def rollout_worker(local_rank, device, args, buffers, actor_net, bc_baseline_net
                 
                 # Reshape back to buffer dimensions
                 intrinsic_rewards = intrinsic_rewards_flat.view(args.num_steps, args.num_envs, NUM_AGENTS)
-                
-                buf['intrinsic_rewards'] = intrinsic_rewards
+
+                intrinsic_rewards.masked_fill_(~buf['masks'], 0.0)
+
+                buf['intrinsic_rewards'].copy_(intrinsic_rewards)
                 
         lastgaelam_ext, lastgaelam_int = 0, 0
         for t in reversed(range(args.num_steps)):
@@ -632,20 +646,8 @@ def rollout_worker(local_rank, device, args, buffers, actor_net, bc_baseline_net
             delta_int = buf['intrinsic_rewards'][t] + args.gamma * next_int_v * nextnonterminal - buf['int_values'][t]
             buf['int_advantages'][t] = lastgaelam_int = delta_int + args.gamma * args.gae_lambda * nextnonterminal * lastgaelam_int
 
-        buf['ext_returns'] = buf['ext_advantages'] + buf['ext_values']
-        buf['int_returns'] = buf['int_advantages'] + buf['int_values']
-        
-        buf['S_M_next'][:-1] = buf['S_M'][1:]
-        
-        if obs_to_encode:
-            with torch.autocast(device_type='cuda', dtype=torch.bfloat16):
-                x_emb_next = actor_net.worker.feature_projection(obs_tensor)
-                S_M_terminal = actor_net.pooler(actor_net.worker.encoder_transformer(x_emb_next))
-            for list_idx, (env_idx, agent_idx) in enumerate(indices_to_update):
-                buf['S_M_next'][-1, env_idx, agent_idx] = S_M_terminal[list_idx]
-
-        for t_step, env_idx, agent_idx, term_sm in terminal_cache:
-            buf['S_M_next'][t_step, env_idx, agent_idx] = term_sm
+        buf['ext_returns'].copy_(buf['ext_advantages'] + buf['ext_values'])
+        buf['int_returns'].copy_(buf['int_advantages'] + buf['int_values'])
 
         inference_stream.synchronize()
 
@@ -910,6 +912,16 @@ def main():
         proposed_actions = int(worker_stats[2].item())
         illegal_dropped = int(worker_stats[3].item())
 
+        total_active_steps = buf['masks'].sum().item()
+        if total_active_steps > 0:
+            avg_extrinsic_step_reward = buf['extrinsic_rewards'].sum().item() / total_active_steps
+            avg_intrinsic_step_reward = buf['intrinsic_rewards'].sum().item() / total_active_steps
+            avg_total_step_reward = (buf['extrinsic_rewards'].sum().item() + buf['intrinsic_rewards'].sum().item()) / total_active_steps
+        else:
+            avg_extrinsic_step_reward = 0.0
+            avg_intrinsic_step_reward = 0.0
+            avg_total_step_reward = 0.0
+
         free_buffers_queue.put(buffer_idx)
         inference_stream.wait_stream(torch.cuda.current_stream())
         
@@ -976,7 +988,12 @@ def main():
         epoch_inv_loss_sum = torch.tensor(0.0, device=device)
         epoch_z_var_sum = torch.tensor(0.0, device=device)
         epoch_inv_grad_norm_sum = torch.tensor(0.0, device=device)
-        current_c_int = min(0.5, 0.5 * (update / 200.0))
+        warmup_end = 11
+        if update < warmup_end:
+            current_c_int = 0.5
+        else:
+            decay_progress = min(1.0, (update - warmup_end) / (args.num_updates * 0.8))
+            current_c_int = max(0.01, 0.5 * (1.0 - decay_progress))
         track_steps = 0
 
         target_kl = 0.02
@@ -1215,20 +1232,11 @@ def main():
             total_time = time.time() - start_time
             full_update_duration = time.time() - full_update_start
             global_steps = args.num_envs * args.num_steps * NUM_AGENTS * dist.get_world_size()
-            sps = int(global_steps / total_time)  
-            total_active_steps = buf['masks'].sum().item()
-            if total_active_steps > 0:
-                avg_extrinsic_step_reward = buf['extrinsic_rewards'].sum().item() / total_active_steps
-                avg_intrinsic_step_reward = buf['intrinsic_rewards'].sum().item() / total_active_steps
-                avg_total_step_reward = (buf['extrinsic_rewards'].sum().item() + buf['intrinsic_rewards'].sum().item()) / total_active_steps
-            else:
-                avg_extrinsic_step_reward = 0.0
-                avg_intrinsic_step_reward = 0.0
-                avg_total_step_reward = 0.0
+            sps = int(global_steps / total_time)
 
             illegal_rate = (illegal_dropped / max(1, proposed_actions)) * 100.0
             
-            print(f"Update {update}/{args.num_updates} | SPS: {sps} | Extrinsic Step: {avg_extrinsic_step_reward:.2f} | Intrinsic Step: {avg_intrinsic_step_reward:.2f} | Total Step: {avg_total_step_reward:.2f}")
+            print(f"Update {update}/{args.num_updates} | SPS: {sps} | Extrinsic Step: {avg_extrinsic_step_reward:.2f} | Intrinsic Step: {avg_intrinsic_step_reward:.4f} | Total Step: {avg_total_step_reward:.2f}")
             print(f"  CPU Time: {env_step_time:.2f}s | GPU Fwd: {gpu_forward_time:.2f}s | Bwd: {update_time:.2f}s | Full Update: {full_update_duration:.2f}s")
             print(f"  Losses -> Total: {avg_total_loss:.4f} | PG: {avg_pg_loss:.4f} | Mgr(InfoNCE): {avg_manager_loss:.4f} | Inv(InfoNCE): {avg_inv_loss:.4f}")
             print(f"  Metrics -> Feasibility Err: {avg_feasibility_error:.4f} | BC_KL: {avg_bc_kl:.4f} | Z_Var: {avg_z_var:.4f}")

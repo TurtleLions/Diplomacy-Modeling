@@ -474,8 +474,6 @@ class MacroManager(nn.Module):
         self.z_norm = nn.LayerNorm(d_model)
 
         self.z_out = nn.Linear(d_model, d_model)
-        nn.init.normal_(self.z_out.weight, std=1e-4)
-        nn.init.zeros_(self.z_out.bias)
 
     def forward(self, S_M_t, H_t, h_prev):
         B = S_M_t.size(0)
