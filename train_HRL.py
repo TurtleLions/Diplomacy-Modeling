@@ -979,16 +979,16 @@ def main():
         accum_steps = 32
         optimizer.zero_grad() 
 
-        epoch_pg_loss_sum = torch.tensor(0.0, device=device)
-        epoch_manager_loss_sum = torch.tensor(0.0, device=device)
-        epoch_feasibility_error_sum = torch.tensor(0.0, device=device)
-        epoch_bc_kl_sum = torch.tensor(0.0, device=device)
-        epoch_entropy_sum = torch.tensor(0.0, device=device)
-        epoch_total_loss_sum = torch.tensor(0.0, device=device)
-        epoch_intrinsic_reward_sum = torch.tensor(0.0, device=device)
-        epoch_inv_loss_sum = torch.tensor(0.0, device=device)
-        epoch_z_var_sum = torch.tensor(0.0, device=device)
-        epoch_inv_grad_norm_sum = torch.tensor(0.0, device=device)
+        epoch_pg_loss_sum = 0.0
+        epoch_manager_loss_sum = 0.0
+        epoch_feasibility_error_sum = 0.0
+        epoch_bc_kl_sum = 0.0
+        epoch_entropy_sum = 0.0
+        epoch_total_loss_sum = 0.0
+        epoch_intrinsic_reward_sum = 0.0
+        epoch_inv_loss_sum = 0.0
+        epoch_z_var_sum = 0.0
+        epoch_inv_grad_norm_sum = 0.0
         warmup_end = 11
         if update < warmup_end:
             current_c_int = 0.5
@@ -1005,6 +1005,8 @@ def main():
             shuffled_indices = epoch_indices[perm]
 
             start_indices = list(range(0, b_size, mb_size))
+            if len(start_indices) > 0 and (b_size % mb_size != 0):
+                start_indices = start_indices[:-1]
             epoch_kl_sum, epoch_kl_steps = 0.0, 0
 
             for step_idx, start in enumerate(start_indices):
@@ -1040,7 +1042,7 @@ def main():
                         z_achieved = z_achieved_raw.float()
 
                         intrinsic_reward = F.cosine_similarity(z_achieved, mb_z.detach().float(), dim=-1)
-                        epoch_intrinsic_reward_sum += intrinsic_reward.detach().mean()
+                        epoch_intrinsic_reward_sum += intrinsic_reward.detach().mean().item()
 
                         flat_mb_z_det = mb_z.view(-1, 512).float().detach()
                         flat_z_achieved = z_achieved_raw.view(-1, 512).float()
@@ -1067,8 +1069,8 @@ def main():
                         
                         z_variance = z_achieved_raw.var(dim=0).mean().detach() if z_achieved_raw.size(0) > 1 else torch.tensor(0.0, device=device)
 
-                        epoch_inv_loss_sum += inverse_model_loss.detach()
-                        epoch_z_var_sum += z_variance
+                        epoch_inv_loss_sum += inverse_model_loss.detach().item()
+                        epoch_z_var_sum += z_variance.item()
                         
                         v_loss = F.huber_loss(ext_values_pred, mb_ext_ret.float(), delta=10.0) + F.huber_loss(int_values_pred, mb_int_ret.float(), delta=10.0)
                         distance_penalty = F.mse_loss(mb_z.detach(), z_achieved.detach())
@@ -1149,12 +1151,12 @@ def main():
                                          + (args.bc_kl_coef * bc_kl_penalty) 
                                          + (args.v_coef * v_loss))
 
-                        epoch_pg_loss_sum += pg_loss.detach()
-                        epoch_manager_loss_sum += manager_loss.detach()
-                        epoch_feasibility_error_sum += distance_penalty.detach().mean()
-                        epoch_bc_kl_sum += bc_kl_penalty.detach() 
-                        epoch_entropy_sum += entropy.detach()
-                        epoch_total_loss_sum += unscaled_loss.detach()
+                        epoch_pg_loss_sum += pg_loss.detach().item()
+                        epoch_manager_loss_sum += manager_loss.detach().item()
+                        epoch_feasibility_error_sum += distance_penalty.detach().mean().item()
+                        epoch_bc_kl_sum += bc_kl_penalty.detach().item() 
+                        epoch_entropy_sum += entropy.detach().item()
+                        epoch_total_loss_sum += unscaled_loss.detach().item()
                         track_steps += 1
 
                         current_block_start = (step_idx // accum_steps) * accum_steps
@@ -1165,7 +1167,7 @@ def main():
                         loss.backward()
                         
                         inv_grad_norm = torch.nn.utils.clip_grad_norm_(net.module.inverse_model.parameters(), float('inf'))
-                        epoch_inv_grad_norm_sum += inv_grad_norm.detach() if isinstance(inv_grad_norm, torch.Tensor) else inv_grad_norm
+                        epoch_inv_grad_norm_sum += inv_grad_norm.detach().item() if isinstance(inv_grad_norm, torch.Tensor) else float(inv_grad_norm)
 
                 if sync_this_step:
                     nn.utils.clip_grad_norm_(net.parameters(), 0.5)
@@ -1191,7 +1193,7 @@ def main():
             
         args.kl_coef = max(0.0001, min(5.0, args.kl_coef))
 
-        local_metrics = torch.stack([
+        local_metrics = torch.tensor([
             epoch_pg_loss_sum / max(1, track_steps),
             epoch_manager_loss_sum / max(1, track_steps),
             epoch_feasibility_error_sum / max(1, track_steps),
@@ -1202,9 +1204,9 @@ def main():
             epoch_inv_loss_sum / max(1, track_steps),
             epoch_z_var_sum / max(1, track_steps),
             epoch_inv_grad_norm_sum / max(1, track_steps),
-            worker_stats[4].clone(), 
-            worker_stats[5].clone()
-        ])
+            worker_stats[4].item(), 
+            worker_stats[5].item()
+        ], dtype=torch.float32, device=device)
 
         dist.all_reduce(local_metrics, op=dist.ReduceOp.SUM)
         global_metrics = local_metrics[:10] / dist.get_world_size()
@@ -1294,7 +1296,7 @@ def main():
                     print(f"  -> Saved checkpoint to {ckpt_path}")
                     torch.save(checkpoint, ckpt_path)
             
-        EVAL_FREQ = 1
+        EVAL_FREQ = 5
         
         if update % EVAL_FREQ == 0:
             eval_start_time = time.time()
