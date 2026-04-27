@@ -597,7 +597,7 @@ class DiplomacyTransformerEnv(ParallelEnv):
         }
 
         self.stalemate_counter = 0
-        self.stalemate_threshold = 3 
+        self.stalemate_threshold = 6
         self.last_year_sc_owners = {}
 
     def _update_history(self, agent, new_state_tensor):
@@ -796,13 +796,13 @@ class DiplomacyTransformerEnv(ParallelEnv):
                 rewards[agent] += (sc_delta * 2.0)
 
             # Calculate unique provinces occupied this turn vs last turn
-            current_bases = set([u.split()[1].split('/')[0] for u in current_state_dict.get('units', {}).get(agent, [])])
-            prev_bases = set([u.split()[1].split('/')[0] for u in prev_units.get(agent, [])])
+            # current_bases = set([u.split()[1].split('/')[0] for u in current_state_dict.get('units', {}).get(agent, [])])
+            # prev_bases = set([u.split()[1].split('/')[0] for u in prev_units.get(agent, [])])
             
             # Reward for taking new territory (even non-SCs)
-            new_territories = len(current_bases - prev_bases)
-            if new_territories > 0:
-                rewards[agent] += (new_territories * 0.1) * anneal_factor
+            # new_territories = len(current_bases - prev_bases)
+            # if new_territories > 0:
+            #     rewards[agent] += (new_territories * 0.1) * anneal_factor
                 
             # Dislodgement Penalty
             # current_dislodged = current_state_dict.get('dislodged', {}).get(agent, [])
@@ -830,7 +830,7 @@ class DiplomacyTransformerEnv(ParallelEnv):
                         agent_scs = len(self.game.get_centers(agent))
                         if agent_scs > 0:
                             sos_share = ((agent_scs ** 2) / total_sq_scs) * 100.0
-                            draw_tax = (num_survivors - 1) * 2.0
+                            draw_tax = (num_survivors - 1) * 1.0
                             rewards[agent] += (sos_share - draw_tax)
 
         # for agent in self.agents:
@@ -846,10 +846,8 @@ class DiplomacyTransformerEnv(ParallelEnv):
             current_scs = self.game.get_centers(agent)
             agent_units = current_state_dict.get('units', {}).get(agent, [])
             
-            if len(current_scs) >= 18 or (len(current_scs) == 0 and len(agent_units) == 0):
+            if is_done or len(current_scs) >= 18 or (len(current_scs) == 0 and len(agent_units) == 0):
                 terminations[agent] = True
-            elif is_done: 
-                truncations[agent] = True
 
         infos = {a: {
             'action_mask': get_sparse_action_mask(self.game, a, self.provinces, self.order_to_idx), 
