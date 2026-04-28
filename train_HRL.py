@@ -25,6 +25,7 @@ from torch.nn.parallel import DistributedDataParallel as DDP
 from torch.optim.lr_scheduler import LambdaLR
 from torch.utils.tensorboard import SummaryWriter
 from diplomacy import Game
+import glob
 
 import wandb
 from dotenv import load_dotenv
@@ -303,7 +304,7 @@ def evaluate_against_baseline(live_net, baseline_net, device, update_num, live_p
 
 def parse_args():
     parser = argparse.ArgumentParser(description="PPO Training for Diplomacy")
-    parser.add_argument("--num_envs", type=int, default=28, help="Number of parallel environments per GPU")
+    parser.add_argument("--num_envs", type=int, default=35, help="Number of parallel environments per GPU")
     parser.add_argument("--num_steps", type=int, default=512, help="Number of steps per rollout")
     parser.add_argument("--num_updates", type=int, default=1000, help="Total number of PPO updates")
     parser.add_argument("--lr", type=float, default=1e-5, help="Learning rate")
@@ -313,13 +314,14 @@ def parse_args():
     parser.add_argument("--ent_coef", type=float, default=0.01, help="Entropy coefficient")
     parser.add_argument("--v_coef", type=float, default=0.1, help="Value function loss coefficient")
     parser.add_argument("--kl_coef", type=float, default=0.01, help="KL divergence penalty coefficient")
-    parser.add_argument("--update_epochs", type=int, default=2, help="Number of epochs per PPO update")
+    parser.add_argument("--update_epochs", type=int, default=3, help="Number of epochs per PPO update")
     parser.add_argument("--bc_weights", type=str, default="feudal_agent_bc.pth", help="Path to pre-trained Behavioral Cloning weights")
     parser.add_argument("--resume_weights", type=str, default=None, help="Path to RL checkpoint to resume training from")
     parser.add_argument("--bc_kl_coef", type=float, default=0.01, help="KL divergence penalty coefficient for behavioral cloning")
+    parser.add_argument("--run_name", type=str, default=None, help="Target run name (e.g., ppo_run_20260427_164600) to resume wandb logging and folder paths.")
     return parser.parse_args()
 
-def rollout_worker(local_rank, device, args, buffers, actor_net, bc_baseline_net, 
+def rollout_worker(local_rank, device, args, buffers, actor_net, bc_baseline_net, history_nets, ckpt_dir,
                    free_buffers_queue, ready_buffers_queue, worker_stats, 
                    NUM_AGENTS, MAP_PROVINCES, VOCAB_SIZE, NONE_IDX, possible_agents, agent_to_idx,
                    actor_weights_lock, start_update=1):
@@ -338,18 +340,61 @@ def rollout_worker(local_rank, device, args, buffers, actor_net, bc_baseline_net
     batch_prev_h = torch.zeros((args.num_envs, NUM_AGENTS, 8, 512), dtype=torch.bfloat16, device=device)
     batch_S_M = torch.zeros((args.num_envs, NUM_AGENTS, 8, 512), dtype=torch.bfloat16, device=device)
 
+    NUM_HISTORY_NETS = len(history_nets)
+
+    def refresh_historical_pool():
+        available_ckpts = glob.glob(os.path.join(ckpt_dir, "*.pth"))
+        if not available_ckpts: 
+            if local_rank == 0:
+                print("  [League] No historical checkpoints found yet. History nets retaining base weights.")
+            return
+            
+        loaded_ckpts = []
+        for net in history_nets:
+            chosen_ckpt = random.choice(available_ckpts)
+            loaded_ckpts.append(os.path.basename(chosen_ckpt))
+            try:
+                state_dict = torch.load(chosen_ckpt, map_location=device, weights_only=True)
+                if 'model_state_dict' in state_dict:
+                    clean_dict = {k.replace('module.', ''): v for k, v in state_dict['model_state_dict'].items()}
+                    net.load_state_dict(clean_dict, strict=False)
+                else:
+                    net.load_state_dict(state_dict, strict=False)
+            except Exception as e:
+                if local_rank == 0:
+                    print(f"  [League Error] Failed to load {os.path.basename(chosen_ckpt)}: {e}")
+                pass
+                
+        if local_rank == 0:
+            print(f"  [League Refresh] Opponents loaded: {', '.join(loaded_ckpts)}")
+
     for update in range(start_update, args.num_updates + 1):
         buffer_idx = free_buffers_queue.get()
 
-        num_learning = 3
+        if update % 5 == 0 or update == start_update:
+            refresh_historical_pool()
+
+        num_learning = 2
+
+        opp_probs = [0.2] + [0.8 / max(1, NUM_HISTORY_NETS)] * NUM_HISTORY_NETS if NUM_HISTORY_NETS > 0 else [1.0]
+        opp_probs = np.array(opp_probs) / sum(opp_probs)
+
+        net_assignment = torch.zeros((args.num_envs, NUM_AGENTS), dtype=torch.long, device=device)
         learning_assignment = torch.zeros((args.num_envs, NUM_AGENTS), dtype=torch.bool, device=device)
+        
         for i in range(args.num_envs):
             perm = torch.randperm(NUM_AGENTS, device=device)
-            learning_assignment[i, perm[:num_learning]] = True
+            actor_agents = perm[:num_learning]
+            net_assignment[i, actor_agents] = 1
+            learning_assignment[i, actor_agents] = True
+            
+            for a_idx in perm[num_learning:]:
+                opp_type = np.random.choice([0] + list(range(2, 2 + NUM_HISTORY_NETS)), p=opp_probs)
+                net_assignment[i, a_idx] = opp_type
 
         current_progress = (update - 1) / max(1, args.num_updates - 1)
-
         buf = buffers[buffer_idx]
+        
         with torch.cuda.stream(inference_stream):
             buf['masks'].zero_()
             buf['extrinsic_rewards'].zero_()
@@ -363,8 +408,11 @@ def rollout_worker(local_rank, device, args, buffers, actor_net, bc_baseline_net
             for step in range(args.num_steps):
                 actions_to_send = [{} for _ in range(args.num_envs)]
                 
-                active_obs_list, active_sparse_list, active_indices = [], [], []
-                baseline_obs_list, baseline_sparse_list, baseline_metadata = [], [], []
+                # Dictionary to group states by assigned Network ID
+                net_obs_lists = {k: [] for k in range(2 + NUM_HISTORY_NETS)}
+                net_sparse_lists = {k: [] for k in range(2 + NUM_HISTORY_NETS)}
+                net_indices = {k: [] for k in range(2 + NUM_HISTORY_NETS)}
+                
                 h_matrix_list, h_indices = [], []
                 
                 with torch.no_grad():
@@ -386,34 +434,31 @@ def rollout_worker(local_rank, device, args, buffers, actor_net, bc_baseline_net
                                 h_matrix_list.append(infos_dict[a]['H_matrix'])
                                 h_indices.append((i, a_idx))
                             
-                            if learning_assignment[i, a_idx]:
-                                buf['masks'][step, i, a_idx] = True
-                                active_obs_list.append(obs_dict[a][0])
-                                active_sparse_list.append(infos_dict[a]['action_mask'])
-                                active_indices.append((i, a_idx))
+                            net_id = net_assignment[i, a_idx].item()
+                            net_obs_lists[net_id].append(obs_dict[a][0])
+                            net_sparse_lists[net_id].append(infos_dict[a]['action_mask'])
+                            net_indices[net_id].append((i, a_idx))
 
+                            if net_id == 1:
+                                buf['masks'][step, i, a_idx] = True
                                 if 'legality_metrics' in infos_dict[a]:
                                     bad_indices = infos_dict[a]['legality_metrics'].get('illegal_prov_indices', [])
                                     for bad_idx in bad_indices:
                                         buf['unit_penalties'][step, i, a_idx, bad_idx] = -1.0
                                     local_proposed += infos_dict[a]['legality_metrics'].get('proposed', 0)
                                     local_dropped += infos_dict[a]['legality_metrics'].get('illegal_dropped', 0)
-                            else:
-                                baseline_obs_list.append(obs_dict[a][0])
-                                baseline_sparse_list.append(infos_dict[a]['action_mask'])
-                                baseline_metadata.append((i, a))
 
                     if h_matrix_list:
                         h_env_idx = [idx[0] for idx in h_indices]
                         h_agt_idx = [idx[1] for idx in h_indices]
                         batch_H[h_env_idx, h_agt_idx] = torch.tensor(np.stack(h_matrix_list), dtype=torch.float32, device=device)
 
-                    if active_obs_list:
-                        act_env_idx = [idx[0] for idx in active_indices]
-                        act_agt_idx = [idx[1] for idx in active_indices]
+                    if net_obs_lists[1]:
+                        act_env_idx = [idx[0] for idx in net_indices[1]]
+                        act_agt_idx = [idx[1] for idx in net_indices[1]]
                         
-                        batched_active_obs = torch.tensor(np.stack(active_obs_list), dtype=torch.int8, device=device)
-                        batched_active_sparse = torch.tensor(np.stack(active_sparse_list), dtype=torch.int32, device=device)
+                        batched_active_obs = torch.tensor(np.stack(net_obs_lists[1]), dtype=torch.int8, device=device)
+                        batched_active_sparse = torch.tensor(np.stack(net_sparse_lists[1]), dtype=torch.int32, device=device)
                         
                         buf['obs'][step, act_env_idx, act_agt_idx] = batched_active_obs
                         buf['sparse_masks'][step, act_env_idx, act_agt_idx] = batched_active_sparse
@@ -495,34 +540,59 @@ def rollout_worker(local_rank, device, args, buffers, actor_net, bc_baseline_net
                                     buf['actions'][step, i, agent_to_idx[a]] = act_array
                                     actions_to_send[i][a] = act_array.cpu().numpy()
                                     idx_counter += 1
-                                    
-                    if baseline_obs_list:
-                        bc_obs_tensor = torch.tensor(np.stack(baseline_obs_list), dtype=torch.bfloat16, device=device)
-                        bc_sparse_tensor = torch.tensor(np.stack(baseline_sparse_list), dtype=torch.int32, device=device)
-                        
-                        with torch.no_grad():
+
+                    with torch.no_grad():
+                        for net_id in range(2 + NUM_HISTORY_NETS):
+                            if net_id == 1 or not net_obs_lists[net_id]: continue 
+                            
+                            opp_obs = torch.tensor(np.stack(net_obs_lists[net_id]), dtype=torch.int8, device=device).to(torch.bfloat16)
+                            opp_sparse = torch.tensor(np.stack(net_sparse_lists[net_id]), dtype=torch.int32, device=device)
+                            
+                            env_idxs = [idx[0] for idx in net_indices[net_id]]
+                            agt_idxs = [idx[1] for idx in net_indices[net_id]]
+                            
                             with torch.autocast(device_type='cuda', dtype=torch.bfloat16):
-                                # Baseline receives a dummy 0 strategy vector
-                                bc_z = torch.zeros(bc_obs_tensor.size(0), 8, 512, device=device, dtype=torch.bfloat16)
-                                bc_logits, _ = bc_baseline_net.worker(bc_obs_tensor, bc_z, bc_baseline_net.D)
+                                if net_id == 0:
+                                    
+                                    opp_z = torch.zeros(opp_obs.size(0), 8, 512, device=device, dtype=torch.bfloat16)
+                                    opp_logits, _ = bc_baseline_net.worker(opp_obs, opp_z, bc_baseline_net.D)
+                                else:
+                                    net = history_nets[net_id - 2]
+                                    opp_H = batch_H[env_idxs, agt_idxs]
+                                    opp_prev_h = batch_h[env_idxs, agt_idxs]
+                                    
+                                    opp_x_emb = net.worker.feature_projection(opp_obs)
+                                    opp_S_mu = net.worker.encoder_transformer(opp_x_emb)
+                                    opp_S_M = net.pooler(opp_S_mu)
+                                    
+                                    opp_z, opp_new_h = net.manager(opp_S_M, opp_H, opp_prev_h)
+                                    opp_z = opp_z.to(torch.bfloat16)
+                                    
+                                    batch_prev_h[env_idxs, agt_idxs] = opp_prev_h
+                                    batch_h[env_idxs, agt_idxs] = opp_new_h
+                                    
+                                    opp_logits, _ = net.worker(opp_obs, opp_z, net.D)
 
-                            # Fast One-Shot Masking for Baseline
-                            valid_mask_bc = bc_sparse_tensor != -1
-                            row_offsets_bc = torch.arange(bc_obs_tensor.size(0), device=device).unsqueeze(1) * (MAP_PROVINCES * VOCAB_SIZE)
-                            global_indices_bc = bc_sparse_tensor + row_offsets_bc
-                            valid_global_indices_bc = global_indices_bc[valid_mask_bc]
+                            # Masking and Sampling 
+                            opp_logits = torch.nan_to_num(opp_logits, nan=0.0, posinf=50.0, neginf=-50.0)
+                            opp_logits = torch.clamp(opp_logits, min=-50.0, max=50.0)
+                            
+                            valid_mask_opp = opp_sparse != -1
+                            row_offsets_opp = torch.arange(opp_obs.size(0), device=device).unsqueeze(1) * (MAP_PROVINCES * VOCAB_SIZE)
+                            global_indices_opp = opp_sparse + row_offsets_opp
+                            valid_global_indices_opp = global_indices_opp[valid_mask_opp]
 
-                            dense_mask_bc = torch.zeros(bc_obs_tensor.size(0) * MAP_PROVINCES * VOCAB_SIZE, dtype=torch.bool, device=device)
-                            dense_mask_bc[valid_global_indices_bc.long()] = True
-                            dense_mask_bc = dense_mask_bc.view(bc_obs_tensor.size(0), MAP_PROVINCES, VOCAB_SIZE)
-                            bc_logits = bc_logits.float().masked_fill(~dense_mask_bc, float('-inf'))
+                            dense_mask_opp = torch.zeros(opp_obs.size(0) * MAP_PROVINCES * VOCAB_SIZE, dtype=torch.bool, device=device)
+                            dense_mask_opp[valid_global_indices_opp.long()] = True
+                            dense_mask_opp = dense_mask_opp.view(opp_obs.size(0), MAP_PROVINCES, VOCAB_SIZE)
+                            
+                            opp_logits = opp_logits.float().masked_fill(~dense_mask_opp, -1e20)
+                            opp_dist = Categorical(logits=opp_logits)
+                            opp_final_actions = opp_dist.sample()
 
-                            bc_dist = Categorical(logits=bc_logits)
-                            bc_final_actions = bc_dist.sample()
-                            del bc_logits, dense_mask_bc, bc_obs_tensor, bc_sparse_tensor
-
-                        for idx, (env_idx, agent_name) in enumerate(baseline_metadata):
-                            actions_to_send[env_idx][agent_name] = bc_final_actions[idx].cpu().numpy()
+                            for list_idx, (env_idx, agt_idx) in enumerate(net_indices[net_id]):
+                                agt_name = possible_agents[agt_idx]
+                                actions_to_send[env_idx][agt_name] = opp_final_actions[list_idx].cpu().numpy()
 
                     gpu_forward_time += (time.time() - t_gpu_start)
 
@@ -541,13 +611,13 @@ def rollout_worker(local_rank, device, args, buffers, actor_net, bc_baseline_net
 
                             for a in possible_agents:
                                 if a in infos_dict and '__terminal_observation' in infos_dict[a]:
+                                    batch_h[i, agent_to_idx[a]].zero_()
+                                    batch_prev_h[i, agent_to_idx[a]].zero_()
+                                    batch_S_M[i, agent_to_idx[a]].zero_()
+
                                     if learning_assignment[i, agent_to_idx[a]]:
                                         terminal_obs_to_encode.append(infos_dict[a]['__terminal_observation'][0])
                                         terminal_indices.append((i, agent_to_idx[a]))
-                                        
-                                        batch_h[i, agent_to_idx[a]].zero_()
-                                        batch_prev_h[i, agent_to_idx[a]].zero_()
-                                        batch_S_M[i, agent_to_idx[a]].zero_()
                             
                             for a in possible_agents:
                                 if learning_assignment[i, agent_to_idx[a]]:
@@ -712,6 +782,8 @@ def main():
     actor_net = FeudalDiplomacyAgent(d_model=512, vocab_size=VOCAB_SIZE).to(device)
     bc_baseline_net = FeudalDiplomacyAgent(d_model=512, vocab_size=VOCAB_SIZE).to(device)
 
+    NUM_HISTORY_NETS = 3
+    history_nets = []
     
     temp_game = Game()
     provinces = sorted([p.upper() for p in list(temp_game.map.locs)])
@@ -721,14 +793,25 @@ def main():
     actor_net.D.copy_(D_matrix)
     bc_baseline_net.D.copy_(D_matrix)
     
+    # Initialize Historical Opponent Pool
+    for _ in range(NUM_HISTORY_NETS):
+        net_h = FeudalDiplomacyAgent(d_model=512, vocab_size=VOCAB_SIZE).to(device)
+        net_h.D.copy_(D_matrix)
+        net_h.eval()
+        for param in net_h.parameters(): param.requires_grad = False
+        net_h.share_memory()
+        history_nets.append(net_h)
+    
     if os.path.exists(args.bc_weights):
         bc_state_dict = torch.load(args.bc_weights, map_location=device)
         net.load_state_dict(bc_state_dict, strict=False)
         
         actor_net.load_state_dict(net.state_dict())
         bc_baseline_net.load_state_dict(bc_state_dict, strict=False)
+        
+        for net_h in history_nets:
+            net_h.load_state_dict(bc_state_dict, strict=False)
 
-        # Freeze reference models
         actor_net.eval()
         for param in actor_net.parameters(): param.requires_grad = False
             
@@ -746,8 +829,7 @@ def main():
             net.load_state_dict(checkpoint['model_state_dict'], strict=False)
             actor_net.load_state_dict(checkpoint['model_state_dict'], strict=False)
             loaded_opt_state = checkpoint['optimizer_state_dict']
-            loaded_sched_state = checkpoint.get('scheduler_state_dict') # Extract it here safely
-            
+            loaded_sched_state = checkpoint.get('scheduler_state_dict')
             start_update = checkpoint.get('update', 0) + 1 
         else:
             net.load_state_dict(checkpoint, strict=False)
@@ -851,22 +933,17 @@ def main():
 
     inference_stream = torch.cuda.Stream(device=device)
     actor_weights_lock = mp.Lock()
-    rollout_process = mp.Process(target=rollout_worker, args=(
-        local_rank, device, args, buffers, actor_net, bc_baseline_net,
-        free_buffers_queue, ready_buffers_queue, worker_stats,
-        NUM_AGENTS, MAP_PROVINCES, VOCAB_SIZE, NONE_IDX, possible_agents, agent_to_idx,
-        actor_weights_lock, start_update
-    ))
-    rollout_process.start()
 
-    timestamp_list = [None]
-    if global_rank == 0:
-        timestamp_list[0] = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
-        
-    dist.broadcast_object_list(timestamp_list, src=0)
-    timestamp = timestamp_list[0]
-
-    run_name = f"ppo_run_{timestamp}"
+    if args.run_name:
+        run_name = args.run_name
+    else:
+        timestamp_list = [None]
+        if global_rank == 0:
+            timestamp_list[0] = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
+            
+        dist.broadcast_object_list(timestamp_list, src=0)
+        timestamp = timestamp_list[0]
+        run_name = f"ppo_run_{timestamp}"
     base_dir = f"/data/restanislao/model_runs/{run_name}"
     ckpt_dir = os.path.join(base_dir, "checkpoints")
     eval_dir = os.path.join(base_dir, "eval_games")
@@ -874,11 +951,22 @@ def main():
     if global_rank == 0:
         os.makedirs(ckpt_dir, exist_ok=True)
         os.makedirs(eval_dir, exist_ok=True)
-        
+
+    rollout_process = mp.Process(target=rollout_worker, args=(
+        local_rank, device, args, buffers, actor_net, bc_baseline_net, history_nets, ckpt_dir,
+        free_buffers_queue, ready_buffers_queue, worker_stats,
+        NUM_AGENTS, MAP_PROVINCES, VOCAB_SIZE, NONE_IDX, possible_agents, agent_to_idx,
+        actor_weights_lock, start_update
+    ))
+    rollout_process.start()
+
+    if global_rank == 0:
         writer = SummaryWriter(log_dir=f"/data/restanislao/tb_runs/{run_name}")
         wandb.init(
             project="diplomacy-ppo",
             name=run_name,
+            id=run_name,
+            resume="allow",
             config=vars(args),
             dir="/data/restanislao/wandb"
         )
@@ -1289,7 +1377,7 @@ def main():
                 "global_step": update * global_steps,
             }, step=update)
 
-            if update % 1 == 0:
+            if update % 5 == 0:
                 ckpt_path = os.path.join(ckpt_dir, f"diplomacy_APPO_update_{update}.pth")
                 if global_rank == 0:
                     checkpoint = {
