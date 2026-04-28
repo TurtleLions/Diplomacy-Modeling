@@ -98,13 +98,14 @@ def rebuild_packed_masks(sparse_masks, num_provs, vocab_size, none_idx, device):
     
     return is_active_mask, packed_masks, padded_indices, max_active
 
-def worker(remote, parent_remote):
-    """Background worker process for executing environment steps."""
+def worker(remote, parent_remote, env_idx, shared_obs, shared_masks, shared_H):
+    """Background worker process using PyTorch Shared Memory."""
     torch.set_num_threads(1)
     parent_remote.close()
     env = DiplomacyTransformerEnv(history_length=1) 
     
     episode_rewards = {a: 0.0 for a in env.possible_agents}
+    agent_to_idx = {a: i for i, a in enumerate(env.possible_agents)}
     
     while True:
         try:
@@ -127,13 +128,36 @@ def worker(remote, parent_remote):
                             infos[agent]['__terminal_observation'] = t_obs
                     
                     infos['episode_reward'] = episode_rewards.copy()
-                    
                     episode_rewards = {a: 0.0 for a in env.possible_agents}
 
+                for a in env.agents:
+                    a_idx = agent_to_idx[a]
+                    shared_obs[env_idx, a_idx].copy_(torch.from_numpy(obs[a]))
+                    shared_masks[env_idx, a_idx].copy_(torch.from_numpy(infos[a]['action_mask']))
+                    shared_H[env_idx, a_idx].copy_(torch.from_numpy(infos[a]['H_matrix']))
+                    
+                    del obs[a]
+                    del infos[a]['action_mask']
+                    del infos[a]['H_matrix']
+
                 remote.send((obs, rewards, terms, truncs, infos, env.agents))
+
             elif cmd == 'reset': 
                 episode_rewards = {a: 0.0 for a in env.possible_agents}
-                remote.send((*env.reset(), env.agents))
+                obs, infos = env.reset()
+                
+                for a in env.agents:
+                    a_idx = agent_to_idx[a]
+                    shared_obs[env_idx, a_idx].copy_(torch.from_numpy(obs[a]))
+                    shared_masks[env_idx, a_idx].copy_(torch.from_numpy(infos[a]['action_mask']))
+                    shared_H[env_idx, a_idx].copy_(torch.from_numpy(infos[a]['H_matrix']))
+                    
+                    del obs[a]
+                    del infos[a]['action_mask']
+                    del infos[a]['H_matrix']
+
+                remote.send((obs, infos, env.agents))
+
             elif cmd == 'close':
                 remote.close()
                 break
@@ -145,22 +169,56 @@ def worker(remote, parent_remote):
             break
 
 class SubprocVecDiplomacy:
-    """Asynchronous vector environment using multiprocessing pipes for parallel simulation."""
+    """Asynchronous vector environment using IPC pipes + Shared Memory for parallel simulation."""
     def __init__(self, num_envs):
         self.num_envs = num_envs
+        
+        # Pre-allocate massive shared memory blocks for all workers to write to
+        NUM_AGENTS = 7
+        self.shared_obs = torch.zeros((num_envs, NUM_AGENTS, 1, 82, 61), dtype=torch.int8).share_memory_()
+        self.shared_masks = torch.full((num_envs, NUM_AGENTS, 4000), -1, dtype=torch.int32).share_memory_()
+        self.shared_H = torch.zeros((num_envs, NUM_AGENTS, 7, 7), dtype=torch.float32).share_memory_()
+        
+        self.possible_agents = ['AUSTRIA', 'ENGLAND', 'FRANCE', 'GERMANY', 'ITALY', 'RUSSIA', 'TURKEY']
+        self.agent_to_idx = {a: i for i, a in enumerate(self.possible_agents)}
+
         self.remotes, self.work_remotes = zip(*[mp.Pipe() for _ in range(num_envs)])
-        self.ps = [mp.Process(target=worker, args=(work_remote, remote)) for (work_remote, remote) in zip(self.work_remotes, self.remotes)]
+        self.ps = [
+            mp.Process(
+                target=worker, 
+                args=(work_remote, remote, i, self.shared_obs, self.shared_masks, self.shared_H)
+            ) 
+            for i, (work_remote, remote) in enumerate(zip(self.work_remotes, self.remotes))
+        ]
+        
         for p in self.ps:
             p.daemon = True 
             p.start()
         for remote in self.work_remotes: 
             remote.close()
 
+    def _reconstruct_data(self, idx, msg):
+        """Zero-Copy Reattachment: Restores arrays to the dictionaries instantly from RAM."""
+        if len(msg) == 6:
+            obs, rewards, terms, truncs, infos, active_agents = msg
+            for a in active_agents:
+                a_idx = self.agent_to_idx[a]
+                obs[a] = self.shared_obs[idx, a_idx].numpy()
+                infos[a]['action_mask'] = self.shared_masks[idx, a_idx].numpy()
+                infos[a]['H_matrix'] = self.shared_H[idx, a_idx].numpy()
+            return (obs, rewards, terms, truncs, infos, active_agents)
+        else:
+            obs, infos, active_agents = msg
+            for a in active_agents:
+                a_idx = self.agent_to_idx[a]
+                obs[a] = self.shared_obs[idx, a_idx].numpy()
+                infos[a]['action_mask'] = self.shared_masks[idx, a_idx].numpy()
+                infos[a]['H_matrix'] = self.shared_H[idx, a_idx].numpy()
+            return (obs, infos, active_agents)
+
     def _gather_results(self):
         """Safely polls ready pipes to prevent OS buffer lockups."""
         results = [None] * self.num_envs
-        
-        # Keep a dictionary mapping each active remote to its original index
         remotes_left = {remote: i for i, remote in enumerate(self.remotes)}
         
         while remotes_left:
@@ -168,8 +226,10 @@ class SubprocVecDiplomacy:
             
             for remote in ready_remotes:
                 idx = remotes_left[remote]
-                results[idx] = remote.recv() # Clear the buffer instantly
-                del remotes_left[remote]     # Remove from the polling pool
+                msg = remote.recv()
+                
+                results[idx] = self._reconstruct_data(idx, msg)
+                del remotes_left[remote]
                 
         return results
 
