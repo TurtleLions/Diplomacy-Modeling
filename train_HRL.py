@@ -414,7 +414,7 @@ def rollout_worker(local_rank, device, args, buffers, actor_net, bc_baseline_net
             chosen_ckpt = random.choice(available_ckpts)
             loaded_ckpts.append(os.path.basename(chosen_ckpt))
             try:
-                state_dict = torch.load(chosen_ckpt, map_location=device, weights_only=True)
+                state_dict = torch.load(chosen_ckpt, map_location='cpu', weights_only=True)
                 if 'model_state_dict' in state_dict:
                     clean_dict = {k.replace('module.', ''): v for k, v in state_dict['model_state_dict'].items()}
                     net.load_state_dict(clean_dict, strict=False)
@@ -769,8 +769,8 @@ def rollout_worker(local_rank, device, args, buffers, actor_net, bc_baseline_net
         for t in reversed(range(args.num_steps)):
             if t == args.num_steps - 1:
                 nextnonterminal = 1.0 - next_done
-                next_ext_v = torch.zeros((args.num_envs, NUM_AGENTS), device=device)
-                next_int_v = torch.zeros((args.num_envs, NUM_AGENTS), device=device)
+                next_ext_v = next_ext_value
+                next_int_v = next_int_value
             else:
                 nextnonterminal = 1.0 - buf['dones'][t]
                 is_trunc = buf['truncations'][t] == 1.0
@@ -899,7 +899,7 @@ def main():
         if global_rank == 0:
             print(f"Successfully resumed RL training from checkpoint: {args.resume_weights}")
 
-    net = DDP(net, device_ids=[local_rank], find_unused_parameters=True, bucket_cap_mb=256)
+    net = DDP(net, device_ids=[local_rank], find_unused_parameters=False, bucket_cap_mb=256)
 
     manager_params = []
     worker_params = []
@@ -923,9 +923,13 @@ def main():
     def worker_warmup(update):
         unfreeze_update = 11
         warmup_updates = 10
-        
+        freeze_again_update = 600 
+    
         if update < unfreeze_update:
             return 0.0 
+            
+        if update >= freeze_again_update:
+            return 0.0
             
         active_steps = update - unfreeze_update + 1
         if active_steps < warmup_updates:
@@ -1034,23 +1038,8 @@ def main():
 
     dist.barrier()
 
-    for param in net.module.worker.parameters():
-            param.requires_grad = False
-
-    if start_update >= 11:
-        for param in net.module.worker.parameters():
-            param.requires_grad = True
-        if global_rank == 0:
-            print("Resuming past warmup: TacticalWorker parameters unfrozen.")
-
     for update in range(start_update, args.num_updates + 1):
         start_time = time.time()
-
-        if update == 11:
-            for param in net.module.worker.parameters():
-                param.requires_grad = True
-            if global_rank == 0:
-                print("Warmup complete: TacticalWorker parameters unfrozen.")
         
         buffer_idx = ready_buffers_queue.get()
         full_update_start = time.time()
@@ -1093,35 +1082,45 @@ def main():
             
         b_size = min_b_size
 
+        local_stats = torch.zeros((NUM_AGENTS, 5), dtype=torch.float32, device=device)
+        
         if b_size > 1:
-            valid_ext_adv = buf['ext_advantages'].view(-1)[epoch_indices]
-            valid_int_adv = buf['int_advantages'].view(-1)[epoch_indices]
-            
-            local_ext_sum, local_ext_sq_sum = valid_ext_adv.sum(), (valid_ext_adv ** 2).sum()
-            local_int_sum, local_int_sq_sum = valid_int_adv.sum(), (valid_int_adv ** 2).sum()
-            local_count = torch.tensor(b_size, dtype=torch.float32, device=device)
-        else:
-            local_ext_sum = local_ext_sq_sum = torch.tensor(0.0, device=device)
-            local_int_sum = local_int_sq_sum = torch.tensor(0.0, device=device)
-            local_count = torch.tensor(0.0, device=device)
-            
-        stats = torch.stack([local_ext_sum, local_ext_sq_sum, local_int_sum, local_int_sq_sum, local_count])
-        dist.all_reduce(stats, op=dist.ReduceOp.SUM)
+            for a_idx in range(NUM_AGENTS):
+                agent_mask = (epoch_indices % NUM_AGENTS) == a_idx
+                agent_indices = epoch_indices[agent_mask]
+                
+                count = agent_indices.numel()
+                if count > 0:
+                    agent_ext_adv = buf['ext_advantages'].view(-1)[agent_indices]
+                    agent_int_adv = buf['int_advantages'].view(-1)[agent_indices]
+                    
+                    local_stats[a_idx, 0] = agent_ext_adv.sum()
+                    local_stats[a_idx, 1] = (agent_ext_adv ** 2).sum()
+                    local_stats[a_idx, 2] = agent_int_adv.sum()
+                    local_stats[a_idx, 3] = (agent_int_adv ** 2).sum()
+                    local_stats[a_idx, 4] = count
 
-        if stats[4] > 1:
-            global_count = stats[4]
-            
-            # Normalize Extrinsic
-            global_ext_mean = stats[0] / global_count
-            global_ext_var = (stats[1] / global_count) - (global_ext_mean ** 2)
-            global_ext_std = torch.sqrt(torch.clamp(global_ext_var, min=1e-8))
-            buf['ext_advantages'].view(-1)[epoch_indices] = (valid_ext_adv - global_ext_mean) / (global_ext_std + 1e-8)
-            
-            # Normalize Intrinsic
-            global_int_mean = stats[2] / global_count
-            global_int_var = (stats[3] / global_count) - (global_int_mean ** 2)
-            global_int_std = torch.sqrt(torch.clamp(global_int_var, min=1e-8))
-            buf['int_advantages'].view(-1)[epoch_indices] = (valid_int_adv - global_int_mean) / (global_int_std + 1e-8)
+        dist.all_reduce(local_stats, op=dist.ReduceOp.SUM)
+
+        for a_idx in range(NUM_AGENTS):
+            agent_count = local_stats[a_idx, 4]
+            if agent_count > 1:
+                agent_mask = (epoch_indices % NUM_AGENTS) == a_idx
+                agent_indices = epoch_indices[agent_mask]
+                
+                if agent_indices.numel() > 0:
+                    agent_ext_adv = buf['ext_advantages'].view(-1)[agent_indices]
+                    agent_int_adv = buf['int_advantages'].view(-1)[agent_indices]
+                    
+                    ext_mean = local_stats[a_idx, 0] / agent_count
+                    ext_var = (local_stats[a_idx, 1] / agent_count) - (ext_mean ** 2)
+                    ext_std = torch.sqrt(torch.clamp(ext_var, min=1e-8))
+                    buf['ext_advantages'].view(-1)[agent_indices] = (agent_ext_adv - ext_mean) / (ext_std + 1e-8)
+                    
+                    int_mean = local_stats[a_idx, 2] / agent_count
+                    int_var = (local_stats[a_idx, 3] / agent_count) - (int_mean ** 2)
+                    int_std = torch.sqrt(torch.clamp(int_var, min=1e-8))
+                    buf['int_advantages'].view(-1)[agent_indices] = (agent_int_adv - int_mean) / (int_std + 1e-8)
 
         t_update_start = time.time()
         net.train()
@@ -1286,13 +1285,13 @@ def main():
                                 kl_divergence = 0.5 * (log_ratio ** 2)[valid_ratio_mask].mean()
                                 
                                 kl_div_vector = new_logprobs - bc_logprobs
-                                # raw_bc_kl = kl_div_vector[valid_ratio_mask].mean()
-                                # progress = min(1.0, update / 100.0) 
-                                # dynamic_target_kl = 0.02 + (0.48 * progress) 
-                                
-                                # bc_kl_penalty = F.relu(raw_bc_kl - dynamic_target_kl)
                                 raw_bc_kl = kl_div_vector[valid_ratio_mask].mean()
-                                bc_kl_penalty = raw_bc_kl
+                                progress = min(1.0, update / 100.0) 
+                                dynamic_target_kl = 0.02 + (0.48 * progress) 
+                                
+                                bc_kl_penalty = F.relu(raw_bc_kl - dynamic_target_kl)
+                                # raw_bc_kl = kl_div_vector[valid_ratio_mask].mean()
+                                # bc_kl_penalty = raw_bc_kl
 
                         # Final loss aggregation
                         unscaled_loss = (pg_loss 
