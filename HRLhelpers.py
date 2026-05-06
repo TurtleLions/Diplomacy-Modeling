@@ -431,18 +431,17 @@ class InverseModel(nn.Module):
     """I_psi: Calculates the achieved z based on state transitions per theater."""
     def __init__(self, d_val=512, d_model=512):
         super().__init__()
-        hidden_dim = d_val * 4
+        hidden_dim = d_val * 2 
         self.mlp = nn.Sequential(
-            nn.Linear(d_val * 2, hidden_dim),
+            nn.Linear(d_val, hidden_dim), 
             nn.LayerNorm(hidden_dim),
             nn.GELU(),
             nn.Linear(hidden_dim, d_model)
         )
 
     def forward(self, S_M_t, S_M_t_next):
-        x = torch.cat([S_M_t, S_M_t_next], dim=-1)
-        
-        return self.mlp(x) # Output shape: (B, 8, 512)
+        state_difference = S_M_t_next - S_M_t
+        return self.mlp(state_difference)
 
 class MacroManager(nn.Module):
     """
@@ -503,6 +502,7 @@ class MacroManager(nn.Module):
         h_t = h_t_flat.view(B, 8, -1)
         
         z_t = self.z_out(self.z_norm(h_t))
+        z_t = F.normalize(z_t, p=2, dim=-1)
 
         return z_t, h_t
 
@@ -551,7 +551,8 @@ class FeudalDiplomacyAgent(nn.Module):
         S_M = self.pooler(S_mu_encoded)
         
         predicted_z, predicted_h = self.manager(S_M, mb_H, mb_prev_h)
-        logits, _ = self.worker(mb_obs, predicted_z, self.D)
+        z_for_worker = worker_z_target if worker_z_target is not None else predicted_z
+        logits, _ = self.worker(mb_obs, z_for_worker, self.D)
         pooled_S_M = S_M.detach().mean(dim=1)
         ext_values_pred = self.extrinsic_value_head(pooled_S_M).squeeze(-1).float()
         int_values_pred = self.intrinsic_value_head(pooled_S_M).squeeze(-1).float()
@@ -793,7 +794,7 @@ class DiplomacyTransformerEnv(ParallelEnv):
             # Supply Center Deltas
             sc_delta = current_sc_count - prev_sc_counts.get(agent, 0)
             if sc_delta != 0:
-                rewards[agent] += (sc_delta * 2.0)
+                rewards[agent] += (sc_delta * 0.2)
 
             # Calculate unique provinces occupied this turn vs last turn
             # current_bases = set([u.split()[1].split('/')[0] for u in current_state_dict.get('units', {}).get(agent, [])])
@@ -818,7 +819,7 @@ class DiplomacyTransformerEnv(ParallelEnv):
                     break
             
             if solo_winner:
-                rewards[solo_winner] += 150.0
+                rewards[solo_winner] += 15.0
             else:
                 surviving_agents = [a for a in self.agents if len(self.game.get_centers(a)) > 0]
                 num_survivors = len(surviving_agents)
@@ -829,7 +830,7 @@ class DiplomacyTransformerEnv(ParallelEnv):
                     for agent in self.agents:
                         agent_scs = len(self.game.get_centers(agent))
                         if agent_scs > 0:
-                            sos_share = ((agent_scs ** 2) / total_sq_scs) * 100.0
+                            sos_share = ((agent_scs ** 2) / total_sq_scs) * 10.0
                             draw_tax = (num_survivors - 1) * 1.0
                             rewards[agent] += (sos_share - draw_tax)
 

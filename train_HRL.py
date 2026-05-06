@@ -1141,10 +1141,10 @@ def main():
         epoch_inv_grad_norm_sum = 0.0
         warmup_end = 11
         if update < warmup_end:
-            current_c_int = 0.5
+            current_c_int = 0.05
         else:
             decay_progress = min(1.0, (update - warmup_end) / (args.num_updates * 0.8))
-            current_c_int = max(0.01, 0.5 * (1.0 - decay_progress))
+            current_c_int = max(0.001, 0.05 * (1.0 - decay_progress))
         track_steps = 0
 
         target_kl = 0.02
@@ -1205,7 +1205,7 @@ def main():
                         norm_z_achieved = F.normalize(flat_z_achieved, p=2, dim=1)
                         norm_mb_z_det = F.normalize(flat_mb_z_det, p=2, dim=1)
                         
-                        temperature = 0.1
+                        temperature = 0.5
                         
                         logits_mgr = torch.matmul(norm_predicted_z, norm_z_achieved_det.T) / temperature
                         
