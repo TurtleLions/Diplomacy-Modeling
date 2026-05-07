@@ -283,7 +283,7 @@ def process_and_save_to_disk(json_path, cache_dir, max_games=None):
                 games_yielded += 1
                 if max_games and games_yielded >= max_games: break
 
-    num_cores = min(28, smp.cpu_count())
+    num_cores = min(44, smp.cpu_count())
     print(f"Starting multiprocessing pool with {num_cores} workers.")
     total_samples = 0
     
@@ -428,6 +428,10 @@ def train_worker(rank, world_size, paths_and_metadata, args):
     agent = DDP(agent, device_ids=[rank], find_unused_parameters=True)
     criterion = nn.CrossEntropyLoss(ignore_index=none_idx) 
     optimizer = optim.Adam(agent.parameters(), lr=args.learning_rate)
+
+    steps_per_epoch = len(dataloader)
+    total_steps = args.epochs * steps_per_epoch
+    scheduler = optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=total_steps, eta_min=1e-5)
     
     if rank == 0:
         print(f"\n--- Starting Phase 2: Tactical Worker Behavioral Cloning ---")
@@ -473,6 +477,7 @@ def train_worker(rank, world_size, paths_and_metadata, args):
             loss.backward()
             torch.nn.utils.clip_grad_norm_(agent.parameters(), 0.5)
             optimizer.step()
+            scheduler.step()
             total_loss += loss.item()
                 
             if rank == 0 and batch_idx % 20 == 0:

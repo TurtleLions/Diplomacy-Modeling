@@ -577,7 +577,7 @@ class FeudalDiplomacyAgent(nn.Module):
             B = mb_obs.size(0)
             if self.training and torch.rand(1).item() < 0.25:
                 z_target = torch.randn((B, 8, self.worker.d_model), device=mb_obs.device, dtype=mb_obs.dtype)
-                z_target = F.normalize(z_target, p=2, dim=-1) * 0.1 
+                z_target = F.normalize(z_target, p=2, dim=-1)
             else:
                 z_target = torch.zeros((B, 8, self.worker.d_model), device=mb_obs.device, dtype=mb_obs.dtype)
                 
