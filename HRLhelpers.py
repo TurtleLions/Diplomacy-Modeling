@@ -596,12 +596,7 @@ class FeudalDiplomacyAgent(nn.Module):
         
         S_M_seq = S_M.view(SEQ_LEN, B, 8, 512)
         
-        live_S_M_next = torch.empty_like(S_M_seq)
-        done_mask = 1.0 - seq_dones[:-1].view(-1, B, 1, 1).to(live_S_M_next.dtype)
-        live_S_M_next[:-1] = S_M_seq[1:].detach() * done_mask
-        live_S_M_next[-1] = seq_S_M_next[-1]
-        
-        flat_live_S_M_next = live_S_M_next.view(SEQ_LEN * B, 8, 512)
+        flat_live_S_M_next = seq_S_M_next.view(SEQ_LEN * B, 8, 512)
         flat_z_ach = self.inverse_model(S_M, flat_live_S_M_next)
         
         # Reshape everything back to sequences
