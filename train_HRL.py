@@ -1153,8 +1153,8 @@ def main():
             
         b_size_seqs = min_b_size_seqs
 
-        mb_size_seqs = 16  # 16 seqs * 16 steps = 256
-        accum_steps = 32
+        mb_size_seqs = 32
+        accum_steps = 16
         optimizer.zero_grad() 
 
         epoch_pg_loss_sum = 0.0
@@ -1199,17 +1199,42 @@ def main():
                 my_context = net.no_sync() if not sync_this_step else contextlib.nullcontext()
                 
                 with my_context:
-                    # Initialize hidden state for the sequence chunks
-                    h_t = buf['prev_h'][start_ts, envs, agts].detach()
+                    all_ts = []
+                    for t_offset in range(SEQ_LEN):
+                        all_ts.extend([st + t_offset for st in start_ts])
+                    
+                    flat_envs = envs * SEQ_LEN
+                    flat_agts = agts * SEQ_LEN
+                    
+                    seq_obs = buf['obs'][all_ts, flat_envs, flat_agts].view(SEQ_LEN, mb_size_seqs, 82, 61).to(dtype=torch.bfloat16)
+                    seq_H = buf['H'][all_ts, flat_envs, flat_agts].view(SEQ_LEN, mb_size_seqs, 7, 7)
+                    seq_z = buf['z'][all_ts, flat_envs, flat_agts].view(SEQ_LEN, mb_size_seqs, 8, 512).to(torch.bfloat16)
+                    seq_S_M_next = buf['S_M_next'][all_ts, flat_envs, flat_agts].view(SEQ_LEN, mb_size_seqs, 8, 512)
+                    seq_dones = buf['dones'][all_ts, flat_envs, flat_agts].view(SEQ_LEN, mb_size_seqs)
+                    
+                    h_0 = buf['prev_h'][start_ts, envs, agts].detach()
+
+                    with torch.no_grad(), torch.autocast(device_type='cuda', dtype=torch.bfloat16):
+                        flat_bc_obs = seq_obs.view(SEQ_LEN * mb_size_seqs, 82, 61)
+                        bc_z_zero = torch.zeros(SEQ_LEN * mb_size_seqs, 8, 512, device=device, dtype=torch.bfloat16)
+                        flat_bc_logits, _ = bc_baseline_net.worker(flat_bc_obs, bc_z_zero, bc_baseline_net.D)
+                        
+                        flat_bc_logits = torch.nan_to_num(flat_bc_logits, nan=0.0, posinf=50.0, neginf=-50.0)
+                        flat_bc_logits = torch.clamp(flat_bc_logits, min=-50.0, max=50.0)
+                        seq_bc_logits = flat_bc_logits.view(SEQ_LEN, mb_size_seqs, 82, VOCAB_SIZE)
+                    
+                    with torch.autocast(device_type='cuda', dtype=torch.bfloat16):
+                        out_S_M, out_pred_z, out_next_h, out_logits, out_ext_v, out_int_v, out_z_ach = net(
+                            seq_obs, mb_H=seq_H, mb_prev_h=h_0, worker_z_target=seq_z, 
+                            mb_S_M_next=seq_S_M_next, is_bptt=True, seq_dones=seq_dones
+                        )
                     
                     mb_loss = torch.tensor(0.0, device=device)
                     seq_active_frames = 0
                     
-                    # Backpropagation Through Time loop
                     for t_offset in range(SEQ_LEN):
                         curr_ts = [st + t_offset for st in start_ts]
                         
-                        t_obs = buf['obs'][curr_ts, envs, agts].to(dtype=torch.bfloat16)
                         t_act = buf['actions'][curr_ts, envs, agts].long()
                         t_logprobs = buf['logprobs'][curr_ts, envs, agts]
                         t_ext_adv = buf['ext_advantages'][curr_ts, envs, agts]
@@ -1218,169 +1243,150 @@ def main():
                         t_int_ret = buf['int_returns'][curr_ts, envs, agts]
                         t_sparse = buf['sparse_masks'][curr_ts, envs, agts]
                         t_z = buf['z'][curr_ts, envs, agts]
-                        t_H = buf['H'][curr_ts, envs, agts]
-                        t_S_M_next = buf['S_M_next'][curr_ts, envs, agts]
                         t_masks = buf['masks'][curr_ts, envs, agts]
-                        t_dones = buf['dones'][curr_ts, envs, agts].unsqueeze(-1)
                         
                         if not t_masks.any():
                             continue
 
-                        if t_offset > 0:
-                            prev_dones = buf['dones'][[st + t_offset - 1 for st in start_ts], envs, agts]
-                            prev_dones = prev_dones.view(-1, 1, 1).to(h_t.dtype)
-                            h_t = h_t * (1.0 - prev_dones)
+                        active_idx = torch.where(t_masks)[0]
+                        
+                        if active_idx.shape[0] > 0:
+                            seq_active_frames += active_idx.shape[0]
+                            
+                            active_logits = out_logits[t_offset][active_idx]
+                            active_predicted_z = out_pred_z[t_offset][active_idx]
+                            active_z_achieved_raw = out_z_ach[t_offset][active_idx]
+                            active_t_z = t_z[active_idx].to(torch.bfloat16)
+                            active_ext_values_pred = out_ext_v[t_offset][active_idx]
+                            active_int_values_pred = out_int_v[t_offset][active_idx]
+                            
+                            active_t_obs = buf['obs'][curr_ts, envs, agts].to(dtype=torch.bfloat16)[active_idx]
+                            active_t_act = t_act[active_idx]
+                            active_t_logprobs = t_logprobs[active_idx]
+                            active_t_ext_adv = t_ext_adv[active_idx]
+                            active_t_int_adv = t_int_adv[active_idx]
+                            active_t_ext_ret = t_ext_ret[active_idx]
+                            active_t_int_ret = t_int_ret[active_idx]
+                            active_t_sparse = t_sparse[active_idx]
+                            
+                            active_logits = torch.nan_to_num(active_logits, nan=0.0, posinf=50.0, neginf=-50.0)
+                            active_logits = torch.clamp(active_logits, min=-50.0, max=50.0)
+                            z_achieved = active_z_achieved_raw.float()
 
-                        with torch.autocast(device_type='cuda', dtype=torch.bfloat16):
-                            live_S_M, predicted_z, next_h, logits, ext_values_pred, int_values_pred, z_achieved_raw = net(
-                                t_obs, t_H, h_t, t_z.to(torch.bfloat16), bc_mode=False, mb_S_M_next=t_S_M_next
+                            intrinsic_reward = F.cosine_similarity(z_achieved, active_t_z.detach().float(), dim=-1)
+                            epoch_intrinsic_reward_sum += intrinsic_reward.detach().mean().item()
+
+                            flat_mb_z_det = active_t_z.view(-1, 512).float().detach()
+                            flat_z_achieved = z_achieved.view(-1, 512)
+                            flat_predicted_z = active_predicted_z.view(-1, 512).float()
+                            flat_z_achieved_det = flat_z_achieved.detach()
+
+                            norm_predicted_z = F.normalize(flat_predicted_z, p=2, dim=1)
+                            norm_z_achieved_det = F.normalize(flat_z_achieved_det, p=2, dim=1)
+                            
+                            norm_z_achieved = F.normalize(flat_z_achieved, p=2, dim=1)
+                            norm_mb_z_det = F.normalize(flat_mb_z_det, p=2, dim=1)
+                            
+                            temperature = 0.5
+                            
+                            logits_mgr = torch.matmul(norm_predicted_z, norm_z_achieved_det.T) / temperature
+                            logits_inv = torch.matmul(norm_z_achieved, norm_mb_z_det.T) / temperature
+                            
+                            N = flat_predicted_z.size(0)
+                            labels = torch.arange(N, dtype=torch.long, device=device)
+                            
+                            manager_loss = F.cross_entropy(logits_mgr, labels)
+                            inverse_model_loss = F.cross_entropy(logits_inv, labels)
+                            
+                            z_variance = active_z_achieved_raw.var(dim=0).mean().detach() if active_z_achieved_raw.size(0) > 1 else torch.tensor(0.0, device=device)
+
+                            epoch_inv_loss_sum += inverse_model_loss.detach().item()
+                            epoch_z_var_sum += z_variance.item()
+                            
+                            v_loss = F.huber_loss(active_ext_values_pred, active_t_ext_ret.float(), delta=10.0) + F.huber_loss(active_int_values_pred, active_t_int_ret.float(), delta=10.0)
+                            distance_penalty = F.mse_loss(active_t_z.detach(), z_achieved.detach())
+                            
+                            is_active, packed_masks, padded_idx, max_act_live = rebuild_packed_masks(
+                                active_t_sparse, MAP_PROVINCES, VOCAB_SIZE, NONE_IDX, device
                             )
                             
-                            active_idx = torch.where(t_masks)[0]
+                            B_live, max_act_live = padded_idx.shape
                             
-                            if active_idx.shape[0] > 0:
-                                seq_active_frames += active_idx.shape[0]
+                            pg_loss = torch.tensor(0.0, device=device)
+                            entropy = torch.tensor(0.0, device=device)
+                            bc_kl_penalty = torch.tensor(0.0, device=device)
+                            kl_divergence = torch.tensor(0.0, device=device)
+                            
+                            if max_act_live > 0:
+                                b_idx_live = torch.arange(B_live, device=device).view(B_live, 1).expand(B_live, max_act_live)
                                 
-                                active_logits = logits[active_idx]
-                                active_predicted_z = predicted_z[active_idx]
-                                active_z_achieved_raw = z_achieved_raw[active_idx]
-                                active_t_z = t_z[active_idx].to(torch.bfloat16)
-                                active_ext_values_pred = ext_values_pred[active_idx]
-                                active_int_values_pred = int_values_pred[active_idx]
+                                step_active_logits = active_logits[b_idx_live, padded_idx, :].float()
+                                step_active_logits = step_active_logits.masked_fill(~packed_masks, -1e20)
                                 
-                                active_t_obs = t_obs[active_idx]
-                                active_t_act = t_act[active_idx]
-                                active_t_logprobs = t_logprobs[active_idx]
-                                active_t_ext_adv = t_ext_adv[active_idx]
-                                active_t_int_adv = t_int_adv[active_idx]
-                                active_t_ext_ret = t_ext_ret[active_idx]
-                                active_t_int_ret = t_int_ret[active_idx]
-                                active_t_sparse = t_sparse[active_idx]
+                                seq_lens = is_active.sum(dim=1)
+                                valid_pack_mask = torch.arange(max_act_live, device=device).unsqueeze(0) < seq_lens.unsqueeze(1)
+                                step_active_logits = step_active_logits.masked_fill(~valid_pack_mask.unsqueeze(-1), 0.0)
                                 
-                                active_logits = torch.nan_to_num(active_logits, nan=0.0, posinf=50.0, neginf=-50.0)
-                                active_logits = torch.clamp(active_logits, min=-50.0, max=50.0)
-                                z_achieved = active_z_achieved_raw.float()
+                                dist_cat = Categorical(logits=step_active_logits)
+                                packed_actions = torch.gather(active_t_act, 1, padded_idx)
+                                new_logprobs = dist_cat.log_prob(packed_actions)
 
-                                intrinsic_reward = F.cosine_similarity(z_achieved, active_t_z.detach().float(), dim=-1)
-                                epoch_intrinsic_reward_sum += intrinsic_reward.detach().mean().item()
+                                new_logprobs = torch.clamp(new_logprobs, min=-30.0)
+                                old_logprobs_packed = torch.clamp(torch.gather(active_t_logprobs, 1, padded_idx), min=-30.0)
 
-                                flat_mb_z_det = active_t_z.view(-1, 512).float().detach()
-                                flat_z_achieved = z_achieved.view(-1, 512)
-                                flat_predicted_z = active_predicted_z.view(-1, 512).float()
-                                flat_z_achieved_det = flat_z_achieved.detach()
+                                log_ratio = new_logprobs - old_logprobs_packed
+                                ratio = torch.exp(log_ratio)
 
-                                norm_predicted_z = F.normalize(flat_predicted_z, p=2, dim=1)
-                                norm_z_achieved_det = F.normalize(flat_z_achieved_det, p=2, dim=1)
-                                
-                                norm_z_achieved = F.normalize(flat_z_achieved, p=2, dim=1)
-                                norm_mb_z_det = F.normalize(flat_mb_z_det, p=2, dim=1)
-                                
-                                temperature = 0.5
-                                
-                                logits_mgr = torch.matmul(norm_predicted_z, norm_z_achieved_det.T) / temperature
-                                logits_inv = torch.matmul(norm_z_achieved, norm_mb_z_det.T) / temperature
-                                
-                                N = flat_predicted_z.size(0)
-                                labels = torch.arange(N, dtype=torch.long, device=device)
-                                
-                                manager_loss = F.cross_entropy(logits_mgr, labels)
-                                inverse_model_loss = F.cross_entropy(logits_inv, labels)
-                                
-                                z_variance = active_z_achieved_raw.var(dim=0).mean().detach() if active_z_achieved_raw.size(0) > 1 else torch.tensor(0.0, device=device)
+                                valid_ratio_mask = (packed_actions != NONE_IDX) & valid_pack_mask
 
-                                epoch_inv_loss_sum += inverse_model_loss.detach().item()
-                                epoch_z_var_sum += z_variance.item()
-                                
-                                v_loss = F.huber_loss(active_ext_values_pred, active_t_ext_ret.float(), delta=10.0) + F.huber_loss(active_int_values_pred, active_t_int_ret.float(), delta=10.0)
-                                distance_penalty = F.mse_loss(active_t_z.detach(), z_achieved.detach())
-                                
-                                is_active, packed_masks, padded_idx, max_act_live = rebuild_packed_masks(
-                                    active_t_sparse, MAP_PROVINCES, VOCAB_SIZE, NONE_IDX, device
-                                )
-                                
-                                B_live, max_act_live = padded_idx.shape
-                                
-                                pg_loss = torch.tensor(0.0, device=device)
-                                entropy = torch.tensor(0.0, device=device)
-                                bc_kl_penalty = torch.tensor(0.0, device=device)
-                                kl_divergence = torch.tensor(0.0, device=device)
-                                
-                                if max_act_live > 0:
-                                    b_idx_live = torch.arange(B_live, device=device).view(B_live, 1).expand(B_live, max_act_live)
+                                if valid_ratio_mask.any():
+                                    worker_adv = (active_t_ext_adv + (current_c_int * active_t_int_adv)).unsqueeze(1)
                                     
-                                    step_active_logits = active_logits[b_idx_live, padded_idx, :].float()
-                                    step_active_logits = step_active_logits.masked_fill(~packed_masks, -1e20)
+                                    surr1 = ratio * worker_adv
+                                    surr2 = torch.clamp(ratio, 1.0 - args.clip_coef, 1.0 + args.clip_coef) * worker_adv
                                     
-                                    seq_lens = is_active.sum(dim=1)
-                                    valid_pack_mask = torch.arange(max_act_live, device=device).unsqueeze(0) < seq_lens.unsqueeze(1)
-                                    step_active_logits = step_active_logits.masked_fill(~valid_pack_mask.unsqueeze(-1), 0.0)
+                                    pg_loss = -torch.min(surr1, surr2)[valid_ratio_mask].mean()
+                                    entropy = dist_cat.entropy()[valid_ratio_mask].mean()
                                     
-                                    dist_cat = Categorical(logits=step_active_logits)
-                                    packed_actions = torch.gather(active_t_act, 1, padded_idx)
-                                    new_logprobs = dist_cat.log_prob(packed_actions)
+                                    with torch.no_grad(), torch.autocast(device_type='cuda', dtype=torch.bfloat16):
+                                        bc_active_logits = seq_bc_logits[t_offset][active_idx]
 
-                                    new_logprobs = torch.clamp(new_logprobs, min=-30.0)
-                                    old_logprobs_packed = torch.clamp(torch.gather(active_t_logprobs, 1, padded_idx), min=-30.0)
-
-                                    log_ratio = new_logprobs - old_logprobs_packed
-                                    ratio = torch.exp(log_ratio)
-
-                                    valid_ratio_mask = (packed_actions != NONE_IDX) & valid_pack_mask
-
-                                    if valid_ratio_mask.any():
-                                        worker_adv = (active_t_ext_adv + (current_c_int * active_t_int_adv)).unsqueeze(1)
+                                        bc_active_logits = bc_active_logits[b_idx_live, padded_idx, :].float()
+                                        bc_active_logits = bc_active_logits.masked_fill(~packed_masks, -1e20)
+                                        bc_active_logits = bc_active_logits.masked_fill(~valid_pack_mask.unsqueeze(-1), 0.0)
                                         
-                                        surr1 = ratio * worker_adv
-                                        surr2 = torch.clamp(ratio, 1.0 - args.clip_coef, 1.0 + args.clip_coef) * worker_adv
+                                        bc_dist = Categorical(logits=bc_active_logits)
+                                        bc_logprobs = bc_dist.log_prob(packed_actions)
+                                        bc_logprobs = torch.clamp(bc_logprobs, min=-20.0)
                                         
-                                        pg_loss = -torch.min(surr1, surr2)[valid_ratio_mask].mean()
-                                        entropy = dist_cat.entropy()[valid_ratio_mask].mean()
-                                        
-                                        with torch.no_grad():
-                                            bc_z = torch.zeros_like(active_t_z)
-                                            bc_logits, _ = bc_baseline_net.worker(active_t_obs, bc_z, bc_baseline_net.D)
+                                    kl_divergence = 0.5 * (log_ratio ** 2)[valid_ratio_mask].mean()
+                                    
+                                    kl_div_vector = new_logprobs - bc_logprobs
+                                    raw_bc_kl = kl_div_vector[valid_ratio_mask].mean()
+                                    progress = min(1.0, update / 100.0) 
+                                    dynamic_target_kl = 0.02 + (0.48 * progress) 
+                                    
+                                    bc_kl_penalty = F.relu(raw_bc_kl - dynamic_target_kl)
+
+                            unscaled_loss = (pg_loss 
+                                            - (args.ent_coef * entropy) 
+                                            + (0.05 * manager_loss) 
+                                            + (0.05 * inverse_model_loss)
+                                            + (args.bc_kl_coef * bc_kl_penalty) 
+                                            + (args.v_coef * v_loss))
                                             
-                                            bc_logits = torch.nan_to_num(bc_logits, nan=0.0, posinf=50.0, neginf=-50.0)
-                                            bc_logits = torch.clamp(bc_logits, min=-50.0, max=50.0)
+                            mb_loss = mb_loss + unscaled_loss
 
-                                            bc_active_logits = bc_logits[b_idx_live, padded_idx, :].float()
-                                            bc_active_logits = bc_active_logits.masked_fill(~packed_masks, -1e20)
-                                            bc_active_logits = bc_active_logits.masked_fill(~valid_pack_mask.unsqueeze(-1), 0.0)
-                                            
-                                            bc_dist = Categorical(logits=bc_active_logits)
-                                            bc_logprobs = bc_dist.log_prob(packed_actions)
-                                            bc_logprobs = torch.clamp(bc_logprobs, min=-20.0)
-                                            
-                                        kl_divergence = 0.5 * (log_ratio ** 2)[valid_ratio_mask].mean()
-                                        
-                                        kl_div_vector = new_logprobs - bc_logprobs
-                                        raw_bc_kl = kl_div_vector[valid_ratio_mask].mean()
-                                        progress = min(1.0, update / 100.0) 
-                                        dynamic_target_kl = 0.02 + (0.48 * progress) 
-                                        
-                                        bc_kl_penalty = F.relu(raw_bc_kl - dynamic_target_kl)
-
-                                unscaled_loss = (pg_loss 
-                                                - (args.ent_coef * entropy) 
-                                                + (0.05 * manager_loss) 
-                                                + (0.05 * inverse_model_loss)
-                                                + (args.bc_kl_coef * bc_kl_penalty) 
-                                                + (args.v_coef * v_loss))
-                                                
-                                mb_loss = mb_loss + unscaled_loss
-
-                                epoch_pg_loss_sum += pg_loss.detach().item()
-                                epoch_manager_loss_sum += manager_loss.detach().item()
-                                epoch_feasibility_error_sum += distance_penalty.detach().mean().item()
-                                epoch_bc_kl_sum += bc_kl_penalty.detach().item() 
-                                epoch_entropy_sum += entropy.detach().item()
-                                epoch_total_loss_sum += unscaled_loss.detach().item()
-                                track_steps += 1
-                                
-                                epoch_kl_sum += kl_divergence.detach()
-                                epoch_kl_steps += 1
-
-                        h_t = next_h 
+                            epoch_pg_loss_sum += pg_loss.detach().item()
+                            epoch_manager_loss_sum += manager_loss.detach().item()
+                            epoch_feasibility_error_sum += distance_penalty.detach().mean().item()
+                            epoch_bc_kl_sum += bc_kl_penalty.detach().item() 
+                            epoch_entropy_sum += entropy.detach().item()
+                            epoch_total_loss_sum += unscaled_loss.detach().item()
+                            track_steps += 1
+                            
+                            epoch_kl_sum += kl_divergence.detach()
+                            epoch_kl_steps += 1
 
                     if seq_active_frames > 0:
                         current_block_start = (step_idx // accum_steps) * accum_steps

@@ -539,7 +539,10 @@ class FeudalDiplomacyAgent(nn.Module):
         logits, _ = self.worker(S_mu_raw, z_zero, self.D)
         return logits
 
-    def forward(self, mb_obs, mb_H=None, mb_prev_h=None, worker_z_target=None, bc_mode=False, mb_S_M_next=None):
+    def forward(self, mb_obs, mb_H=None, mb_prev_h=None, worker_z_target=None, bc_mode=False, mb_S_M_next=None, is_bptt=False, seq_dones=None):
+        if is_bptt:
+            return self._forward_bptt(mb_obs, mb_H, mb_prev_h, worker_z_target, mb_S_M_next, seq_dones)
+            
         if bc_mode:
             B = mb_obs.size(0)
             z_zero = torch.zeros((B, 8, self.worker.d_model), device=mb_obs.device, dtype=mb_obs.dtype)
@@ -562,6 +565,61 @@ class FeudalDiplomacyAgent(nn.Module):
             return S_M, predicted_z, predicted_h, logits, ext_values_pred, int_values_pred, z_achieved_raw
         
         return S_M, predicted_z, predicted_h, logits, ext_values_pred, int_values_pred
+
+    def _forward_bptt(self, seq_obs, seq_H, h_0, seq_z_target, seq_S_M_next, seq_dones):
+        """Executes batched spatial encoding with sequential GRU for BPTT."""
+        SEQ_LEN, B = seq_obs.shape[:2]
+        
+        flat_obs = seq_obs.view(SEQ_LEN * B, *seq_obs.shape[2:])
+        flat_z_target = seq_z_target.view(SEQ_LEN * B, *seq_z_target.shape[2:])
+        
+        x_emb = self.worker.feature_projection(flat_obs)
+        if x_emb.requires_grad:
+            S_mu_encoded = checkpoint.checkpoint(self.worker.encoder_transformer, x_emb, use_reentrant=False)
+        else:
+            S_mu_encoded = self.worker.encoder_transformer(x_emb)
+            
+        S_M = self.pooler(S_mu_encoded)
+        
+        # Tactical worker completion
+        strat_context, _ = self.worker.strategy_cross_attn(query=S_mu_encoded, key=flat_z_target, value=flat_z_target)
+        S_mu_strat = self.worker.strategy_norm(S_mu_encoded + strat_context)
+        decoder_out = self.worker.decoder_layer(S_mu_strat, self.D)
+        flat_logits = self.worker.action_head(decoder_out)
+        
+        # Batched Value Heads
+        pooled_S_M = S_M.detach().mean(dim=1) 
+        flat_ext_v = self.extrinsic_value_head(pooled_S_M).squeeze(-1).float()
+        flat_int_v = self.intrinsic_value_head(pooled_S_M).squeeze(-1).float()
+        
+        # Batched Inverse Model
+        flat_S_M_next = seq_S_M_next.view(SEQ_LEN * B, *seq_S_M_next.shape[2:])
+        flat_z_ach = self.inverse_model(S_M, flat_S_M_next)
+        
+        # Reshape everything back to sequences
+        S_M_seq = S_M.view(SEQ_LEN, B, 8, 512)
+        out_logits = flat_logits.view(SEQ_LEN, B, 82, -1)
+        out_ext_v = flat_ext_v.view(SEQ_LEN, B)
+        out_int_v = flat_int_v.view(SEQ_LEN, B)
+        out_z_ach = flat_z_ach.view(SEQ_LEN, B, 8, 512)
+        
+        h_t = h_0
+        out_pred_z = []
+        out_next_h = []
+        
+        for t in range(SEQ_LEN):
+            if t > 0 and seq_dones is not None:
+                h_t = h_t * (1.0 - seq_dones[t-1].view(B, 1, 1).to(h_t.dtype))
+                
+            predicted_z, h_t = self.manager(S_M_seq[t], seq_H[t], h_t)
+            
+            out_pred_z.append(predicted_z)
+            out_next_h.append(h_t)
+            
+        return (
+            S_M_seq, torch.stack(out_pred_z), torch.stack(out_next_h),
+            out_logits, out_ext_v, out_int_v, out_z_ach
+        )
 
     def step(self, S_mu_raw, H_t, h_prev):
         x_emb = self.worker.feature_projection(S_mu_raw)
