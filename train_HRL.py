@@ -900,6 +900,9 @@ def main():
         if global_rank == 0:
             print(f"Successfully resumed RL training from checkpoint: {args.resume_weights}")
 
+    for param in net.inverse_model.parameters():
+        param.requires_grad = False
+
     net = DDP(net, device_ids=[local_rank], find_unused_parameters=False, bucket_cap_mb=256, broadcast_buffers=False)
 
     manager_params = []
@@ -1164,7 +1167,6 @@ def main():
         epoch_entropy_sum = 0.0
         epoch_total_loss_sum = 0.0
         epoch_intrinsic_reward_sum = 0.0
-        epoch_inv_loss_sum = 0.0
         epoch_z_var_sum = 0.0
         epoch_inv_grad_norm_sum = 0.0
         warmup_end = 11
@@ -1296,10 +1298,8 @@ def main():
                             labels = torch.arange(N_batch, dtype=torch.long, device=device)
                             
                             logits_mgr = torch.matmul(norm_pred_z, norm_z_ach.detach().T) / temperature
-                            logits_inv = torch.matmul(norm_z_ach, norm_t_z.T) / temperature
                             
                             manager_loss = F.cross_entropy(logits_mgr, labels)
-                            inverse_model_loss = F.cross_entropy(logits_inv, labels)
 
                             cos_sim = F.cosine_similarity(norm_pred_z, norm_z_ach.detach(), dim=-1)
                             cos_sim_per_agent = cos_sim.view(-1, 8).mean(dim=1)
@@ -1339,15 +1339,18 @@ def main():
                                 joint_new_logprobs = new_logprobs_masked.sum(dim=1)
                                 joint_old_logprobs = old_logprobs_masked.sum(dim=1)
 
-                                log_ratio = joint_new_logprobs - joint_old_logprobs
+                                log_ratio = new_logprobs_masked - old_logprobs_masked
                                 ratio = torch.exp(log_ratio)
-
-                                worker_adv = (active_t_ext_adv + (current_c_int * active_t_int_adv))
+                                
+                                worker_adv = (active_t_ext_adv + (current_c_int * active_t_int_adv)).unsqueeze(1)
                                 
                                 surr1 = ratio * worker_adv
                                 surr2 = torch.clamp(ratio, 1.0 - args.clip_coef, 1.0 + args.clip_coef) * worker_adv
                                 
-                                pg_loss = -torch.min(surr1, surr2).mean()
+                                action_pg_loss = -torch.min(surr1, surr2)
+                                action_pg_loss = action_pg_loss.masked_fill(~valid_pack_mask, 0.0)
+                                
+                                pg_loss = action_pg_loss.sum(dim=1).mean()
                                 
                                 entropy_masked = dist_cat.entropy().masked_fill(~valid_pack_mask, 0.0)
                                 entropy = entropy_masked.sum(dim=1).mean()
@@ -1376,14 +1379,12 @@ def main():
                                             + (args.bc_kl_coef * bc_kl_penalty) 
                                             + (args.v_coef * v_loss)
                                             + (0.05 * manager_loss)
-                                            + (0.05 * inverse_model_loss)
                                             + (0.1 * manager_pg_loss))
                                             
                             mb_loss = mb_loss + (unscaled_loss / SEQ_LEN)
 
                             epoch_pg_loss_sum += pg_loss.detach().item()
                             epoch_manager_loss_sum += manager_loss.detach().item()
-                            epoch_inv_loss_sum += inverse_model_loss.detach().item()
                             epoch_feasibility_error_sum += distance_penalty.detach().item()
                             epoch_bc_kl_sum += bc_kl_penalty.detach().item() 
                             epoch_entropy_sum += entropy.detach().item()
@@ -1435,7 +1436,6 @@ def main():
             epoch_entropy_sum / max(1, track_steps),
             epoch_total_loss_sum / max(1, track_steps),
             epoch_intrinsic_reward_sum / max(1, track_steps),
-            epoch_inv_loss_sum / max(1, track_steps),
             epoch_z_var_sum / max(1, track_steps),
             epoch_inv_grad_norm_sum / max(1, track_steps),
             worker_stats[4].item(), 
@@ -1443,7 +1443,7 @@ def main():
         ], dtype=torch.float32, device=device)
 
         dist.all_reduce(local_metrics, op=dist.ReduceOp.SUM)
-        global_metrics = local_metrics[:10] / dist.get_world_size()
+        global_metrics = local_metrics[:9] / dist.get_world_size()
 
         avg_pg_loss = global_metrics[0].item()
         avg_manager_loss = global_metrics[1].item()
@@ -1452,11 +1452,10 @@ def main():
         avg_entropy = global_metrics[4].item()
         avg_total_loss = global_metrics[5].item()
         avg_intrinsic_reward = global_metrics[6].item()
-        avg_inv_loss = global_metrics[7].item()
-        avg_z_var = global_metrics[8].item()
-        avg_inv_grad_norm = global_metrics[9].item()
-        global_ep_reward_sum = local_metrics[10].item()
-        global_ep_count = local_metrics[11].item()
+        avg_z_var = global_metrics[7].item()
+        avg_inv_grad_norm = global_metrics[8].item()
+        global_ep_reward_sum = local_metrics[9].item()
+        global_ep_count = local_metrics[10].item()
 
         if global_ep_count > 0:
             last_avg_ep_reward = global_ep_reward_sum / global_ep_count
@@ -1474,7 +1473,7 @@ def main():
             
             print(f"Update {update}/{args.num_updates} | SPS: {sps} | Extrinsic Step: {avg_extrinsic_step_reward:.2f} | Intrinsic Step: {avg_intrinsic_step_reward:.4f} | Total Step: {avg_total_step_reward:.2f}")
             print(f"  CPU Time: {env_step_time:.2f}s | GPU Fwd: {gpu_forward_time:.2f}s | Bwd: {update_time:.2f}s | Full Update: {full_update_duration:.2f}s")
-            print(f"  Losses -> Total: {avg_total_loss:.4f} | PG: {avg_pg_loss:.4f} | Mgr(InfoNCE): {avg_manager_loss:.4f} | Inv(InfoNCE): {avg_inv_loss:.4f}")
+            print(f"  Losses -> Total: {avg_total_loss:.4f} | PG: {avg_pg_loss:.4f} | Mgr(InfoNCE): {avg_manager_loss:.4f}")
             print(f"  Metrics -> Feasibility Err: {avg_feasibility_error:.4f} | BC_KL: {avg_bc_kl:.4f} | Z_Var: {avg_z_var:.4f}")
             print(f"  Legality Audit: {proposed_actions - illegal_dropped}/{proposed_actions} legal actions ({illegal_rate:.1f}% illegal)")
             print(f"  Avg Episode Return: {last_avg_ep_reward:.2f} (Completed {int(global_ep_count)} episodes this update)")
@@ -1490,7 +1489,6 @@ def main():
             writer.add_scalar("Loss/BC_KL_Penalty", avg_bc_kl, update)
             writer.add_scalar("Loss/Entropy", avg_entropy, update)
             writer.add_scalar("Metrics/Illegal_Action_Rate", illegal_rate, update)
-            writer.add_scalar("Loss/Inverse_Model_InfoNCE", avg_inv_loss, update)
             writer.add_scalar("Metrics/Z_Achieved_Variance", avg_z_var, update)
             writer.add_scalar("Metrics/Inverse_Grad_Norm", avg_inv_grad_norm, update)
             writer.add_scalar("Hyperparameters/C_INT", current_c_int, update)
@@ -1509,7 +1507,6 @@ def main():
                 "Loss/Entropy": avg_entropy,
                 "Loss/KL_Div": global_avg_kl,
                 "Metrics/Illegal_Action_Rate": illegal_rate,
-                "Loss/Inverse_Model_InfoNCE": avg_inv_loss,
                 "Metrics/Z_Achieved_Variance": avg_z_var,
                 "Metrics/Inverse_Grad_Norm": avg_inv_grad_norm,
                 "Hyperparameters/C_INT": current_c_int,

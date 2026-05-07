@@ -395,6 +395,8 @@ class TacticalWorker(nn.Module):
         self.d_model = d_model
         
         self.feature_projection = nn.Linear(FEATURE_DIM, d_model)
+        num_provs = len(GLOBAL_PROVINCES)
+        self.pos_embedding = nn.Parameter(torch.randn(1, num_provs, d_model))
         encoder_layer = nn.TransformerEncoderLayer(d_model=d_model, nhead=16, batch_first=True, norm_first=True)
         self.encoder_transformer = nn.TransformerEncoder(encoder_layer, num_layers=16, enable_nested_tensor=False)
         
@@ -406,7 +408,7 @@ class TacticalWorker(nn.Module):
 
     def forward(self, S_mu_raw, z_t, distance_matrix_D):
         B, L, _ = S_mu_raw.size()
-        x_emb = self.feature_projection(S_mu_raw)
+        x_emb = self.feature_projection(S_mu_raw) + self.pos_embedding
         
         if x_emb.requires_grad:
             S_mu_encoded = checkpoint.checkpoint(
@@ -595,8 +597,9 @@ class FeudalDiplomacyAgent(nn.Module):
         S_M_seq = S_M.view(SEQ_LEN, B, 8, 512)
         
         live_S_M_next = torch.empty_like(S_M_seq)
-        live_S_M_next[:-1] = S_M_seq[1:].detach() 
-        live_S_M_next[-1] = seq_S_M_next[-1] 
+        done_mask = 1.0 - seq_dones[:-1].view(-1, B, 1, 1).to(live_S_M_next.dtype)
+        live_S_M_next[:-1] = S_M_seq[1:].detach() * done_mask
+        live_S_M_next[-1] = seq_S_M_next[-1]
         
         flat_live_S_M_next = live_S_M_next.view(SEQ_LEN * B, 8, 512)
         flat_z_ach = self.inverse_model(S_M, flat_live_S_M_next)
@@ -821,9 +824,10 @@ class DiplomacyTransformerEnv(ParallelEnv):
             observations[a] = self.state_history[a].copy()
         
         is_done = False
+        is_truncated = False
         if self.step_count >= 100: 
-            is_done = True
-            
+            is_truncated = True
+
         current_state_dict = self.game.get_state()
         current_phase = self.game.get_current_phase()
         all_map_scs = self.game.map.scs
@@ -911,6 +915,8 @@ class DiplomacyTransformerEnv(ParallelEnv):
             
             if is_done or len(current_scs) >= 18 or (len(current_scs) == 0 and len(agent_units) == 0):
                 terminations[agent] = True
+            elif is_truncated:
+                truncations[agent] = True
 
         infos = {a: {
             'action_mask': get_sparse_action_mask(self.game, a, self.provinces, self.order_to_idx), 
