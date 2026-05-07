@@ -1302,7 +1302,8 @@ def main():
                             inverse_model_loss = F.cross_entropy(logits_inv, labels)
 
                             cos_sim = F.cosine_similarity(norm_pred_z, norm_z_ach.detach(), dim=-1)
-                            manager_pg_loss = -(active_t_ext_adv.detach() * cos_sim).mean()
+                            cos_sim_per_agent = cos_sim.view(-1, 8).mean(dim=1)
+                            manager_pg_loss = -(active_t_ext_adv.detach() * cos_sim_per_agent).mean()
 
                             is_active, packed_masks, padded_idx, max_act_live = rebuild_packed_masks(
                                 active_t_sparse, MAP_PROVINCES, VOCAB_SIZE, NONE_IDX, device
@@ -1331,40 +1332,44 @@ def main():
 
                                 new_logprobs = torch.clamp(new_logprobs, min=-30.0)
                                 old_logprobs_packed = torch.clamp(torch.gather(active_t_logprobs, 1, padded_idx), min=-30.0)
+                                
+                                new_logprobs_masked = new_logprobs.masked_fill(~valid_pack_mask, 0.0)
+                                old_logprobs_masked = old_logprobs_packed.masked_fill(~valid_pack_mask, 0.0)
+                                
+                                joint_new_logprobs = new_logprobs_masked.sum(dim=1)
+                                joint_old_logprobs = old_logprobs_masked.sum(dim=1)
 
-                                log_ratio = new_logprobs - old_logprobs_packed
+                                log_ratio = joint_new_logprobs - joint_old_logprobs
                                 ratio = torch.exp(log_ratio)
 
-                                valid_ratio_mask = (packed_actions != NONE_IDX) & valid_pack_mask
-
-                                if valid_ratio_mask.any():
-                                    worker_adv = (active_t_ext_adv + (current_c_int * active_t_int_adv)).unsqueeze(1)
+                                worker_adv = (active_t_ext_adv + (current_c_int * active_t_int_adv))
+                                
+                                surr1 = ratio * worker_adv
+                                surr2 = torch.clamp(ratio, 1.0 - args.clip_coef, 1.0 + args.clip_coef) * worker_adv
+                                
+                                pg_loss = -torch.min(surr1, surr2).mean()
+                                
+                                entropy_masked = dist_cat.entropy().masked_fill(~valid_pack_mask, 0.0)
+                                entropy = entropy_masked.sum(dim=1).mean()
+                                
+                                with torch.no_grad(), torch.autocast(device_type='cuda', dtype=torch.bfloat16):
+                                    bc_active_logits = seq_bc_logits[t_offset][active_idx]
+                                    bc_active_logits = bc_active_logits[b_idx_live, padded_idx, :].float()
+                                    bc_active_logits = bc_active_logits.masked_fill(~packed_masks, -1e20)
+                                    bc_active_logits = bc_active_logits.masked_fill(~valid_pack_mask.unsqueeze(-1), 0.0)
                                     
-                                    surr1 = ratio * worker_adv
-                                    surr2 = torch.clamp(ratio, 1.0 - args.clip_coef, 1.0 + args.clip_coef) * worker_adv
+                                    bc_dist = Categorical(logits=bc_active_logits)
                                     
-                                    pg_loss = -torch.min(surr1, surr2)[valid_ratio_mask].mean()
-                                    entropy = dist_cat.entropy()[valid_ratio_mask].mean()
-                                    
-                                    with torch.no_grad(), torch.autocast(device_type='cuda', dtype=torch.bfloat16):
-                                        bc_active_logits = seq_bc_logits[t_offset][active_idx]
-
-                                        bc_active_logits = bc_active_logits[b_idx_live, padded_idx, :].float()
-                                        bc_active_logits = bc_active_logits.masked_fill(~packed_masks, -1e20)
-                                        bc_active_logits = bc_active_logits.masked_fill(~valid_pack_mask.unsqueeze(-1), 0.0)
-                                        
-                                        bc_dist = Categorical(logits=bc_active_logits)
-                                        bc_logprobs = bc_dist.log_prob(packed_actions)
-                                        bc_logprobs = torch.clamp(bc_logprobs, min=-20.0)
-                                        
-                                    kl_divergence = 0.5 * (log_ratio ** 2)[valid_ratio_mask].mean()
-                                    
-                                    exact_kl = torch.distributions.kl.kl_divergence(dist_cat, bc_dist)
-                                    raw_bc_kl = exact_kl[valid_pack_mask].mean()
-                                    progress = min(1.0, update / 100.0) 
-                                    dynamic_target_kl = 0.02 + (0.48 * progress) 
-                                    
-                                    bc_kl_penalty = F.relu(raw_bc_kl - dynamic_target_kl)
+                                kl_divergence = 0.5 * (log_ratio ** 2).mean()
+                                
+                                exact_kl = torch.distributions.kl.kl_divergence(dist_cat, bc_dist)
+                                exact_kl_masked = exact_kl.masked_fill(~valid_pack_mask, 0.0)
+                                raw_bc_kl = exact_kl_masked.sum(dim=1).mean()
+                                
+                                progress = min(1.0, update / 100.0) 
+                                dynamic_target_kl = 0.02 + (0.48 * progress) 
+                                
+                                bc_kl_penalty = F.relu(raw_bc_kl - dynamic_target_kl)
 
                             unscaled_loss = (pg_loss 
                                             - (args.ent_coef * entropy) 

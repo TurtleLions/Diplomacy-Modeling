@@ -556,7 +556,7 @@ class FeudalDiplomacyAgent(nn.Module):
         predicted_z, predicted_h = self.manager(S_M, mb_H, mb_prev_h)
         z_for_worker = worker_z_target if worker_z_target is not None else predicted_z
         logits, _ = self.worker(mb_obs, z_for_worker, self.D)
-        pooled_S_M = S_M.detach().mean(dim=1)
+        pooled_S_M = S_M.mean(dim=1)
         ext_values_pred = self.extrinsic_value_head(pooled_S_M).squeeze(-1).float()
         int_values_pred = self.intrinsic_value_head(pooled_S_M).squeeze(-1).float()
 
@@ -588,7 +588,7 @@ class FeudalDiplomacyAgent(nn.Module):
         flat_logits = self.worker.action_head(decoder_out)
         
         # Batched Value Heads
-        pooled_S_M = S_M.detach().mean(dim=1) 
+        pooled_S_M = S_M.mean(dim=1)
         flat_ext_v = self.extrinsic_value_head(pooled_S_M).squeeze(-1).float()
         flat_int_v = self.intrinsic_value_head(pooled_S_M).squeeze(-1).float()
         
