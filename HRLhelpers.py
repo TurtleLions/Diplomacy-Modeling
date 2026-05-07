@@ -388,13 +388,33 @@ class GraphBiasedAttentionBlock(nn.Module):
         out = torch.matmul(attn, v).transpose(1, 2).reshape(B, L, self.d_model)
         return self.out_proj(out)
 
+class DiplomaticBottleneckProjection(nn.Module):
+    """
+    Information Bottleneck Wrapper (Solution A: Diplomatic Blindness).
+    Forces the Tactical Worker to listen to the Manager by hiding explicit 
+    alliance/enemy data (Features 58-60) from its raw spatial observation.
+    """
+    def __init__(self, in_features, out_features):
+        super().__init__()
+        self.linear = nn.Linear(in_features, out_features)
+
+    def forward(self, x):
+        # Create a blinded copy so we don't mutate the memory buffer in-place
+        blinded_x = x.clone()
+        
+        # Features 58 (Self), 59 (Ally), 60 (Enemy) are zeroed out.
+        # The Manager still receives this context perfectly via H_matrix.
+        blinded_x[..., 58:61] = 0.0 
+        
+        return self.linear(blinded_x)
+
 class TacticalWorker(nn.Module):
     """T_phi: Executes tactics guided by the latent strategy z_t."""
     def __init__(self, d_model=512, vocab_size=22231):
         super().__init__()
         self.d_model = d_model
         
-        self.feature_projection = nn.Linear(FEATURE_DIM, d_model)
+        self.feature_projection = DiplomaticBottleneckProjection(FEATURE_DIM, d_model)
         num_provs = len(GLOBAL_PROVINCES)
         self.pos_embedding = nn.Parameter(torch.randn(1, num_provs, d_model))
         encoder_layer = nn.TransformerEncoderLayer(d_model=d_model, nhead=16, batch_first=True, norm_first=True)
@@ -410,6 +430,11 @@ class TacticalWorker(nn.Module):
         B, L, _ = S_mu_raw.size()
         x_emb = self.feature_projection(S_mu_raw) + self.pos_embedding
         
+        if self.training:
+            x_emb = x_emb.transpose(1, 2)
+            x_emb = F.dropout1d(x_emb, p=0.3, training=self.training)
+            x_emb = x_emb.transpose(1, 2)
+
         if x_emb.requires_grad:
             S_mu_encoded = checkpoint.checkpoint(
                 self.encoder_transformer, 
@@ -476,6 +501,9 @@ class MacroManager(nn.Module):
         self.z_norm = nn.LayerNorm(d_model)
 
         self.z_out = nn.Linear(d_model, d_model)
+
+        nn.init.normal_(self.z_out.weight, std=1e-5)
+        nn.init.zeros_(self.z_out.bias)
 
     def forward(self, S_M_t, H_t, h_prev):
         B = S_M_t.size(0)
@@ -547,8 +575,13 @@ class FeudalDiplomacyAgent(nn.Module):
             
         if bc_mode:
             B = mb_obs.size(0)
-            z_zero = torch.zeros((B, 8, self.worker.d_model), device=mb_obs.device, dtype=mb_obs.dtype)
-            logits, _ = self.worker(mb_obs, z_zero, self.D)
+            if self.training and torch.rand(1).item() < 0.25:
+                z_target = torch.randn((B, 8, self.worker.d_model), device=mb_obs.device, dtype=mb_obs.dtype)
+                z_target = F.normalize(z_target, p=2, dim=-1) * 0.1 
+            else:
+                z_target = torch.zeros((B, 8, self.worker.d_model), device=mb_obs.device, dtype=mb_obs.dtype)
+                
+            logits, _ = self.worker(mb_obs, z_target, self.D)
             return logits
 
         x_emb = self.worker.feature_projection(mb_obs)

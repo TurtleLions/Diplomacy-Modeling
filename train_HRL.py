@@ -903,7 +903,7 @@ def main():
     for param in net.inverse_model.parameters():
         param.requires_grad = False
 
-    net = DDP(net, device_ids=[local_rank], find_unused_parameters=False, bucket_cap_mb=256, broadcast_buffers=False)
+    net = DDP(net, device_ids=[local_rank], find_unused_parameters=True, bucket_cap_mb=256, broadcast_buffers=False)
 
     manager_params = []
     worker_params = []
@@ -1297,8 +1297,7 @@ def main():
                             N_batch = norm_pred_z.size(0)
                             labels = torch.arange(N_batch, dtype=torch.long, device=device)
                             
-                            logits_mgr = torch.matmul(norm_pred_z, norm_z_ach.detach().T) / temperature
-                            
+                            logits_mgr = torch.matmul(norm_pred_z.detach(), norm_z_ach.T) / temperature
                             manager_loss = F.cross_entropy(logits_mgr, labels)
 
                             cos_sim = F.cosine_similarity(norm_pred_z, norm_z_ach.detach(), dim=-1)
@@ -1342,7 +1341,13 @@ def main():
                                 log_ratio = new_logprobs_masked - old_logprobs_masked
                                 ratio = torch.exp(log_ratio)
                                 
-                                worker_adv = (active_t_ext_adv + (current_c_int * active_t_int_adv)).unsqueeze(1)
+                                ext_adv_mean, ext_adv_std = active_t_ext_adv.mean(), active_t_ext_adv.std() + 1e-8
+                                norm_ext_adv = (active_t_ext_adv - ext_adv_mean) / ext_adv_std
+
+                                int_adv_mean, int_adv_std = active_t_int_adv.mean(), active_t_int_adv.std() + 1e-8
+                                norm_int_adv = (active_t_int_adv - int_adv_mean) / int_adv_std
+
+                                worker_adv = (norm_ext_adv + (current_c_int * norm_int_adv)).unsqueeze(1)
                                 
                                 surr1 = ratio * worker_adv
                                 surr2 = torch.clamp(ratio, 1.0 - args.clip_coef, 1.0 + args.clip_coef) * worker_adv
