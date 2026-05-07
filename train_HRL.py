@@ -1232,10 +1232,6 @@ def main():
                     mb_loss = torch.tensor(0.0, device=device)
                     seq_active_frames = 0
 
-                    all_predicted_z = []
-                    all_z_achieved = []
-                    all_t_z = []
-                    
                     for t_offset in range(SEQ_LEN):
                         curr_ts = [st + t_offset for st in start_ts]
                         
@@ -1283,18 +1279,31 @@ def main():
                             flat_mb_z_det = active_t_z.view(-1, 512).float().detach()
                             flat_z_achieved = z_achieved.view(-1, 512)
                             flat_predicted_z = active_predicted_z.view(-1, 512).float()
-                            flat_z_achieved_det = flat_z_achieved.detach()
-
-                            all_predicted_z.append(flat_predicted_z)
-                            all_z_achieved.append(flat_z_achieved)
-                            all_t_z.append(flat_mb_z_det)
                             
+                            norm_pred_z = F.normalize(flat_predicted_z, p=2, dim=-1)
+                            norm_z_ach = F.normalize(flat_z_achieved, p=2, dim=-1)
+                            norm_t_z = F.normalize(flat_mb_z_det, p=2, dim=-1)
+
                             z_variance = active_z_achieved_raw.var(dim=0).mean().detach() if active_z_achieved_raw.size(0) > 1 else torch.tensor(0.0, device=device)
                             epoch_z_var_sum += z_variance.item()
                             
                             v_loss = F.huber_loss(active_ext_values_pred, active_t_ext_ret.float(), delta=10.0) + F.huber_loss(active_int_values_pred, active_t_int_ret.float(), delta=10.0)
-                            distance_penalty = F.mse_loss(active_t_z.detach(), z_achieved.detach())
                             
+                            distance_penalty = F.mse_loss(norm_t_z.detach(), norm_z_ach.detach())
+                            
+                            temperature = 0.5
+                            N_batch = norm_pred_z.size(0)
+                            labels = torch.arange(N_batch, dtype=torch.long, device=device)
+                            
+                            logits_mgr = torch.matmul(norm_pred_z, norm_z_ach.detach().T) / temperature
+                            logits_inv = torch.matmul(norm_z_ach, norm_t_z.T) / temperature
+                            
+                            manager_loss = F.cross_entropy(logits_mgr, labels)
+                            inverse_model_loss = F.cross_entropy(logits_inv, labels)
+
+                            cos_sim = F.cosine_similarity(norm_pred_z, norm_z_ach.detach(), dim=-1)
+                            manager_pg_loss = -(active_t_ext_adv.detach() * cos_sim).mean()
+
                             is_active, packed_masks, padded_idx, max_act_live = rebuild_packed_masks(
                                 active_t_sparse, MAP_PROVINCES, VOCAB_SIZE, NONE_IDX, device
                             )
@@ -1360,13 +1369,17 @@ def main():
                             unscaled_loss = (pg_loss 
                                             - (args.ent_coef * entropy) 
                                             + (args.bc_kl_coef * bc_kl_penalty) 
-                                            + (args.v_coef * v_loss))
+                                            + (args.v_coef * v_loss)
+                                            + (0.05 * manager_loss)
+                                            + (0.05 * inverse_model_loss)
+                                            + (0.1 * manager_pg_loss))
                                             
                             mb_loss = mb_loss + (unscaled_loss / SEQ_LEN)
 
                             epoch_pg_loss_sum += pg_loss.detach().item()
                             epoch_manager_loss_sum += manager_loss.detach().item()
-                            epoch_feasibility_error_sum += distance_penalty.detach().mean().item()
+                            epoch_inv_loss_sum += inverse_model_loss.detach().item()
+                            epoch_feasibility_error_sum += distance_penalty.detach().item()
                             epoch_bc_kl_sum += bc_kl_penalty.detach().item() 
                             epoch_entropy_sum += entropy.detach().item()
                             epoch_total_loss_sum += unscaled_loss.detach().item()
@@ -1375,30 +1388,6 @@ def main():
                             epoch_kl_sum += kl_divergence.detach()
                             epoch_kl_steps += 1
 
-                    if len(all_predicted_z) > 0:
-                        big_predicted_z = torch.cat(all_predicted_z, dim=0)
-                        big_z_achieved = torch.cat(all_z_achieved, dim=0)
-                        big_t_z = torch.cat(all_t_z, dim=0)
-                        
-                        norm_pred_z = F.normalize(big_predicted_z, p=2, dim=1)
-                        norm_z_ach = F.normalize(big_z_achieved, p=2, dim=1)
-                        norm_t_z = F.normalize(big_t_z, p=2, dim=1)
-                        
-                        temperature = 0.5
-                        logits_mgr = torch.matmul(norm_pred_z, norm_z_ach.detach().T) / temperature
-                        logits_inv = torch.matmul(norm_z_ach, norm_t_z.T) / temperature
-                        
-                        N_total = big_predicted_z.size(0)
-                        labels = torch.arange(N_total, dtype=torch.long, device=device)
-                        
-                        manager_loss = F.cross_entropy(logits_mgr, labels)
-                        inverse_model_loss = F.cross_entropy(logits_inv, labels)
-                        
-                        epoch_manager_loss_sum += manager_loss.detach().item()
-                        epoch_inv_loss_sum += inverse_model_loss.detach().item()
-                        
-                        mb_loss = mb_loss + (0.05 * manager_loss) + (0.05 * inverse_model_loss)
-
                     if seq_active_frames > 0:
                         current_block_start = (step_idx // accum_steps) * accum_steps
                         current_block_end = min(current_block_start + accum_steps, len(start_indices))
@@ -1406,12 +1395,13 @@ def main():
                         
                         loss = mb_loss / actual_accum_steps
                         loss.backward()
-                        
-                        inv_grad_norm = torch.nn.utils.clip_grad_norm_(net.module.inverse_model.parameters(), float('inf'))
-                        epoch_inv_grad_norm_sum += inv_grad_norm.detach().item() if isinstance(inv_grad_norm, torch.Tensor) else float(inv_grad_norm)
 
                 if sync_this_step:
-                    nn.utils.clip_grad_norm_(net.parameters(), 0.5)
+                    inv_grad_norm = torch.nn.utils.clip_grad_norm_(net.module.inverse_model.parameters(), max_norm=1.0)
+                    epoch_inv_grad_norm_sum += inv_grad_norm.detach().item() if isinstance(inv_grad_norm, torch.Tensor) else float(inv_grad_norm)
+                    
+                    nn.utils.clip_grad_norm_(net.parameters(), max_norm=0.5)
+                    
                     optimizer.step()
                     optimizer.zero_grad()
                 
