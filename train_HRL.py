@@ -1231,6 +1231,10 @@ def main():
                     
                     mb_loss = torch.tensor(0.0, device=device)
                     seq_active_frames = 0
+
+                    all_predicted_z = []
+                    all_z_achieved = []
+                    all_t_z = []
                     
                     for t_offset in range(SEQ_LEN):
                         curr_ts = [st + t_offset for st in start_ts]
@@ -1281,26 +1285,11 @@ def main():
                             flat_predicted_z = active_predicted_z.view(-1, 512).float()
                             flat_z_achieved_det = flat_z_achieved.detach()
 
-                            norm_predicted_z = F.normalize(flat_predicted_z, p=2, dim=1)
-                            norm_z_achieved_det = F.normalize(flat_z_achieved_det, p=2, dim=1)
-                            
-                            norm_z_achieved = F.normalize(flat_z_achieved, p=2, dim=1)
-                            norm_mb_z_det = F.normalize(flat_mb_z_det, p=2, dim=1)
-                            
-                            temperature = 0.5
-                            
-                            logits_mgr = torch.matmul(norm_predicted_z, norm_z_achieved_det.T) / temperature
-                            logits_inv = torch.matmul(norm_z_achieved, norm_mb_z_det.T) / temperature
-                            
-                            N = flat_predicted_z.size(0)
-                            labels = torch.arange(N, dtype=torch.long, device=device)
-                            
-                            manager_loss = F.cross_entropy(logits_mgr, labels)
-                            inverse_model_loss = F.cross_entropy(logits_inv, labels)
+                            all_predicted_z.append(flat_predicted_z)
+                            all_z_achieved.append(flat_z_achieved)
+                            all_t_z.append(flat_mb_z_det)
                             
                             z_variance = active_z_achieved_raw.var(dim=0).mean().detach() if active_z_achieved_raw.size(0) > 1 else torch.tensor(0.0, device=device)
-
-                            epoch_inv_loss_sum += inverse_model_loss.detach().item()
                             epoch_z_var_sum += z_variance.item()
                             
                             v_loss = F.huber_loss(active_ext_values_pred, active_t_ext_ret.float(), delta=10.0) + F.huber_loss(active_int_values_pred, active_t_int_ret.float(), delta=10.0)
@@ -1361,8 +1350,8 @@ def main():
                                         
                                     kl_divergence = 0.5 * (log_ratio ** 2)[valid_ratio_mask].mean()
                                     
-                                    kl_div_vector = new_logprobs - bc_logprobs
-                                    raw_bc_kl = kl_div_vector[valid_ratio_mask].mean()
+                                    exact_kl = torch.distributions.kl.kl_divergence(dist_cat, bc_dist)
+                                    raw_bc_kl = exact_kl[valid_pack_mask].mean()
                                     progress = min(1.0, update / 100.0) 
                                     dynamic_target_kl = 0.02 + (0.48 * progress) 
                                     
@@ -1370,12 +1359,10 @@ def main():
 
                             unscaled_loss = (pg_loss 
                                             - (args.ent_coef * entropy) 
-                                            + (0.05 * manager_loss) 
-                                            + (0.05 * inverse_model_loss)
                                             + (args.bc_kl_coef * bc_kl_penalty) 
                                             + (args.v_coef * v_loss))
                                             
-                            mb_loss = mb_loss + unscaled_loss
+                            mb_loss = mb_loss + (unscaled_loss / SEQ_LEN)
 
                             epoch_pg_loss_sum += pg_loss.detach().item()
                             epoch_manager_loss_sum += manager_loss.detach().item()
@@ -1387,6 +1374,30 @@ def main():
                             
                             epoch_kl_sum += kl_divergence.detach()
                             epoch_kl_steps += 1
+
+                    if len(all_predicted_z) > 0:
+                        big_predicted_z = torch.cat(all_predicted_z, dim=0)
+                        big_z_achieved = torch.cat(all_z_achieved, dim=0)
+                        big_t_z = torch.cat(all_t_z, dim=0)
+                        
+                        norm_pred_z = F.normalize(big_predicted_z, p=2, dim=1)
+                        norm_z_ach = F.normalize(big_z_achieved, p=2, dim=1)
+                        norm_t_z = F.normalize(big_t_z, p=2, dim=1)
+                        
+                        temperature = 0.5
+                        logits_mgr = torch.matmul(norm_pred_z, norm_z_ach.detach().T) / temperature
+                        logits_inv = torch.matmul(norm_z_ach, norm_t_z.T) / temperature
+                        
+                        N_total = big_predicted_z.size(0)
+                        labels = torch.arange(N_total, dtype=torch.long, device=device)
+                        
+                        manager_loss = F.cross_entropy(logits_mgr, labels)
+                        inverse_model_loss = F.cross_entropy(logits_inv, labels)
+                        
+                        epoch_manager_loss_sum += manager_loss.detach().item()
+                        epoch_inv_loss_sum += inverse_model_loss.detach().item()
+                        
+                        mb_loss = mb_loss + (0.05 * manager_loss) + (0.05 * inverse_model_loss)
 
                     if seq_active_frames > 0:
                         current_block_start = (step_idx // accum_steps) * accum_steps

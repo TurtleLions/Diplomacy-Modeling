@@ -592,12 +592,16 @@ class FeudalDiplomacyAgent(nn.Module):
         flat_ext_v = self.extrinsic_value_head(pooled_S_M).squeeze(-1).float()
         flat_int_v = self.intrinsic_value_head(pooled_S_M).squeeze(-1).float()
         
-        # Batched Inverse Model
-        flat_S_M_next = seq_S_M_next.view(SEQ_LEN * B, *seq_S_M_next.shape[2:])
-        flat_z_ach = self.inverse_model(S_M, flat_S_M_next)
+        S_M_seq = S_M.view(SEQ_LEN, B, 8, 512)
+        
+        live_S_M_next = torch.empty_like(S_M_seq)
+        live_S_M_next[:-1] = S_M_seq[1:].detach() 
+        live_S_M_next[-1] = seq_S_M_next[-1] 
+        
+        flat_live_S_M_next = live_S_M_next.view(SEQ_LEN * B, 8, 512)
+        flat_z_ach = self.inverse_model(S_M, flat_live_S_M_next)
         
         # Reshape everything back to sequences
-        S_M_seq = S_M.view(SEQ_LEN, B, 8, 512)
         out_logits = flat_logits.view(SEQ_LEN, B, 82, -1)
         out_ext_v = flat_ext_v.view(SEQ_LEN, B)
         out_int_v = flat_int_v.view(SEQ_LEN, B)
