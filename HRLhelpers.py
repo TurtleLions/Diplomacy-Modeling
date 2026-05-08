@@ -426,11 +426,11 @@ class TacticalWorker(nn.Module):
         self.decoder_layer = GraphBiasedAttentionBlock(d_model, nhead=16)
         self.action_head = nn.Linear(d_model, vocab_size)
 
-    def forward(self, S_mu_raw, z_t, distance_matrix_D):
+    def forward(self, S_mu_raw, z_t, distance_matrix_D, bc_mode=False):
         B, L, _ = S_mu_raw.size()
         x_emb = self.feature_projection(S_mu_raw) + self.pos_embedding
         
-        if self.training:
+        if bc_mode and self.training:
             x_emb = x_emb.transpose(1, 2)
             x_emb = F.dropout1d(x_emb, p=0.3, training=self.training)
             x_emb = x_emb.transpose(1, 2)
@@ -584,13 +584,13 @@ class FeudalDiplomacyAgent(nn.Module):
             logits, _ = self.worker(mb_obs, z_target, self.D)
             return logits
 
-        x_emb = self.worker.feature_projection(mb_obs)
+        x_emb = self.worker.feature_projection(mb_obs) + self.worker.pos_embedding 
         S_mu_encoded = self.worker.encoder_transformer(x_emb)
         S_M = self.pooler(S_mu_encoded)
         
         predicted_z, predicted_h = self.manager(S_M, mb_H, mb_prev_h)
         z_for_worker = worker_z_target if worker_z_target is not None else predicted_z
-        logits, _ = self.worker(mb_obs, z_for_worker, self.D)
+        logits, _ = self.worker(mb_obs, z_for_worker, self.D, bc_mode=False)
         pooled_S_M = S_M.mean(dim=1)
         ext_values_pred = self.extrinsic_value_head(pooled_S_M).squeeze(-1).float()
         int_values_pred = self.intrinsic_value_head(pooled_S_M).squeeze(-1).float()
@@ -608,7 +608,7 @@ class FeudalDiplomacyAgent(nn.Module):
         flat_obs = seq_obs.view(SEQ_LEN * B, *seq_obs.shape[2:])
         flat_z_target = seq_z_target.view(SEQ_LEN * B, *seq_z_target.shape[2:])
         
-        x_emb = self.worker.feature_projection(flat_obs)
+        x_emb = self.worker.feature_projection(flat_obs) + self.worker.pos_embedding 
         if x_emb.requires_grad:
             S_mu_encoded = checkpoint.checkpoint(self.worker.encoder_transformer, x_emb, use_reentrant=False)
         else:

@@ -12,4 +12,5 @@ __pycache__/
 todo.txt
 .cursor/
 feudal_agent_bc.pth
+feudal_agent_bc_old.pth
 tea_debug.log

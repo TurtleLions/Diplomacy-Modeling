@@ -875,6 +875,9 @@ def main():
 
         actor_net.eval()
         for param in actor_net.parameters(): param.requires_grad = False
+
+        bc_baseline_net.eval() 
+        for param in bc_baseline_net.parameters(): param.requires_grad = False
             
         if global_rank == 0: 
             print("Successfully loaded pre-trained BC weights for policy initialization.")
