@@ -60,7 +60,7 @@ def rebuild_packed_masks(sparse_masks, num_provs, vocab_size, none_idx, device):
     is_active_mask[active_b, active_p] = True
     
     # Find the actual maximum number of units in this specific batch
-    max_active = int(is_active_mask.sum(dim=1).max().item())
+    max_active = 34
     
     BIN_SIZE = 8
     if max_active > 0:
@@ -1076,18 +1076,7 @@ def main():
         valid_indices = torch.nonzero(buf['masks'].view(-1), as_tuple=True)[0]
         b_size = valid_indices.shape[0]
         
-        # DDP min-batch synchronization to prevent NCCL hanging
-        local_b_size = torch.tensor([b_size], dtype=torch.long, device=device)
-        dist.all_reduce(local_b_size, op=dist.ReduceOp.MIN)
-        min_b_size = local_b_size.item()
-
-        if b_size > min_b_size:
-            perm = torch.randperm(b_size, device=device)
-            epoch_indices = valid_indices[perm][:min_b_size]
-        else:
-            epoch_indices = valid_indices[torch.randperm(b_size, device=device)]
-            
-        b_size = min_b_size
+        epoch_indices = valid_indices[torch.randperm(b_size, device=device)]
 
         local_stats = torch.zeros((NUM_AGENTS, 5), dtype=torch.float32, device=device)
         
@@ -1148,19 +1137,25 @@ def main():
         b_size_seqs = len(valid_sequences)
         
         local_b_size_seqs = torch.tensor([b_size_seqs], dtype=torch.long, device=device)
-        dist.all_reduce(local_b_size_seqs, op=dist.ReduceOp.MIN)
-        min_b_size_seqs = local_b_size_seqs.item()
+        dist.all_reduce(local_b_size_seqs, op=dist.ReduceOp.MAX)
+        max_b_size_seqs = local_b_size_seqs.item()
 
-        if b_size_seqs > min_b_size_seqs:
-            perm_seq = torch.randperm(b_size_seqs, device=device)
-            epoch_seq_indices = [valid_sequences[i] for i in perm_seq[:min_b_size_seqs].tolist()]
-        else:
-            epoch_seq_indices = valid_sequences
+        real_seq_count = len(valid_sequences)
+        dummy_seq = valid_sequences[0] if real_seq_count > 0 else (0, 0, 0)
+        
+        while len(valid_sequences) < max_b_size_seqs:
+            valid_sequences.append(dummy_seq)
             
-        b_size_seqs = min_b_size_seqs
+        real_mask = torch.zeros(max_b_size_seqs, dtype=torch.bool, device=device)
+        real_mask[:real_seq_count] = True
 
-        mb_size_seqs = 32
-        accum_steps = 16
+        perm_seq = torch.randperm(max_b_size_seqs, device=device)
+        epoch_seq_indices = [valid_sequences[i] for i in perm_seq.tolist()]
+        seq_real_mask = real_mask[perm_seq]
+        
+        b_size_seqs = max_b_size_seqs
+        mb_size_seqs = 16
+        accum_steps = 32
         optimizer.zero_grad() 
 
         epoch_pg_loss_sum = 0.0
@@ -1194,6 +1189,7 @@ def main():
             for step_idx, start in enumerate(start_indices):
                 end = start + mb_size_seqs
                 mb_seqs = epoch_seq_indices[start:end]
+                mb_real_mask = seq_real_mask[start:end]
                 
                 start_ts = [s[0] for s in mb_seqs]
                 envs = [s[1] for s in mb_seqs]
@@ -1250,6 +1246,8 @@ def main():
                         t_z = buf['z'][curr_ts, envs, agts]
                         t_masks = buf['masks'][curr_ts, envs, agts]
                         
+                        t_masks = t_masks & mb_real_mask 
+                        
                         if not t_masks.any():
                             continue
 
@@ -1300,7 +1298,7 @@ def main():
                             N_batch = norm_pred_z.size(0)
                             labels = torch.arange(N_batch, dtype=torch.long, device=device)
                             
-                            logits_mgr = torch.matmul(norm_pred_z.detach(), norm_z_ach.T) / temperature
+                            logits_mgr = torch.matmul(norm_pred_z, norm_z_ach.detach().T) / temperature
                             manager_loss = F.cross_entropy(logits_mgr, labels)
 
                             cos_sim = F.cosine_similarity(norm_pred_z, norm_z_ach.detach(), dim=-1)
@@ -1344,11 +1342,8 @@ def main():
                                 log_ratio = new_logprobs_masked - old_logprobs_masked
                                 ratio = torch.exp(log_ratio)
                                 
-                                ext_adv_mean, ext_adv_std = active_t_ext_adv.mean(), active_t_ext_adv.std() + 1e-8
-                                norm_ext_adv = (active_t_ext_adv - ext_adv_mean) / ext_adv_std
-
-                                int_adv_mean, int_adv_std = active_t_int_adv.mean(), active_t_int_adv.std() + 1e-8
-                                norm_int_adv = (active_t_int_adv - int_adv_mean) / int_adv_std
+                                norm_ext_adv = active_t_ext_adv
+                                norm_int_adv = active_t_int_adv
 
                                 worker_adv = (norm_ext_adv + (current_c_int * norm_int_adv)).unsqueeze(1)
                                 

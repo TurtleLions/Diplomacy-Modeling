@@ -869,7 +869,7 @@ class DiplomacyTransformerEnv(ParallelEnv):
                 self.last_year_sc_owners = current_sc_owners_map.copy()
             
             if self.stalemate_counter >= self.stalemate_threshold:
-                is_done = True
+                is_truncated = True
 
         if not is_done:
             for a in self.agents:
